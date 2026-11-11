@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   changed-files:
-    runs-on: linux-amd64-cpu32
+    runs-on: ubuntu-latest
     outputs:
       docs: ${{ steps.changes.outputs.docs }}
     steps:
@@ -44,7 +44,7 @@ jobs:
   collect:
     needs: changed-files
     if: needs.changed-files.outputs.docs == 'true'
-    runs-on: linux-amd64-cpu32
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
