@@ -26,7 +26,7 @@ jobs:
   # The Build workflow skips its collect job when a push changes no docs. It then
   # ends as success but uploads no fern-preview artifact.
   check-artifact:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu32
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     outputs:
       exists: ${{ steps.artifact.outputs.exists }}
@@ -48,7 +48,7 @@ jobs:
 
   preview:
     needs: check-artifact
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu32
     if: ${{ needs.check-artifact.outputs.exists == 'true' }}
     steps:
       - name: Download fern sources and metadata
