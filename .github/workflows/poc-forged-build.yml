@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   collect:
-    runs-on: linux-amd64-cpu32
+    runs-on: ubuntu-latest
     steps:
       - name: Build poisoned fern-preview artifact
         run: |
