@@ -1,0 +1,552 @@
+# Janitor Configuration
+
+## Overview
+
+The Janitor module watches for Kubernetes Custom Resources (`RebootNode`, `TerminateNode`, `GPUReset`) created by fault-remediation and carries out the actual node operations by calling the Janitor Provider over gRPC. This document covers all Helm configuration options for system administrators.
+
+## Configuration Reference
+
+### Module Enable/Disable
+
+Controls whether the janitor module is deployed in the cluster.
+
+```yaml
+global:
+  janitor:
+    enabled: true
+```
+
+### Replica Count
+
+```yaml
+janitor:
+  replicaCount: 1
+```
+
+The Janitor processes one CR at a time per controller. A single replica is sufficient for most deployments.
+
+### Resources
+
+Defines CPU and memory resource requests and limits for the janitor pod. No defaults are set; configure for production use.
+
+```yaml
+janitor:
+  resources: {}
+```
+
+### Logging
+
+Sets the verbosity level for janitor logs.
+
+```yaml
+janitor:
+  logLevel: info  # Options: debug, info, warn, error
+```
+
+## Operation Timeout
+
+Global default timeout applied to all node operations when no controller-specific timeout is set.
+
+```yaml
+janitor:
+  config:
+    timeout: "25m"
+```
+
+Choose a value that covers the slowest expected operation for your cloud provider. AWS, Azure, and OCI node reboots typically complete within 25 minutes. GCP can be shorter. On Akamai (LKE), one GPU node reboot and one node recycle each took about 3 minutes in testing. For `kind` clusters used in development, a much shorter value (e.g. `"5m"`) is sufficient.
+
+## CSP Provider Connection
+
+The Janitor connects to the Janitor Provider over gRPC. Configure the endpoint and connection security here.
+
+```yaml
+janitor:
+  config:
+    cspProviderHost: "janitor-provider.nvsentinel.svc.cluster.local:50051"
+```
+
+`cspProviderHost` is the gRPC address of the Janitor Provider. Change this only when the Janitor Provider is deployed in a different namespace or under a custom service name.
+
+### TLS
+
+```yaml
+janitor:
+  config:
+    cspProvider:
+      tls:
+        enabled: true
+        caSecretName: "janitor-provider-grpc-cert"
+        insecure: false
+```
+
+### enabled
+When `true`, the Janitor uses TLS for the gRPC connection to the Janitor Provider. Disable only in isolated test environments.
+
+### caSecretName
+Name of the Kubernetes Secret containing `ca.crt` used to verify the Janitor Provider's TLS certificate. The self-signed certificate is managed by cert-manager, which is a required dependency.
+
+### insecure
+Set to `true` to skip TLS certificate verification. For development use only; never enable in production.
+
+### Service Account Token Auth
+
+```yaml
+janitor:
+  config:
+    cspProvider:
+      auth:
+        enabled: true
+        audience: "nvsentinel-csp-provider"
+        expirationSeconds: 3600
+```
+
+### enabled
+When `true`, the Janitor mounts a projected ServiceAccount token and sends it to the Janitor Provider for authentication.
+
+### audience
+The token audience must match the `auth.audiences` value configured on the Janitor Provider.
+
+### expirationSeconds
+Requested lifetime of the projected ServiceAccount token in seconds. Kubernetes automatically rotates the token before expiry.
+
+## Manual Mode
+
+```yaml
+janitor:
+  config:
+    manualMode: false
+```
+
+When `true`, the Janitor creates the Custom Resource but does not call the Janitor Provider to execute any node operation. Use this to test the fault-remediation → janitor CR creation pipeline without triggering actual node reboots, terminations, or GPU resets.
+
+## HTTP Port
+
+```yaml
+janitor:
+  config:
+    httpPort: 8082
+```
+
+Port for the Janitor's internal HTTP server (health and readiness endpoints).
+
+## Node Exclusions
+
+Stops new `RebootNode`, `TerminateNode`, and `GPUReset` CRs from being created for the matching nodes.
+
+```yaml
+janitor:
+  config:
+    nodes:
+      exclusions: []
+```
+
+Each entry is a Kubernetes [label selector](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors), not a node name. Use `matchLabels`, `matchExpressions`, or both. A node that matches **any** entry is excluded.
+
+```yaml
+janitor:
+  config:
+    nodes:
+      exclusions:
+        # Every control-plane node
+        - matchLabels:
+            node-role.kubernetes.io/control-plane: ""
+
+        # One specific node, selected through its hostname label
+        - matchLabels:
+            kubernetes.io/hostname: gpu-node-07
+
+        # Any node in a critical or production tier
+        - matchExpressions:
+            - key: workload-tier
+              operator: In
+              values:
+                - critical
+                - production
+```
+
+To exclude one node, select it through the `kubernetes.io/hostname` label that kubelet sets on every node. Read the value first, because it does not always match the node's object name:
+
+```bash
+kubectl get node gpu-node-07 -o jsonpath='{.metadata.labels.kubernetes\.io/hostname}'
+```
+
+One list covers all three controllers: RebootNode, TerminateNode, and GPUReset.
+
+### How exclusions are enforced
+
+A validating admission webhook compares the node's labels against every exclusion when a Janitor CR is created, and rejects the request on the first match:
+
+```text
+node 'control-plane-1' is excluded from janitor operations due to a label on the node matching the label exclusion 'node-role.kubernetes.io/control-plane=' from config value global.nodes.exclusions
+```
+
+The check runs server-side on the API request, so it applies to every client, and `force: true` does not bypass it. Because it matches on labels read at admission time, relabelling a node changes what is excluded without a Janitor restart.
+
+Admission is the only place exclusions are enforced. The controllers do not re-check them while reconciling, so a CR admitted before you added the exclusion, or before you labelled the node, still runs to completion. After you add an exclusion, check for CRs that are already in flight for those nodes:
+
+```bash
+kubectl get rebootnodes,terminatenodes,gpuresets -A
+```
+
+Use this for control-plane nodes, infrastructure nodes, or any node that NVSentinel should not reboot or terminate.
+
+## Controllers
+
+Each controller handles one CR type. All three are enabled by default.
+
+### RebootNode Controller
+
+```yaml
+janitor:
+  config:
+    controllers:
+      rebootNode:
+        enabled: true
+        timeout: "25m"
+```
+
+Handles `RebootNode` CRs. `timeout` overrides `config.timeout` for reboot operations.
+
+### TerminateNode Controller
+
+```yaml
+janitor:
+  config:
+    controllers:
+      terminateNode:
+        enabled: true
+        timeout: "25m"
+```
+
+Handles `TerminateNode` CRs. `timeout` overrides `config.timeout` for terminate operations.
+
+### GPUReset Controller
+
+```yaml
+janitor:
+  config:
+    controllers:
+      gpuReset:
+        enabled: true
+        timeout: "25m"
+        serviceManager:
+          name: "gpu-operator"
+        resetJob:
+          writeSysLogEvent: true
+          runtimeClassName: "nvidia"
+          hostDriverRootPath: "/run/nvidia/driver"
+          driverRoot: "/run/nvidia/driver"
+          driverBinPath: ""
+          jobTemplatePatch: {}
+          image:
+            repository: ghcr.io/nvidia/nvsentinel/gpu-reset
+            tag: ""
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
+```
+
+Handles `GPUReset` CRs. Before issuing the GPU reset, the controller removes the GPU Operator operands that hold device handles from the node by setting their `nvidia.com/gpu.deploy.*` node labels to `false`, waits for the pods to leave, runs the reset Job, then sets the labels back to `true` and waits for the pods to be Ready.
+
+### serviceManager.name
+Name of the built-in GPU services manager. Use `gpu-operator` for the NVIDIA GPU Operator.
+
+#### GPU Operator modes
+
+The `gpu-operator` service manager supports both GPU Operator modes: device plugin and DRA. You do not set the mode. The controller finds the GPU Operator operands that run on each node.
+
+Each managed operand has a deploy node label. To stop an operand on the node, the controller sets its label to `false`. After the reset, the controller sets the label back to `true` and waits until the operand pods are ready.
+
+| GPU Operator mode | Pod labels | Node label |
+|---|---|---|
+| device plugin | `app=nvidia-device-plugin-daemonset`, `app.kubernetes.io/managed-by=gpu-operator` | `nvidia.com/gpu.deploy.device-plugin` |
+| device plugin | `app=nvidia-dcgm`, `app.kubernetes.io/managed-by=gpu-operator` | `nvidia.com/gpu.deploy.dcgm` |
+| device plugin | `app=nvidia-dcgm-exporter`, `app.kubernetes.io/managed-by=gpu-operator` | `nvidia.com/gpu.deploy.dcgm-exporter` |
+| device plugin | `app=gpu-feature-discovery`, `app.kubernetes.io/managed-by=gpu-operator` | `nvidia.com/gpu.deploy.gpu-feature-discovery` |
+| DRA | `app=nvidia-dcgm-dra` | `nvidia.com/gpu.deploy.dcgm-dra` |
+| DRA | `app=nvidia-dcgm-exporter-dra` | `nvidia.com/gpu.deploy.dcgm-exporter-dra` |
+
+When the teardown starts, the controller lists the pods of each operand on the node. A pod in any phase counts. The controller stops only the operands that have a pod on the node. It records their node labels in the GPUReset status, in `status.managedServices.nodeLabels`. The restore and the GPUReset finalizer use this record. The controller does not change the node labels of the other operands.
+
+The controller changes a node label only when it holds the enabled or the disabled value. A label that is absent is not held: the teardown sets it to the disabled value and the restore to the enabled value. Another controller can hold a label at a different value. For example, the GPU Operator upgrade controller sets `nvidia.com/gpu.deploy.dcgm=paused-for-driver-upgrade` during a driver upgrade. The controller then waits and retries. Before the teardown starts, it checks the labels of every operand of the service manager, also the operands that have no pod on the node, because a driver upgrade removes the operand pods. This wait is bounded by the `gpuReset.timeout` value. The same check runs before the controller creates the reset Job. During the teardown, the wait is bounded by the service manager `teardownTimeout`, and during the restore by `restoreTimeout`. When the wait times out, the GPUReset fails with the reason `ServiceTeardownTimeoutExceeded`, `ResetJobCreationFailed` or `RestoreTimeoutExceeded`. A GPUReset that fails after it stopped services, for example on the restore timeout or on a held label before the reset Job, keeps the node lock and keeps restoring the node labels, without waiting for the pods, for one more `gpuReset.timeout`. Only the controller writes those labels back; the GPU Operator does not touch a label that holds the disabled value. A label that stays held for that long is left as it is, the other labels are restored, the `ServicesRestored` condition names the held one, and the lock is released. Deletion waits in the same way.
+
+When no operand pod runs on the node, the controller skips the teardown and the restore. The `ServicesTornDown` and `ServicesRestored` conditions then have the reason `Skipped`.
+
+A GPUReset that an earlier janitor version started has no record. For such a GPUReset, the controller treats every operand whose node label currently holds its disabled value as stopped, and restores those.
+
+Before the controller creates the reset Job, it makes sure that no pod of a stopped operand runs on the node.
+
+The janitor Pod cache holds only the pods in the service manager namespace that have one of the `app` labels of the service manager.
+
+The controller finds the operands only one time, when the teardown starts. An operand pod that is not on the node at that time is not stopped. For example, a DaemonSet rolling update can remove the pod for a short time. The pod can then start again during the reset and keep the GPU open, and the reset fails.
+
+#### Values per GPU Operator mode
+
+The built-in `gpu-operator` service manager and the `/run/nvidia/driver` driver paths work unchanged on ClusterPolicy and `GPUCluster` (DRA) clusters. The one value that differs is `resetJob.runtimeClassName`, which must be `""` together with `global.gpuDraEnabled: true`. Set `serviceManager.spec` only for a GPU services manager other than the GPU Operator, or to stop a GPU Operator operand that the built-in entry does not cover, as in the [host-installed driver example](#example-host-installed-driver-on-gke). The spec replaces the built-in entry completely, including its mode detection, so list every operand to stop.
+
+#### GPU clients
+
+The controller also stops the GPU client pods before the reset. It does this with every service manager, and also when no service manager is set.
+
+A GPU client is a pod that holds the GPUs open, but that the GPU Operator does not manage. For example, a monitoring agent or a health agent. If a GPU client runs on the node, `nvidia-smi --gpu-reset` fails with `In use by another client`. GPU clients can run in any namespace, so the `serviceManager` cannot stop them.
+
+GPU Operator 26.7 and later sets the `nvidia.com/gpu.deploy.client=true` node label on each GPU node. A GPU client selects this label in its `nodeSelector`. The NVSentinel metadata collector selects it in its required node affinity. The controller does these steps:
+
+1. When the teardown starts, the controller reads `nvidia.com/gpu.deploy.client` on the node. The controller stops the GPU clients only when the label is `true` and at least one GPU client pod runs on the node.
+2. The controller sets the label to `false`, and records it in `status.managedServices.nodeLabels`. The DaemonSet controller then removes the GPU client pods from the node.
+3. The controller waits until no GPU client pod runs on the node. A GPU client pod is a pod in any namespace that selects the label in its `nodeSelector` or in a term of its required node affinity. For a DaemonSet pod, the controller also checks the pod template of the DaemonSet, because the DaemonSet controller replaces the required node affinity of the pod with a term on the node name. A pod that has finished is not a GPU client pod.
+4. After the reset, the controller sets the label back to `true`. It does not wait for the GPU client pods to be Ready.
+
+The controller does not change the label in these cases:
+
+- The node has no label. GPU Operator versions before 26.7, and `GPUCluster` mode, do not set it.
+- The label is `false`. The controller does not wait for GPU client pods. A GPU client pod that a DaemonSet does not own, for example a Deployment or Job pod, can still run on the node and keep the GPU open.
+- The label is `true`, but no GPU client pod runs on the node.
+- The label has another value, for example `paused-for-driver-upgrade`. The GPU Operator holds the label during a driver upgrade or a MIG change. The controller waits, as for an operand label.
+
+Know these limits:
+
+- The controller does not delete pods. Only the DaemonSet controller removes a pod when the label changes. A Deployment, StatefulSet or Job pod stays on the node. The teardown then fails with the reason `ServiceTeardownTimeoutExceeded`, and the controller logs the names of the GPU client pods that still run.
+- The controller does not stop processes that run on the host outside Kubernetes, for example `nvidia-persistenced` or a host DCGM.
+- The controller reads the GPU client pods from the API server, not from the janitor Pod cache. Each check lists the pods of one node, and reads the DaemonSet of each DaemonSet pod that does not select the label itself.
+- If you roll janitor back to an earlier version during a reset, the earlier version does not restore this label. Set the label back to `true` by hand: `kubectl label node <node> nvidia.com/gpu.deploy.client=true --overwrite`.
+
+Before GPU Operator 26.7, put the GPU client on a node label that the `gpu-operator` service manager already sets to `false`, for example `nvidia.com/gpu.deploy.dcgm=true`.
+
+### resetJob.writeSysLogEvent
+When `true`, the reset job writes a kernel syslog message on reset completion. Useful for correlating reset events with node-level logs.
+
+### resetJob.runtimeClassName
+RuntimeClass name for the GPU reset Job. Defaults to `nvidia`. GPU Operator `GPUCluster` (DRA) mode creates no `nvidia` RuntimeClass, so with `global.gpuDraEnabled: true` this value must be `""`; the chart refuses to render otherwise. The Job is privileged and reaches the driver through `resetJob.hostDriverRootPath`, so it does not need a RuntimeClass in either mode; on ClusterPolicy clusters the default is kept for compatibility. Also set it to `""` on a ClusterPolicy cluster that has no `nvidia` RuntimeClass, for example with the GPU Operator NRI plugin enabled.
+
+### resetJob.hostDriverRootPath
+Host path containing the NVIDIA driver filesystem. The reset Job mounts it at `resetJob.driverRoot` inside the reset container.
+
+Keep the default `/run/nvidia/driver` for containerized driver installations. Set it to `/` when the driver is installed directly into the host filesystem and `nvidia-smi` is available at a path such as `/usr/bin/nvidia-smi`.
+
+### resetJob.driverRoot
+Path inside the reset container that the reset command chroots into. The reset command runs `chroot <driverRoot> nvidia-smi` for every `nvidia-smi` call, so this path must hold a complete filesystem: the `nvidia-smi` binary, its shared libraries, and a dynamic loader. The reset Job also mounts the host `/sys` at `<driverRoot>/sys`, so the chroot can read sysfs.
+
+Keep the default `/run/nvidia/driver`. The GPU Operator driver container bind-mounts its full container root to that host path, which satisfies the chroot. This default also works with `hostDriverRootPath: "/"`, because the host root filesystem is complete as well.
+
+Set `driverRoot` to `/` when the driver root holds only driver files and not a complete filesystem. A chroot into a partial driver root fails before `nvidia-smi` starts. With `/`, the chroot is a no-op and the reset command uses the `nvidia-smi` in the reset container image. The Job then does not mount `hostDriverRootPath`, and it mounts the host `/sys` at `/sys`.
+
+The value must be an absolute, clean path. The janitor rejects any other value at startup.
+
+### resetJob.driverBinPath
+Directory inside `resetJob.driverRoot` that holds `nvidia-smi` and `nvidia-bug-report.sh`. The reset command adds it to the front of `PATH` for every command it runs in the chroot. Leave it empty when these files are on the default `PATH`, for example with the GPU Operator driver container.
+
+The value is empty by default. A value that is set must be an absolute, clean path without `:`. The janitor rejects any other value at startup.
+
+#### Example: host-installed driver on GKE
+
+The GKE driver installer on Container-Optimized OS (COS) nodes puts the driver in `/home/kubernetes/bin/nvidia` on the host, and no GPU Operator driver container publishes `/run/nvidia/driver`. The GPU Operator then runs with `driver.enabled: false` and its container toolkit installed in the same directory.
+
+This setup needs three changes:
+
+- Chroot into the host root, and point the reset command at the driver binaries with `driverBinPath`. The installer adds `/home/kubernetes/bin/nvidia/lib64` to the host's dynamic loader configuration, so the chroot finds the driver libraries without further settings.
+- Stop the GPU Operator container toolkit during the reset. In this setup, the toolkit process keeps every GPU device open, and the reset fails with `In use by another client`. The built-in `gpu-operator` entry does not stop the toolkit, so set `serviceManager.spec` with the device plugin mode operands and the toolkit.
+- Set `runtimeClassName` to `""`. When the toolkit stops, it removes the `nvidia` runtime from containerd, so a reset Job that requests that RuntimeClass cannot start.
+
+```yaml
+janitor:
+  config:
+    controllers:
+      gpuReset:
+        serviceManager:
+          name: "gpu-operator"
+          spec:
+            namespace: "gpu-operator"
+            teardownTimeout: "5m"
+            restoreTimeout: "10m"
+            apps:
+              - appSelector: {app: "nvidia-device-plugin-daemonset", app.kubernetes.io/managed-by: "gpu-operator"}
+                nodeLabel: "nvidia.com/gpu.deploy.device-plugin"
+                enabledValue: "true"
+                disabledValue: "false"
+              - appSelector: {app: "nvidia-dcgm", app.kubernetes.io/managed-by: "gpu-operator"}
+                nodeLabel: "nvidia.com/gpu.deploy.dcgm"
+                enabledValue: "true"
+                disabledValue: "false"
+              - appSelector: {app: "nvidia-dcgm-exporter", app.kubernetes.io/managed-by: "gpu-operator"}
+                nodeLabel: "nvidia.com/gpu.deploy.dcgm-exporter"
+                enabledValue: "true"
+                disabledValue: "false"
+              - appSelector: {app: "gpu-feature-discovery", app.kubernetes.io/managed-by: "gpu-operator"}
+                nodeLabel: "nvidia.com/gpu.deploy.gpu-feature-discovery"
+                enabledValue: "true"
+                disabledValue: "false"
+              - appSelector: {app: "nvidia-container-toolkit-daemonset", app.kubernetes.io/managed-by: "gpu-operator"}
+                nodeLabel: "nvidia.com/gpu.deploy.container-toolkit"
+                enabledValue: "true"
+                disabledValue: "false"
+        resetJob:
+          runtimeClassName: ""
+          hostDriverRootPath: "/"
+          driverRoot: "/run/nvidia/driver"
+          driverBinPath: "/home/kubernetes/bin/nvidia/bin"
+```
+
+The reset fails while any process holds the GPU open. If another GPU client runs on the node, for example a DRA kubelet plugin, add its operand to the spec as well.
+
+### resetJob.jobTemplatePatch
+Changes the GPU reset Job. Use it to add host mounts, init containers or a service account, to wrap the reset command, or to give the Job a longer deadline. It is empty by default, which leaves the Job unchanged.
+
+Janitor applies the value as a Kubernetes strategic merge patch on top of the built-in Job, after the other `resetJob` keys. If the patch and a `resetJob` key set the same field, the patch wins. Janitor checks the patch when it starts: a misspelled field, a field name in the wrong case or a value of the wrong type stops janitor with an error.
+
+Some fields are specific to each reset, so janitor always sets them itself and ignores the patch for them: the Job name, namespace and owner labels, `nodeName`, and `NVIDIA_GPU_RESETS` in each container and init container.
+
+#### How lists merge
+
+A strategic merge patch does not replace a list. It matches the items in your patch with the built-in items by a key:
+
+- `containers`, `initContainers`, `volumes` and `env` match by `name`. Use a new name to add an item. Use the name of a built-in item, such as `gpu-reset`, to change that item: only the fields you set change, and the others stay as they are.
+- `volumeMounts` match by `mountPath`, not by name. If you give a built-in mount a different `mountPath`, you get a second mount and the first one stays. To move the driver mount, use `hostDriverRootPath` and `driverRoot` instead.
+- `tolerations` have no key, so a patch that sets `tolerations` replaces the whole list. The built-in list has one toleration, `operator: Exists`, which keeps the reset pod running on a node with a `NoExecute` taint. Include it in your list to keep it.
+- To switch a built-in env var that has a value, such as `UPLOAD_URL_BASE`, to `valueFrom`, also set `value: null`. Otherwise the variable has both `value` and `valueFrom`, and the API server rejects the Job.
+- To remove a built-in item, list it by its key and add `$patch: delete`.
+
+#### Example
+
+```yaml
+janitor:
+  config:
+    controllers:
+      gpuReset:
+        resetJob:
+          jobTemplatePatch:
+            spec:
+              activeDeadlineSeconds: 900
+              template:
+                spec:
+                  serviceAccountName: provider-reset
+                  volumes:
+                    - name: host-systemd
+                      hostPath:
+                        path: /run/systemd
+                    - name: reset-hooks
+                      configMap:
+                        name: provider-reset-hooks
+                        defaultMode: 0755
+                  initContainers:
+                    - name: stop-provider-daemonsets
+                      image: provider/reset-hooks:1.0
+                  containers:
+                    - name: gpu-reset
+                      command: ["/hooks/reset-with-restore.sh"]
+                      volumeMounts:
+                        - name: host-systemd
+                          mountPath: /run/systemd
+                        - name: reset-hooks
+                          mountPath: /hooks
+```
+
+This patch makes the deadline 900 seconds, adds a service account, two volumes and an init container, and runs the reset through a wrapper script. The `gpu-reset` container keeps everything else: its image, environment, security context and built-in mounts.
+
+The reset image does not contain the wrapper, so you must supply it. Here it comes from the `provider-reset-hooks` ConfigMap in the janitor namespace, mounted at `/hooks`. You can also build your own image on top of the reset image.
+
+#### Before you set a patch
+
+- Keep the reset in the Job. Janitor takes the Job result as the reset result, so a wrapper must run the reset and exit with its exit code.
+- Create everything the patch refers to, such as the ServiceAccount, in the janitor namespace. If something is missing, you find out only when a reset runs, on a node that is already cordoned and drained.
+- Undo any host changes that the Job makes. Janitor restores only the GPU services that it stopped.
+- Set `gpuReset.timeout` higher than the Job's `activeDeadlineSeconds` plus the time janitor needs before it starts the Job: stopping the GPU services, and waiting for node labels that another controller holds. The timeout starts when the GPUReset starts. If you delete a GPUReset, janitor waits for a running Job only until the timeout, and then restores the GPU services even if the Job is still running. Do not delete a GPUReset while its Job runs.
+- Try a patch on one node before you use it across the cluster.
+
+### resetJob.image
+Container image for the GPU reset Job. Leave `tag` empty to use the chart default.
+
+### resetJob.resources
+Resource requests and limits for the GPU reset Job container.
+
+## TTL-Based CR Cleanup
+
+Janitor deletes maintenance CRs after their TTL expires.
+
+```yaml
+janitor:
+  ttl:
+    enabled: true
+    defaultTTL: "336h"
+```
+
+### enabled
+When `true`, the TTL controller deletes `RebootNode`, `TerminateNode`, `GPUReset` and `ExternalRemediationRequest` CRs after `defaultTTL` has elapsed.
+
+The TTL controller never deletes an open `ExternalRemediationRequest`. Its TTL starts at `status.completionTime`. This includes a request where the external system set `ExternalRemediationComplete=False`, because the node is still released to the external system. To keep an `ExternalRemediationRequest` after completion, set the `nvsentinel.nvidia.com/preserve: "true"` annotation.
+
+For a completed `ExternalRemediationRequest`, janitor calculates the deletion time as `status.completionTime` plus the `nvsentinel.nvidia.com/ttl` value on every reconcile. Janitor writes the result to `nvsentinel.nvidia.com/expiry` for information. A change to the `ttl` annotation after completion changes the deletion time.
+
+### defaultTTL
+Time after which janitor deletes a CR. Default is `336h` (14 days). For `RebootNode`, `GPUReset` and `TerminateNode`, the time starts when janitor first reconciles the CR. For `ExternalRemediationRequest`, the time starts at `status.completionTime`. Use a shorter value (e.g. `"24h"`) in test environments to keep the CR list clean.
+
+## Webhook
+
+The Janitor uses an admission webhook to validate CRs before they are persisted.
+
+```yaml
+janitor:
+  webhook:
+    port: 9443
+    certIssuer: "janitor-selfsigned-issuer"
+    certProvider: cert-manager
+```
+
+### certProvider
+cert-manager is a required dependency. The webhook certificate is issued by the `certIssuer` ClusterIssuer and renewed automatically.
+
+## Metrics TLS
+
+Serves the Prometheus metrics endpoint over TLS, with a cert-manager issued certificate.
+
+```yaml
+janitor:
+  metrics:
+    tls:
+      enabled: false
+      certDir: "/tmp/k8s-metrics-server/metrics-certs"
+      issuerName: ""
+      issuerKind: "Issuer"
+      issuerGroup: ""
+      duration: "2160h"
+      renewBefore: "720h"
+      organization: "NVIDIA"
+```
+
+### enabled
+Turns on TLS for the metrics endpoint. Off by default. Your scrape configuration must then trust the issuing CA, or Prometheus stops collecting janitor metrics.
+
+### certDir
+Directory where the metrics server reads its certificate and key.
+
+### issuerName
+cert-manager issuer that signs the certificate. Falls back to `webhook.certIssuer` when empty.
+
+### issuerKind
+`Issuer` for a namespaced issuer, or `ClusterIssuer` for a cluster-scoped one. Defaults to `Issuer`, so set it to `ClusterIssuer` when `issuerName` names one.
+
+### issuerGroup
+API group of the issuer. Leave empty for cert-manager's own issuers; set it only for an external issuer implementation.
+
+### duration
+Certificate lifetime. Defaults to `2160h`, which is 90 days.
+
+### renewBefore
+How long before expiry cert-manager renews the certificate. Defaults to `720h`, which is 30 days. It must stay shorter than `duration`.
+
+### organization
+Organization name in the certificate subject.
+
+## Inactive Values
+
+The janitor chart carries `autoscaling`, `livenessProbe`, `readinessProbe`, `podSecurityContext` and `securityContext` in `values.yaml`, but no template reads them. They are Helm scaffold left from the chart's creation:
+
+- `autoscaling` renders no HorizontalPodAutoscaler. The Deployment always uses `replicaCount`.
+- `livenessProbe` and `readinessProbe` add no probes to the pod.
+- `podSecurityContext` and `securityContext` are not applied. The only pod security context the chart sets is `fsGroup: 65532`, added automatically when `global.auditLogging.enabled` is true.
+
+Setting any of them changes nothing. Do not rely on them.

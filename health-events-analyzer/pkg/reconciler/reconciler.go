@@ -1,0 +1,849 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package reconciler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+	"k8s.io/client-go/kubernetes"
+
+	multierror "github.com/hashicorp/go-multierror"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/healthstatus"
+	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
+	datamodels "github.com/nvidia/nvsentinel/data-models/pkg/model"
+	protos "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/health-events-analyzer/pkg/analyzer"
+	config "github.com/nvidia/nvsentinel/health-events-analyzer/pkg/config"
+	"github.com/nvidia/nvsentinel/health-events-analyzer/pkg/parser"
+	"github.com/nvidia/nvsentinel/health-events-analyzer/pkg/publisher"
+	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+)
+
+// No retry constants needed - EventProcessor no longer retries internally
+
+var errEventProcessingStopped = errors.New("event processing stopped unexpectedly")
+
+const (
+	// agentName identifies this component in health events it publishes, and is
+	// used to filter out its own events when watching the store.
+	agentName = "health-events-analyzer"
+	// fieldProcessingStrategy is the stored document field holding the
+	// per-event processing strategy.
+	fieldProcessingStrategy = "healthevent.processingstrategy"
+	// fieldNodeName is the stored document field used to scope rule evaluation
+	// to the node that produced the incoming event.
+	fieldNodeName = "healthevent.nodename"
+)
+
+type HealthEventsAnalyzerReconcilerConfig struct {
+	KubernetesClient          kubernetes.Interface
+	DataStoreConfig           *datastore.DataStoreConfig
+	Pipeline                  any
+	HealthEventsAnalyzerRules *config.TomlConfig
+	Publisher                 *publisher.PublisherConfig
+	Workers                   int
+	MaxInFlight               int
+	// RuleConcurrency caps how many rule queries run at once for a single event. Values of 1
+	// or less evaluate the rules one at a time, which is the default.
+	RuleConcurrency int
+}
+
+type Reconciler struct {
+	nodeRecovery      *nodeRecoveryController
+	nodeProcessing    nodeProcessingLocks
+	terminalRequests  sync.Map
+	recoveryPoll      time.Duration
+	recoveryRepublish time.Duration
+	config            HealthEventsAnalyzerReconcilerConfig
+	datastore         datastore.DataStore
+	databaseClient    client.DatabaseClient // MongoDB-specific client for aggregation
+	eventProcessor    client.EventProcessor
+	xidDetector       *analyzer.XidBurstDetector // PostgreSQL-specific XID burst detection
+	useXidDetector    bool                       // True if using PostgreSQL
+}
+
+func NewReconciler(cfg HealthEventsAnalyzerReconcilerConfig) *Reconciler {
+	return &Reconciler{
+		config: cfg,
+	}
+}
+
+func newEventProcessorConfig(cfg HealthEventsAnalyzerReconcilerConfig) client.EventProcessorConfig {
+	workers := cfg.Workers
+	if workers <= 0 {
+		workers = 1
+	}
+
+	maxInFlight := cfg.MaxInFlight
+	if maxInFlight <= 0 {
+		maxInFlight = 1000
+	}
+
+	// Keep the stream live after handler failures. The processor records the
+	// failure before checkpointing; checkpoint failures still stop processing.
+	return client.EventProcessorConfig{
+		EnableMetrics:        true,
+		MetricsLabels:        map[string]string{"module": agentName},
+		MarkProcessedOnError: true,
+		Workers:              workers,
+		MaxInFlight:          maxInFlight,
+		SkipEvent: func(event client.Event) bool {
+			return client.EventUpdatesOnly(event, healthstatus.FaultQuarantineRecoveryPath)
+		},
+	}
+}
+
+// Start begins the reconciliation process by listening to change stream events
+// and processing them accordingly.
+func (r *Reconciler) Start(ctx context.Context) error {
+	// Create datastore using NEW abstraction
+	ds, err := datastore.NewDataStore(ctx, *r.config.DataStoreConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create datastore: %w", err)
+	}
+	defer ds.Close(ctx)
+
+	if r.config.HealthEventsAnalyzerRules.HasAnnotationRecovery() && ds.Provider() != datastore.ProviderMongoDB {
+		return fmt.Errorf("annotation recovery currently requires MongoDB; PostgreSQL rule support is tracked in issue #606")
+	}
+
+	r.datastore = ds
+
+	// Check if using PostgreSQL and enable XID burst detector
+	if ds.Provider() == datastore.ProviderPostgreSQL {
+		slog.DebugContext(ctx, "PostgreSQL detected - enabling Go-based XID burst detection")
+
+		// Extract XID burst detector config from the RepeatedXidError rule's pipeline
+		xidConfig := r.extractXidDetectorConfig()
+		r.xidDetector = analyzer.NewXidBurstDetectorWithConfig(xidConfig)
+		r.useXidDetector = true
+	} else {
+		slog.DebugContext(ctx, "MongoDB detected - using pipeline-based XID detection")
+
+		r.useXidDetector = false
+	}
+
+	// Get database client and change stream watcher from datastore
+	datastoreAdapter, ok := ds.(interface {
+		GetDatabaseClient() client.DatabaseClient
+		CreateChangeStreamWatcher(
+			ctx context.Context, clientName string, pipeline any,
+		) (datastore.ChangeStreamWatcher, error)
+	})
+	if !ok {
+		return fmt.Errorf("datastore does not support required operations (GetDatabaseClient and CreateChangeStreamWatcher)")
+	}
+
+	r.databaseClient = datastoreAdapter.GetDatabaseClient()
+
+	changeStreamWatcher, err := datastoreAdapter.CreateChangeStreamWatcher(
+		ctx, agentName, r.config.Pipeline)
+	if err != nil {
+		return fmt.Errorf("failed to create change stream watcher: %w", err)
+	}
+
+	// Unwrap for EventProcessor compatibility
+	type unwrapper interface {
+		Unwrap() client.ChangeStreamWatcher
+	}
+
+	unwrapable, ok := changeStreamWatcher.(unwrapper)
+	if !ok {
+		return fmt.Errorf("watcher does not support unwrapping to client.ChangeStreamWatcher")
+	}
+
+	oldWatcher := unwrapable.Unwrap()
+
+	processorConfig := newEventProcessorConfig(r.config)
+
+	r.eventProcessor = client.NewEventProcessor(oldWatcher, r.databaseClient, processorConfig)
+
+	// Set the event handler for processing health events
+	r.eventProcessor.SetEventHandler(client.EventHandlerFunc(r.processHealthEvent))
+
+	slog.InfoContext(ctx, "Starting health events analyzer with unified event processor...")
+
+	return r.processUntilCancelled(ctx)
+}
+
+// processUntilCancelled treats any return before ctx is done as fatal. The processor
+// returns nil when its change stream closes on an error, which otherwise leaves the pod
+// Ready and processing nothing. Exiting restarts it from the stored resume token.
+func (r *Reconciler) processUntilCancelled(ctx context.Context) error {
+	err := r.runProcessors(ctx)
+	if ctx.Err() != nil {
+		return err
+	}
+
+	if err == nil {
+		return errEventProcessingStopped
+	}
+
+	return fmt.Errorf("%w: %w", errEventProcessingStopped, err)
+}
+
+// processHealthEvent handles individual health events and implements the EventHandler interface
+func (r *Reconciler) processHealthEvent(ctx context.Context, event *datamodels.HealthEventWithStatus) error {
+	if r.nodeRecovery != nil {
+		unlock, err := r.nodeProcessing.acquire(ctx, event.HealthEvent.GetNodeName())
+		if err != nil {
+			return fmt.Errorf("lock node processing: %w", err)
+		}
+		defer unlock()
+	}
+
+	startTime := time.Now()
+
+	traceID := tracing.TraceIDFromMetadata(event.HealthEvent.GetMetadata())
+	parentSpanID := tracing.ParentSpanID(event.HealthEventStatus.SpanIds, tracing.ServicePlatformConnector)
+
+	ctx, span := tracing.StartSpanWithLinkFromTraceContext(
+		ctx, traceID, parentSpanID, "health_events_analyzer.process_health_event")
+	defer span.End()
+
+	// Track event reception metrics
+	// Use nodeName as label value, fall back to first entity if available
+	labelValue := event.HealthEvent.NodeName
+
+	if labelValue == "" && len(event.HealthEvent.EntitiesImpacted) > 0 {
+		labelValue = event.HealthEvent.EntitiesImpacted[0].EntityValue
+	}
+
+	if labelValue == "" {
+		labelValue = "unknown"
+	}
+
+	totalEventsReceived.WithLabelValues(labelValue).Inc()
+
+	// Process the event using existing business logic
+	publishedNewEvent, err := r.handleEvent(ctx, event)
+	if err != nil {
+		// The event processor checkpoints failed events too
+		// (MarkProcessedOnError), so this is counted and logged, not replayed.
+		totalEventProcessingError.WithLabelValues("handle_event_error").Inc()
+		slog.ErrorContext(ctx, "Failed to process health event", "error", err, "nodeName", labelValue)
+
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "handle_event_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return fmt.Errorf("failed to handle event: %w", err)
+	}
+
+	// Track success metrics
+	totalEventsSuccessfullyProcessed.Inc()
+
+	span.SetAttributes(
+		attribute.Bool("health_events_analyzer.event.published", publishedNewEvent),
+	)
+
+	if publishedNewEvent {
+		slog.InfoContext(ctx, "New fatal event published.")
+		// Only track entity-specific metrics if EntitiesImpacted is not empty
+		if len(event.HealthEvent.EntitiesImpacted) > 0 {
+			fatalEventsPublishedTotal.WithLabelValues(event.HealthEvent.EntitiesImpacted[0].EntityValue).Inc()
+		} else {
+			slog.WarnContext(ctx, "Fatal event published but EntitiesImpacted is empty, using 'unknown' for metrics")
+			fatalEventsPublishedTotal.WithLabelValues("unknown").Inc()
+		}
+	} else {
+		slog.InfoContext(ctx, "Fatal event is not published, rule set criteria didn't match.")
+	}
+
+	// Track processing duration
+	duration := time.Since(startTime).Seconds()
+	eventHandlingDuration.Observe(duration)
+
+	return nil
+}
+
+// handleEvent runs the XID detector and every enabled rule against one event, and publishes a
+// derived event for each match. It reports whether it published anything, and returns all
+// failures together so that one failing rule does not hide the others.
+func (r *Reconciler) handleEvent(ctx context.Context, event *datamodels.HealthEventWithStatus) (bool, error) {
+	ctx, span := tracing.StartSpan(ctx, "health_events_analyzer.handle_event")
+	defer span.End()
+
+	var multiErr *multierror.Error
+
+	publishedNewEvent := false
+
+	// Handle XID detector operations (clear on healthy, detect bursts on unhealthy)
+	published, err := r.handleXidDetector(ctx, event)
+	if err != nil {
+		multiErr = multierror.Append(multiErr, err)
+	}
+
+	if published {
+		publishedNewEvent = true
+	}
+
+	// Process regular rules
+	rulePublished, ruleErrs := r.processRules(ctx, span, event)
+	for _, ruleErr := range ruleErrs {
+		multiErr = multierror.Append(multiErr, ruleErr)
+	}
+
+	if rulePublished {
+		publishedNewEvent = true
+	}
+
+	if multiErr.ErrorOrNil() != nil {
+		slog.ErrorContext(ctx, "Error in handling the event", "error", multiErr)
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "handle_event_error"),
+			attribute.String("health_events_analyzer.error.message", multiErr.Error()),
+		)
+		tracing.RecordError(span, multiErr.ErrorOrNil())
+
+		return publishedNewEvent, fmt.Errorf("error in handling the event: %w", multiErr)
+	}
+
+	return publishedNewEvent, nil
+}
+
+// ruleApplies reports whether rule's query must run for event. A false when expression skips
+// the query, which cannot match. A when expression that fails falls back to running the query,
+// so a broken expression costs a query but cannot hide a match.
+func ruleApplies(ctx context.Context, rule config.HealthEventsAnalyzerRule,
+	event *datamodels.HealthEventWithStatus) bool {
+	applies, err := rule.Applies(event.HealthEvent)
+	if err != nil {
+		ruleWhenErrorsTotal.WithLabelValues(rule.Name).Inc()
+		slog.WarnContext(ctx, "Rule when expression failed, evaluating the rule anyway",
+			"rule_name", rule.Name, "error", err)
+
+		return true
+	}
+
+	if !applies {
+		ruleSkippedTotal.WithLabelValues(rule.Name).Inc()
+		slog.DebugContext(ctx, "Skipping rule, its when expression is false", "rule_name", rule.Name)
+	}
+
+	return applies
+}
+
+// handleXidDetector handles XID burst detection and history clearing
+func (r *Reconciler) handleXidDetector(ctx context.Context, event *datamodels.HealthEventWithStatus) (bool, error) {
+	if !r.useXidDetector {
+		return false, nil
+	}
+
+	ctx, span := tracing.StartSpan(ctx, "health_events_analyzer.handle_xid_detector")
+	defer span.End()
+
+	// Clear XID burst history when a healthy GPU event is received
+	if r.shouldClearXidHistory(event.HealthEvent) {
+		r.xidDetector.ClearNodeHistory(event.HealthEvent.NodeName)
+		span.SetAttributes(attribute.Bool("health_events_analyzer.xid.history_cleared", true))
+		slog.InfoContext(ctx, "Cleared XID burst history for node due to healthy GPU event",
+			"node", event.HealthEvent.NodeName)
+	}
+
+	// Check for GPU XID errors and detect burst patterns
+	if r.shouldProcessXidEvent(event.HealthEvent) {
+		published, err := r.processXidBurstDetection(ctx, event.HealthEvent)
+		if err != nil {
+			slog.ErrorContext(ctx, "Error processing XID burst detection", "error", err)
+			span.SetAttributes(
+				attribute.String("health_events_analyzer.error.type", "xid_burst_detection_error"),
+				attribute.String("health_events_analyzer.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return false, err
+		}
+
+		span.SetAttributes(attribute.Bool("health_events_analyzer.published_event", published))
+
+		return published, nil
+	}
+
+	return false, nil
+}
+
+// processRules evaluates every enabled rule against the event and publishes each match. It runs
+// up to RuleConcurrency rule queries at once (one at a time by default), then publishes the
+// matches in rule order.
+//
+// The queries only read, and they are independent: the mandatory first stage excludes the
+// analyzer's own events, so no rule can observe another rule's output. Publishing starts only
+// after every query has finished and follows rule order, so the events published, and their
+// order, do not depend on the concurrency limit.
+//
+// errgroup bounds the running queries through SetLimit. It is used without WithContext on
+// purpose: one rule's failure must not cancel the others, so each rule stores its own outcome
+// and the group callback always returns nil. Cancelling ctx still stops the queries, because
+// ctx reaches each one through evaluateRule.
+func (r *Reconciler) processRules(ctx context.Context, span trace.Span,
+	event *datamodels.HealthEventWithStatus) (bool, []error) {
+	rules := r.config.HealthEventsAnalyzerRules.Rules
+	matched := make([]bool, len(rules))
+	evalErrs := make([]error, len(rules))
+
+	limit := max(r.config.RuleConcurrency, 1)
+
+	var group errgroup.Group
+
+	group.SetLimit(limit)
+
+	for i, rule := range rules {
+		if !rule.EvaluateRule {
+			slog.InfoContext(ctx, "Skipping rule evaluation", "rule_name", rule.Name)
+			continue
+		}
+
+		if !ruleApplies(ctx, rule, event) {
+			continue
+		}
+
+		group.Go(func() error {
+			ruleCtx, ruleSpan := tracing.StartSpan(ctx, "health_events_analyzer.evaluate_rule")
+			defer ruleSpan.End()
+
+			matched[i], evalErrs[i] = r.evaluateRule(ruleCtx, ruleSpan, rule, event)
+
+			return nil
+		})
+	}
+
+	_ = group.Wait()
+
+	return r.publishMatchedRules(ctx, span, event, matched, evalErrs)
+}
+
+// publishMatchedRules publishes the events of the matched rules in rule order, and returns the
+// evaluation and publish errors together so one failing rule does not hide the others.
+func (r *Reconciler) publishMatchedRules(ctx context.Context, span trace.Span,
+	event *datamodels.HealthEventWithStatus, matched []bool, evalErrs []error) (bool, []error) {
+	var (
+		published bool
+		errs      []error
+	)
+
+	for i, rule := range r.config.HealthEventsAnalyzerRules.Rules {
+		if evalErrs[i] != nil {
+			errs = append(errs, evalErrs[i])
+			recordRuleError(span, evalErrs[i])
+
+			continue
+		}
+
+		if !matched[i] {
+			continue
+		}
+
+		if _, err := r.publishRuleMatch(ctx, span, rule, event); err != nil {
+			errs = append(errs, err)
+			recordRuleError(span, err)
+
+			continue
+		}
+
+		published = true
+	}
+
+	return published, errs
+}
+
+// recordRuleError adds a rule_evaluation_error event that carries err to the event span.
+func recordRuleError(span trace.Span, err error) {
+	span.AddEvent("rule_evaluation_error", trace.WithAttributes(
+		attribute.String("health_events_analyzer.error.type", "rule_evaluation_error"),
+		attribute.String("health_events_analyzer.error.message", err.Error()),
+	))
+}
+
+// evaluateRule runs one rule's query and reports whether it matched. It only reads, which is
+// what makes running several rules at once safe.
+func (r *Reconciler) evaluateRule(ctx context.Context, span trace.Span,
+	rule config.HealthEventsAnalyzerRule,
+	event *datamodels.HealthEventWithStatus) (bool, error) {
+	span.SetAttributes(
+		attribute.String("health_events_analyzer.rule.name", rule.Name),
+		attribute.String("health_events_analyzer.rule.recommended_action", rule.RecommendedAction),
+	)
+
+	startTime := time.Now()
+
+	// Validate all sequences from DB docs
+	matchedSequences, err := r.validateAllSequenceCriteria(ctx, rule, *event)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error in validating all sequence criteria", "error", err)
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "validate_sequence_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return false, fmt.Errorf("error in validating all sequence criteria: %w", err)
+	}
+
+	duration := time.Since(startTime).Seconds()
+	mongoQueryExecutionDuration.WithLabelValues(rule.Name).Observe(duration)
+
+	span.AddEvent("rule_evaluation_duration_seconds", trace.WithAttributes(
+		attribute.Float64("rule_evaluation_duration_seconds", duration),
+	))
+
+	return matchedSequences, nil
+}
+
+// publishRuleMatch publishes the event for a matched rule, recording a failure on span.
+func (r *Reconciler) publishRuleMatch(ctx context.Context, span trace.Span,
+	rule config.HealthEventsAnalyzerRule,
+	event *datamodels.HealthEventWithStatus) (bool, error) {
+	if err := r.publishMatchedEvent(ctx, rule, event); err != nil {
+		slog.ErrorContext(ctx, "Error in publishing the matched event", "error", err)
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "publish_matched_event_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return false, fmt.Errorf("error in publishing the matched event: %w", err)
+	}
+
+	return true, nil
+}
+
+// publishMatchedEvent publishes an event when a rule matches
+func (r *Reconciler) publishMatchedEvent(ctx context.Context,
+	rule config.HealthEventsAnalyzerRule,
+	event *datamodels.HealthEventWithStatus) error {
+	ctx, span := tracing.StartSpan(ctx, "health_events_analyzer.publish_matched_event")
+	defer span.End()
+
+	ruleMatchedTotal.WithLabelValues(rule.Name, event.HealthEvent.NodeName).Inc()
+	r.recordMatchedEntityMetric(rule.Name, event.HealthEvent.NodeName, event.HealthEvent, ruleSelectsOnEntity(rule))
+
+	actionVal := r.getRecommendedActionValue(rule.RecommendedAction, rule.Name)
+
+	fault := event.HealthEvent
+	if identity, ok := recoveryIdentityForEvent(rule, fault); ok {
+		fault = proto.Clone(fault).(*protos.HealthEvent)
+		fault.EntitiesImpacted = identity.entities
+	}
+
+	err := r.config.Publisher.Publish(ctx, fault, protos.RecommendedAction(actionVal),
+		rule.Name, rule.Message, &rule)
+	if err != nil {
+		slog.ErrorContext(ctx, "Error in publishing the new fatal event", "error", err)
+		span.SetAttributes(
+			attribute.Bool("health_events_analyzer.event.published", false),
+			attribute.String("health_events_analyzer.error.type", "publish_event_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+
+		tracing.RecordError(span, err)
+
+		return fmt.Errorf("error in publishing the new fatal event: %w", err)
+	}
+
+	slog.InfoContext(ctx, "New event successfully published for matching rule",
+		"rule_name", rule.Name, "node", event.HealthEvent.NodeName)
+
+	return nil
+}
+
+// getRecommendedActionValue returns the action value, with fallback to RecommendedAction_CONTACT_SUPPORT if invalid
+func (r *Reconciler) getRecommendedActionValue(recommendedAction, ruleName string) int32 {
+	actionVal, ok := protos.RecommendedAction_value[recommendedAction]
+	if !ok {
+		defaultAction := int32(protos.RecommendedAction_CONTACT_SUPPORT)
+		slog.Warn("Invalid recommended_action in rule; defaulting to CONTACT_SUPPORT",
+			"recommended_action", recommendedAction,
+			"rule_name", ruleName,
+			"default_action", protos.RecommendedAction_name[defaultAction])
+
+		return defaultAction
+	}
+
+	return actionVal
+}
+
+func (r *Reconciler) validateAllSequenceCriteria(ctx context.Context, rule config.HealthEventsAnalyzerRule,
+	healthEventWithStatus datamodels.HealthEventWithStatus) (bool, error) {
+	// Execute aggregation with tracing
+	ctx, span := tracing.StartSpan(ctx, "health_events_analyzer.mongo.aggregate")
+	defer span.End()
+
+	slog.InfoContext(ctx, "→ Evaluating rule for event",
+		"rule_name", rule.Name,
+		"node", healthEventWithStatus.HealthEvent.NodeName,
+		"error_code", healthEventWithStatus.HealthEvent.ErrorCode,
+		"agent", healthEventWithStatus.HealthEvent.Agent)
+
+	// Build aggregation pipeline from stages
+	pipelineStages, err := r.getPipelineStages(rule, healthEventWithStatus)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to build pipeline stages", "error", err)
+		tracing.RecordError(span, err)
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "build_pipeline_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+
+		return false, fmt.Errorf("failed to build pipeline stages: %w", err)
+	}
+
+	if rule.Recovery != nil {
+		if err := r.applyRecoveryBoundary(ctx, rule, healthEventWithStatus.HealthEvent, pipelineStages); err != nil {
+			return false, fmt.Errorf("apply recovery history boundary: %w", err)
+		}
+	}
+
+	var result []map[string]any
+
+	slog.DebugContext(ctx, "Executing aggregation pipeline",
+		"rule_name", rule.Name, "pipeline_stages_count", len(pipelineStages))
+
+	cursor, err := r.databaseClient.Aggregate(ctx, pipelineStages)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to execute aggregation pipeline", "error", err, "rule_name", rule.Name)
+		totalEventProcessingError.WithLabelValues("execute_pipeline_error").Inc()
+
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "execute_pipeline_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return false, fmt.Errorf("failed to execute aggregation pipeline: %w", err)
+	}
+
+	defer cursor.Close(ctx)
+
+	if err = cursor.All(ctx, &result); err != nil {
+		slog.ErrorContext(ctx, "Failed to decode cursor", "error", err, "rule_name", rule.Name)
+		totalEventProcessingError.WithLabelValues("decode_cursor_error").Inc()
+
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "decode_cursor_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return false, fmt.Errorf("failed to decode cursor: %w", err)
+	}
+
+	slog.DebugContext(ctx, "Aggregation pipeline completed", "rule_name", rule.Name, "result_count", len(result))
+
+	// Check if we have results (rule matched)
+	if len(result) > 0 {
+		// Check for explicit ruleMatched field (used in tests and by SequenceFacet pipelines)
+		if matched, ok := result[0]["ruleMatched"].(bool); ok {
+			if matched {
+				slog.InfoContext(ctx, "Rule matched via ruleMatched field",
+					"rule_name", rule.Name,
+					"node", healthEventWithStatus.HealthEvent.NodeName)
+
+				return true, nil
+			}
+
+			slog.InfoContext(ctx, "Rule did not match (ruleMatched=false)",
+				"rule_name", rule.Name,
+				"node", healthEventWithStatus.HealthEvent.NodeName,
+				"result", result[0])
+
+			return false, nil
+		}
+
+		return true, nil
+	}
+
+	slog.InfoContext(ctx, "Rule did not match (no results)",
+		"rule_name", rule.Name,
+		"node", healthEventWithStatus.HealthEvent.NodeName)
+
+	return false, nil
+}
+
+// getPipelineStages converts rule stages to aggregation pipeline stages
+func (r *Reconciler) getPipelineStages(
+	rule config.HealthEventsAnalyzerRule,
+	healthEventWithStatus datamodels.HealthEventWithStatus,
+) ([]map[string]any, error) {
+	// Always start with mandatory filters. The agent filter prevents the analyzer
+	// from matching its own generated events, while the node filter limits each
+	// rule evaluation to events from the node that produced the incoming event.
+	// Keeping the node predicate in the first stage lets the datastore use its
+	// node-prefixed HealthEvents index before evaluating configured rule stages.
+	pipeline := []map[string]any{
+		{
+			"$match": map[string]any{
+				"healthevent.agent": map[string]any{"$ne": agentName},
+				fieldNodeName:       healthEventWithStatus.HealthEvent.NodeName,
+				"$or": []any{
+					map[string]any{
+						fieldProcessingStrategy: int32(protos.ProcessingStrategy_EXECUTE_REMEDIATION),
+					},
+					map[string]any{
+						fieldProcessingStrategy: int32(protos.ProcessingStrategy_STORE_AND_ANALYSE),
+					},
+					map[string]any{
+						fieldProcessingStrategy: map[string]any{"$exists": false},
+					},
+				},
+			},
+		},
+	}
+
+	for i, stageStr := range rule.Stage {
+		// Parse the stage and resolve "this." references
+		stageMap, err := parser.ParseSequenceStage(stageStr, healthEventWithStatus)
+		if err != nil {
+			slog.Error("Failed to parse stage", "stage_index", i, "error", err, "stage_string", stageStr)
+			totalEventProcessingError.WithLabelValues("parse_stage_error").Inc()
+
+			return nil, fmt.Errorf("failed to parse stage %d: %w", i, err)
+		}
+
+		slog.Debug("Parsed aggregation stage", "rule_name", rule.Name, "stage_index", i)
+
+		pipeline = append(pipeline, stageMap)
+	}
+
+	return pipeline, nil
+}
+
+// shouldProcessXidEvent checks if an event should be processed by the XID burst detector
+func (r *Reconciler) shouldProcessXidEvent(event *protos.HealthEvent) bool {
+	// Only process GPU XID errors (unhealthy GPU events with error codes)
+	return event != nil &&
+		event.ComponentClass == "GPU" &&
+		!event.IsHealthy &&
+		len(event.ErrorCode) > 0 &&
+		event.Agent != agentName // Don't process our own events
+}
+
+// shouldClearXidHistory checks if a healthy GPU event should clear the XID burst history
+// This ensures that when a GPU is healthy again, we don't keep triggering RepeatedXidError
+// based on stale XID history from before the recovery
+func (r *Reconciler) shouldClearXidHistory(event *protos.HealthEvent) bool {
+	return event != nil &&
+		event.ComponentClass == "GPU" &&
+		event.IsHealthy &&
+		event.Agent != agentName // Don't process our own events
+}
+
+// processXidBurstDetection processes GPU XID events through the burst detector
+// and publishes RepeatedXidError events when burst patterns are detected
+func (r *Reconciler) processXidBurstDetection(ctx context.Context, event *protos.HealthEvent) (bool, error) {
+	ctx, span := tracing.StartSpan(ctx, "health_events_analyzer.xid.burst_detection")
+	defer span.End()
+
+	shouldTrigger, burstCount := r.xidDetector.ProcessEvent(event)
+
+	span.SetAttributes(
+		attribute.Bool("health_events_analyzer.xid.burst_detected", shouldTrigger),
+		attribute.Int("health_events_analyzer.xid.burst_count", burstCount),
+	)
+
+	if !shouldTrigger {
+		slog.DebugContext(ctx, "XID event processed but no burst pattern detected",
+			"node", event.NodeName,
+			"xid", event.ErrorCode[0],
+			"burstCount", burstCount)
+
+		return false, nil
+	}
+
+	// Burst pattern detected - publish RepeatedXidError event
+	xidCode := event.ErrorCode[0]
+	slog.InfoContext(ctx, "RepeatedXidError detected - publishing alert",
+		"node", event.NodeName,
+		"xid", xidCode,
+		"burstCount", burstCount)
+
+	// Use the publisher to create and publish the RepeatedXidError event
+	// The publisher will set agent, checkName, isHealthy, isFatal, and recommendedAction
+	err := r.config.Publisher.Publish(ctx, event, protos.RecommendedAction_CONTACT_SUPPORT, "RepeatedXidError",
+		event.Message, nil)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to publish RepeatedXidError event",
+			"error", err,
+			"node", event.NodeName,
+			"xid", xidCode)
+
+		span.SetAttributes(
+			attribute.String("health_events_analyzer.error.type", "xid_publish_error"),
+			attribute.String("health_events_analyzer.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return false, fmt.Errorf("failed to publish RepeatedXidError event: %w", err)
+	}
+
+	span.SetAttributes(
+		attribute.Bool("health_events_analyzer.event.published", true),
+		attribute.String("health_events_analyzer.event.published_rule", "RepeatedXidError"),
+	)
+
+	slog.InfoContext(ctx, "Successfully published RepeatedXidError event",
+		"node", event.NodeName,
+		"xid", xidCode,
+		"burstCount", burstCount)
+
+	// NOTE: We do NOT clear history here. The MongoDB pipeline is stateless and
+	// queries the DB each time, so multiple XIDs in the same burst can trigger
+	// if they each appear in 2+ bursts. Clearing history here would prevent that.
+	// History is only cleared when a healthy event is received.
+
+	// Track metrics
+	ruleMatchedTotal.WithLabelValues("RepeatedXidError", event.NodeName).Inc()
+	r.recordMatchedEntityMetric("RepeatedXidError", event.NodeName, event, true)
+
+	if len(event.EntitiesImpacted) > 0 {
+		fatalEventsPublishedTotal.WithLabelValues(event.EntitiesImpacted[0].EntityValue).Inc()
+	} else {
+		fatalEventsPublishedTotal.WithLabelValues("unknown").Inc()
+	}
+
+	return true, nil
+}
+
+// extractXidDetectorConfig extracts the XID burst detector configuration from the
+// RepeatedXidError rule's MongoDB aggregation pipeline stages.
+// This ensures the Go-based detector uses the same parameters as configured in the ConfigMap.
+func (r *Reconciler) extractXidDetectorConfig() analyzer.XidBurstDetectorConfig {
+	// Find the RepeatedXidError rule
+	for _, rule := range r.config.HealthEventsAnalyzerRules.Rules {
+		if rule.Name == "RepeatedXidError" {
+			slog.Info("Found RepeatedXidError rule, parsing pipeline for XID detector config")
+
+			return analyzer.ParseXidConfigFromPipeline(rule.Stage)
+		}
+	}
+
+	// If no RepeatedXidError rule found, use defaults
+	slog.Warn("RepeatedXidError rule not found in config, using default XID detector settings")
+
+	return analyzer.DefaultXidBurstDetectorConfig()
+}

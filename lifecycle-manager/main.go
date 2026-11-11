@@ -1,0 +1,512 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"flag"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/go-logr/logr"
+	"google.golang.org/grpc"
+	coordinationv1 "k8s.io/api/coordination/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/auditlogger"
+	"github.com/nvidia/nvsentinel/commons/pkg/distributedlock"
+	"github.com/nvidia/nvsentinel/commons/pkg/grpcclient"
+	"github.com/nvidia/nvsentinel/commons/pkg/healthpub"
+	"github.com/nvidia/nvsentinel/commons/pkg/logger"
+	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
+	"github.com/nvidia/nvsentinel/lifecycle-manager/api/v1alpha1"
+	"github.com/nvidia/nvsentinel/lifecycle-manager/internal/controller"
+	"github.com/nvidia/nvsentinel/lifecycle-manager/pkg/config"
+	webhookv1alpha1 "github.com/nvidia/nvsentinel/lifecycle-manager/pkg/webhook/v1alpha1"
+	// +kubebuilder:scaffold:imports
+)
+
+var (
+	scheme = runtime.NewScheme()
+	// These variables will be populated during the build process
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddMRToScheme(scheme))
+	// +kubebuilder:scaffold:scheme
+}
+
+type serverSetup struct {
+	webhookServer        webhook.Server
+	metricsServerOptions metricsserver.Options
+	metricsCertWatcher   *certwatcher.CertWatcher
+	webhookCertWatcher   *certwatcher.CertWatcher
+}
+
+func setupTLSAndServers(enableHTTP2 bool, webhookCertPath, webhookCertName, webhookCertKey string, metricsAddr string,
+	secureMetrics bool, metricsCertPath, metricsCertName, metricsCertKey string) (serverSetup, error) {
+	var tlsOpts []func(*tls.Config)
+
+	if !enableHTTP2 {
+		tlsOpts = append(tlsOpts, func(c *tls.Config) {
+			slog.Info("Disabling HTTP/2")
+
+			c.NextProtos = []string{"http/1.1"}
+		})
+	}
+
+	webhookTLSOpts := append([]func(*tls.Config){}, tlsOpts...)
+
+	var result serverSetup
+
+	if len(webhookCertPath) > 0 {
+		slog.Info("Initializing webhook certificate watcher using provided certificates",
+			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName,
+			"webhook-cert-key", webhookCertKey)
+
+		watcher, err := certwatcher.New(
+			filepath.Join(webhookCertPath, webhookCertName),
+			filepath.Join(webhookCertPath, webhookCertKey),
+		)
+		if err != nil {
+			return serverSetup{}, fmt.Errorf("failed to initialize webhook certificate watcher: %w", err)
+		}
+
+		result.webhookCertWatcher = watcher
+
+		webhookTLSOpts = append(webhookTLSOpts, func(c *tls.Config) {
+			c.GetCertificate = watcher.GetCertificate
+		})
+	}
+
+	result.webhookServer = webhook.NewServer(webhook.Options{TLSOpts: webhookTLSOpts})
+
+	result.metricsServerOptions = metricsserver.Options{
+		BindAddress:   metricsAddr,
+		SecureServing: secureMetrics,
+		TLSOpts:       tlsOpts,
+	}
+
+	if secureMetrics {
+		result.metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+
+	if len(metricsCertPath) > 0 {
+		slog.Info("Initializing metrics certificate watcher using provided certificates",
+			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName,
+			"metrics-cert-key", metricsCertKey)
+
+		watcher, err := certwatcher.New(
+			filepath.Join(metricsCertPath, metricsCertName),
+			filepath.Join(metricsCertPath, metricsCertKey),
+		)
+		if err != nil {
+			return serverSetup{}, fmt.Errorf("failed to initialize metrics certificate watcher: %w", err)
+		}
+
+		result.metricsCertWatcher = watcher
+		result.metricsServerOptions.TLSOpts = append(result.metricsServerOptions.TLSOpts, func(c *tls.Config) {
+			c.GetCertificate = watcher.GetCertificate
+		})
+	}
+
+	return result, nil
+}
+
+func addCertWatchers(mgr ctrl.Manager, setup serverSetup) error {
+	if setup.metricsCertWatcher != nil {
+		slog.Info("Adding metrics certificate watcher to manager")
+
+		if err := mgr.Add(setup.metricsCertWatcher); err != nil {
+			return fmt.Errorf("failed to add metrics certificate watcher to manager: %w", err)
+		}
+	}
+
+	if setup.webhookCertWatcher != nil {
+		slog.Info("Adding webhook certificate watcher to manager")
+
+		if err := mgr.Add(setup.webhookCertWatcher); err != nil {
+			return fmt.Errorf("failed to add webhook certificate watcher to manager: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func setupControllers(
+	mgr ctrl.Manager, cfg *config.Config,
+	enableValidationController, enableMaintenanceController bool,
+	publisher *healthpub.Publisher, namespace string,
+) error {
+	var validation *v1alpha1.ValidationConfiguration
+	if cfg != nil {
+		validation = cfg.Validation
+	}
+
+	nodeClaim := distributedlock.NewNodeLock(
+		mgr.GetClient(), mgr.GetScheme(), namespace, nil,
+		distributedlock.WithLeaseName(controller.ClaimLeaseName),
+	)
+
+	if err := webhookv1alpha1.SetupWebhookWithManager(
+		mgr, validation, enableValidationController, enableMaintenanceController, nodeClaim,
+	); err != nil {
+		return fmt.Errorf("failed to set up webhook: %w", err)
+	}
+
+	if enableValidationController {
+		if err := setupValidationController(mgr, cfg, validation, namespace); err != nil {
+			return err
+		}
+	}
+
+	if enableMaintenanceController {
+		if err := (&controller.MaintenanceRequestReconciler{
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Publisher: publisher,
+			NodeLock: distributedlock.NewNodeLock(
+				mgr.GetClient(), mgr.GetScheme(), namespace, nil,
+			),
+			NodeClaim: nodeClaim,
+		}).SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("failed to create MaintenanceRequest controller: %w", err)
+		}
+	}
+
+	// +kubebuilder:scaffold:builder
+	return nil
+}
+
+func setupValidationController(
+	mgr ctrl.Manager, cfg *config.Config, validation *v1alpha1.ValidationConfiguration, namespace string,
+) error {
+	reconciler, err := controller.NewValidationRequestReconciler(mgr.GetClient(), mgr.GetAPIReader(),
+		mgr.GetScheme(), cfg, namespace)
+	if err != nil {
+		return fmt.Errorf("failed to create ValidationRequest reconciler: %w", err)
+	}
+
+	nodeReconciler, err := newNodeValidationReconciler(mgr, cfg, validation)
+	if err != nil {
+		return fmt.Errorf("failed to create NodeValidation reconciler: %w", err)
+	}
+
+	if reconciler.ResourceSliceWatch.Enabled || (nodeReconciler != nil && nodeReconciler.ResourceSliceWatch.Enabled) {
+		if err := controller.SetupResourceSliceIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+			return fmt.Errorf("failed to set up ResourceSlice index: %w", err)
+		}
+	}
+
+	if err := reconciler.SetupWithManager(mgr); err != nil {
+		return fmt.Errorf("failed to create ValidationRequest controller: %w", err)
+	}
+
+	if nodeReconciler != nil {
+		if err := nodeReconciler.SetupWithManager(mgr); err != nil {
+			return fmt.Errorf("failed to create NodeValidation controller: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func newNodeValidationReconciler(
+	mgr ctrl.Manager,
+	cfg *config.Config,
+	validation *v1alpha1.ValidationConfiguration,
+) (*controller.NodeValidationReconciler, error) {
+	if validation.Spec.NewNodeValidation == nil {
+		return nil, nil
+	}
+
+	reconciler, err := controller.NewNodeValidationReconciler(
+		mgr.GetClient(), mgr.GetAPIReader(), mgr.GetScheme(), cfg,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NodeValidation reconciler: %w", err)
+	}
+
+	return reconciler, nil
+}
+
+// closePublisher closes the publisher's connection on shutdown; nil when the
+// maintenance controller is disabled.
+func closePublisher(publisher *healthpub.Publisher) {
+	if publisher != nil {
+		publisher.CloseOrWarn()
+	}
+}
+
+// newPublisher creates the MaintenanceRequest controller's health event
+// publisher. Returns (nil, nil) when the maintenance controller is disabled.
+//
+// The HEALTH_PUBLISH_* environment selects a direct TLS connection to the
+// deployment platform connector; otherwise the node-local socket is dialed
+// as before. The publisher owns the connection and closes it in Close.
+//
+// A MaintenanceRequest names any node in the cluster, but this component
+// is a Deployment running on one. The platform connector therefore scopes it
+// to its own node unless it presents a projected ServiceAccount token
+// whose identity is on the cross-node allowlist, so tokenPath must be set
+// wherever node-binding auth is enabled. An empty tokenPath contributes no
+// dial options, which is the tokenless behaviour auth-disabled clusters expect.
+func newPublisher(
+	enabled bool, socketTarget, tokenPath string,
+) (*healthpub.Publisher, error) {
+	if !enabled {
+		return nil, nil
+	}
+
+	_, client, pubOpt, err := healthpub.DialFromEnvOr(func() (*grpc.ClientConn, error) {
+		slog.Info("Dialing platform-connector",
+			"socket", socketTarget, "tokenAuthEnabled", tokenPath != "")
+
+		return grpc.NewClient(socketTarget, grpcclient.InsecureDialOptions(tokenPath)...)
+	})
+	if err != nil {
+		slog.Error("Failed to create gRPC client for platform-connector", "error", err)
+
+		return nil, fmt.Errorf("create platform-connector gRPC client: %w", err)
+	}
+
+	return healthpub.New(client, socketTarget, "maintenance-controller", pubOpt), nil
+}
+
+func run() error {
+	var (
+		metricsAddr                                      string
+		metricsCertPath, metricsCertName, metricsCertKey string
+		webhookCertPath, webhookCertName, webhookCertKey string
+		enableLeaderElection                             bool
+		probeAddr                                        string
+		secureMetrics                                    bool
+		enableHTTP2                                      bool
+		leaseDuration, renewDeadline, retryPeriod        time.Duration
+		configFile                                       string
+		enableValidationController                       bool
+		enableMaintenanceController                      bool
+		platformConnectorSocket                          string
+		platformConnectorTokenPath                       string
+	)
+
+	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metrics endpoint binds to. "+
+		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
+		"Enable leader election for controller manager. "+
+			"Enabling this will ensure there is only one active controller manager.")
+	flag.BoolVar(&secureMetrics, "metrics-secure", false,
+		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
+	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
+	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
+	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
+		"The directory that contains the metrics server certificate.")
+	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
+	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
+	flag.BoolVar(&enableHTTP2, "enable-http2", false,
+		"If set, HTTP/2 will be enabled for the metrics and webhook servers.")
+	flag.DurationVar(&leaseDuration, "lease-duration", 90*time.Second,
+		"The duration that non-leader candidates will wait to force acquire leadership.")
+	flag.DurationVar(&renewDeadline, "renew-deadline", 60*time.Second,
+		"The duration that the acting leader will retry refreshing leadership before giving up.")
+	flag.DurationVar(&retryPeriod, "retry-period", 5*time.Second,
+		"The duration LeaderElector clients should wait between tries of actions.")
+	flag.StringVar(&configFile, "config", "", "Path to a ValidationConfiguration file.")
+	flag.BoolVar(&enableValidationController, "enable-validation-controller", true,
+		"Enable the ValidationRequest controller and webhook.")
+	flag.BoolVar(&enableMaintenanceController, "enable-maintenance-controller", false,
+		"Enable the MaintenanceRequest controller and webhook.")
+	flag.StringVar(&platformConnectorSocket, "platform-connector-socket",
+		"unix:///var/run/nvsentinel.sock",
+		"gRPC target for the platform-connector socket used by the MaintenanceRequest controller. "+
+			"HEALTH_PUBLISH_TARGET, when set, points the controller at the deployment platform connector instead.")
+	flag.StringVar(&platformConnectorTokenPath, "platform-connector-token-path", "",
+		"Path to a projected ServiceAccount token presented to platform-connector. "+
+			"A MaintenanceRequest names any node in the cluster, so this is required for "+
+			"reporting on nodes other than the one this pod runs on; empty disables token authentication.")
+
+	flag.Parse()
+
+	namespace := os.Getenv("POD_NAMESPACE")
+	if len(namespace) == 0 {
+		return fmt.Errorf("POD_NAMESPACE environment variable is not set")
+	}
+
+	var cfg *config.Config
+
+	if enableValidationController {
+		var err error
+
+		cfg, err = config.LoadConfig(configFile)
+		if err != nil {
+			slog.Error("Failed to load configuration", "error", err)
+
+			return err
+		}
+
+		slog.Info("Loaded validation configuration", "spec", cfg.Validation.Spec)
+	}
+
+	setup, err := setupTLSAndServers(enableHTTP2, webhookCertPath, webhookCertName, webhookCertKey, metricsAddr,
+		secureMetrics, metricsCertPath, metricsCertName, metricsCertKey)
+	if err != nil {
+		return err
+	}
+
+	restConfig := ctrl.GetConfigOrDie()
+	restConfig.Wrap(func(rt http.RoundTripper) http.RoundTripper {
+		return auditlogger.NewAuditingRoundTripper(rt)
+	})
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme:                 scheme,
+		Metrics:                setup.metricsServerOptions,
+		WebhookServer:          setup.webhookServer,
+		HealthProbeBindAddress: probeAddr,
+		LeaderElection:         enableLeaderElection,
+		LeaderElectionID:       "lifecycle-manager.nvsentinel.nvidia.com",
+		LeaseDuration:          &leaseDuration,
+		RenewDeadline:          &renewDeadline,
+		RetryPeriod:            &retryPeriod,
+		Cache: cache.Options{
+			DefaultNamespaces: map[string]cache.Config{namespace: {}},
+			// Readiness CEL can read any ResourceSlice spec or metadata field, so only managedFields is dropped.
+			ByObject: map[client.Object]cache.ByObject{
+				&resourcev1.ResourceSlice{}: {Transform: cache.TransformStripManagedFields()},
+			},
+		},
+		// Node lock leases are created and deleted within one reconcile; a
+		// cached read can miss a lease just created and leave it held.
+		Client: client.Options{Cache: &client.CacheOptions{
+			DisableFor: []client.Object{&coordinationv1.Lease{}},
+		}},
+	})
+	if err != nil {
+		slog.Error("Failed to start manager", "error", err)
+
+		return err
+	}
+
+	if err := addCertWatchers(mgr, setup); err != nil {
+		slog.Error("Failed to add certificate watchers", "error", err)
+
+		return err
+	}
+
+	publisher, err := newPublisher(
+		enableMaintenanceController, platformConnectorSocket, platformConnectorTokenPath,
+	)
+	if err != nil {
+		return err
+	}
+
+	defer closePublisher(publisher)
+
+	if err := setupControllers(
+		mgr, cfg, enableValidationController, enableMaintenanceController, publisher, namespace,
+	); err != nil {
+		slog.Error("Failed to set up controllers", "error", err)
+
+		return err
+	}
+
+	if err := addHealthChecks(mgr); err != nil {
+		return err
+	}
+
+	slog.Info("Starting manager")
+
+	return mgr.Start(ctrl.SetupSignalHandler())
+}
+
+func addHealthChecks(mgr ctrl.Manager) error {
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		slog.Error("Failed to set up health check", "error", err)
+
+		return err
+	}
+
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		slog.Error("Failed to set up ready check", "error", err)
+
+		return err
+	}
+
+	return nil
+}
+
+func main() {
+	logger.SetDefaultStructuredLoggerWithTraceCorrelation("lifecycle-manager", version)
+	slog.Info("Starting lifecycle-manager", "version", version, "commit", commit, "date", date)
+
+	if err := auditlogger.InitAuditLogger("lifecycle-manager"); err != nil {
+		slog.Warn("Failed to initialize audit logger", "error", err)
+	}
+
+	if err := tracing.InitTracing("lifecycle-manager"); err != nil {
+		slog.Warn("Failed to initialize tracing", "error", err)
+	}
+
+	ctrllog.SetLogger(logr.FromSlogHandler(slog.Default().Handler()))
+
+	runErr := run()
+
+	tracingCtx, tracingCancel := context.WithTimeout(context.Background(), 5*time.Second)
+
+	if err := tracing.ShutdownTracing(tracingCtx); err != nil {
+		slog.Warn("Failed to shutdown tracing", "error", err)
+	}
+
+	tracingCancel()
+
+	if runErr != nil {
+		slog.Error("Application encountered a fatal error", "error", runErr)
+
+		if closeErr := auditlogger.CloseAuditLogger(); closeErr != nil {
+			slog.Warn("Failed to close audit logger", "error", closeErr)
+		}
+
+		os.Exit(1)
+	}
+
+	if err := auditlogger.CloseAuditLogger(); err != nil {
+		slog.Warn("Failed to close audit logger", "error", err)
+	}
+}

@@ -1,0 +1,500 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metadata
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+const testMetadataJSON = `{
+  "version": "1.0",
+  "timestamp": "2025-01-15T10:00:00Z",
+  "node_name": "test-node",
+  "chassis_serial": "CHASSIS-12345",
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-00000000-0000-0000-0000-000000000000",
+      "pci_address": "0000:17:00.0",
+      "serial_number": "SN-GPU-0",
+      "device_name": "NVIDIA A100",
+      "nvlinks": [
+        {
+          "link_id": 0,
+          "remote_pci_address": "00000008:00:00.0",
+          "remote_link_id": 29
+        },
+        {
+          "link_id": 1,
+          "remote_pci_address": "00000008:00:00.0",
+          "remote_link_id": 28
+        }
+      ]
+    },
+    {
+      "gpu_id": 1,
+      "uuid": "GPU-11111111-1111-1111-1111-111111111111",
+      "pci_address": "0000:65:00.0",
+      "serial_number": "SN-GPU-1",
+      "device_name": "NVIDIA A100",
+      "nvlinks": [
+        {
+          "link_id": 0,
+          "remote_pci_address": "00000008:00:00.0",
+          "remote_link_id": 30
+        }
+      ]
+    }
+  ],
+  "nvswitches": ["00000008:00:00.0"]
+}`
+
+const testMetadataNoChassisSerial = `{
+  "version": "1.0",
+  "timestamp": "2025-01-15T10:00:00Z",
+  "node_name": "test-node",
+  "chassis_serial": null,
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-00000000-0000-0000-0000-000000000000",
+      "pci_address": "0000:17:00.0",
+      "serial_number": "SN-GPU-0",
+      "device_name": "NVIDIA A100",
+      "nvlinks": []
+    }
+  ],
+  "nvswitches": []
+}`
+
+func atomicReplace(t *testing.T, path string, data []byte) {
+	t.Helper()
+	tmp := path + ".next"
+	require.NoError(t, os.WriteFile(tmp, data, 0600))
+	require.NoError(t, os.Rename(tmp, path))
+}
+
+func metadataWithGPU0UUID(uuid string) string {
+	return strings.Replace(testMetadataJSON, "GPU-00000000-0000-0000-0000-000000000000", uuid, 1)
+}
+
+func metadataWithDriverVersion(version string) string {
+	return strings.Replace(testMetadataJSON, `"node_name": "test-node",`, `"node_name": "test-node",`+"\n  \"driver_version\": \""+version+"\",", 1)
+}
+
+func TestReaderLazyLoading(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+	require.Nil(t, reader.metadata)
+
+	gpu, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+	require.NotNil(t, reader.metadata)
+	require.Equal(t, 0, gpu.GPUID)
+	require.Equal(t, "GPU-00000000-0000-0000-0000-000000000000", gpu.UUID)
+}
+
+func TestReaderConcurrentAccess(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			_, err := reader.GetGPUByPCI("0000:17:00.0")
+			require.NoError(t, err)
+		})
+	}
+
+	wg.Wait()
+}
+
+func TestReaderRefreshesPCIToUUIDAfterAtomicReplacement(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+	gpu, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "GPU-00000000-0000-0000-0000-000000000000", gpu.UUID)
+
+	atomicReplace(t, metadataFile, []byte(metadataWithGPU0UUID("GPU-refreshed")))
+	gpu, err = reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "GPU-refreshed", gpu.UUID)
+	_, err = reader.GetInfoByUUID("GPU-00000000-0000-0000-0000-000000000000")
+	require.Error(t, err)
+}
+
+func TestReaderMalformedReplacementKeepsLastSuccessfulSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+	_, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+
+	atomicReplace(t, metadataFile, []byte("{malformed"))
+	gpu, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "GPU-00000000-0000-0000-0000-000000000000", gpu.UUID)
+
+	atomicReplace(t, metadataFile, []byte(metadataWithGPU0UUID("GPU-recovered")))
+	gpu, err = reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "GPU-recovered", gpu.UUID)
+}
+
+func TestGetDriverVersionRefreshesEmptyValueAfterAtomicReplacement(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+	require.Empty(t, reader.GetDriverVersion())
+
+	atomicReplace(t, metadataFile, []byte(metadataWithDriverVersion("575.57.08")))
+	require.Equal(t, "575.57.08", reader.GetDriverVersion())
+}
+
+func TestGetDriverVersionMalformedReplacementKeepsLastSuccessfulValue(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(metadataWithDriverVersion("575.57.08")), 0600))
+
+	reader := NewReader(metadataFile)
+	require.Equal(t, "575.57.08", reader.GetDriverVersion())
+
+	atomicReplace(t, metadataFile, []byte("{malformed"))
+	require.Equal(t, "575.57.08", reader.GetDriverVersion())
+}
+
+func TestReaderConcurrentLookupsDuringAtomicReplacement(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+	_, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.NoError(t, err)
+
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				gpu, lookupErr := reader.GetGPUByPCI("0000:17:00.0")
+				if lookupErr != nil {
+					errCh <- lookupErr
+					return
+				}
+				if gpu.UUID != "GPU-00000000-0000-0000-0000-000000000000" && gpu.UUID != "GPU-refreshed" {
+					errCh <- fmt.Errorf("unexpected UUID %q", gpu.UUID)
+					return
+				}
+			}
+		}()
+	}
+	for i := range 50 {
+		uuid := "GPU-00000000-0000-0000-0000-000000000000"
+		if i%2 == 0 {
+			uuid = "GPU-refreshed"
+		}
+		atomicReplace(t, metadataFile, []byte(metadataWithGPU0UUID(uuid)))
+	}
+	wg.Wait()
+	close(errCh)
+	for concurrentErr := range errCh {
+		require.NoError(t, concurrentErr)
+	}
+}
+
+func TestGetGPUByPCI(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+
+	tests := []struct {
+		name    string
+		pci     string
+		wantID  int
+		wantErr bool
+	}{
+		{
+			name:    "exact match",
+			pci:     "0000:17:00.0",
+			wantID:  0,
+			wantErr: false,
+		},
+		{
+			name:    "normalized match",
+			pci:     "0000:65:00.0",
+			wantID:  1,
+			wantErr: false,
+		},
+		{
+			name:    "long domain normalized",
+			pci:     "00000000:17:00.0",
+			wantID:  0,
+			wantErr: false,
+		},
+		{
+			name:    "not found",
+			pci:     "0000:99:00.0",
+			wantID:  -1,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gpu, err := reader.GetGPUByPCI(tt.pci)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Nil(t, gpu)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, gpu)
+				require.Equal(t, tt.wantID, gpu.GPUID)
+			}
+		})
+	}
+}
+
+func TestGetInfoByUUID(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+
+	tests := []struct {
+		name    string
+		uuid    string
+		wantID  int
+		wantErr bool
+	}{
+		{
+			name:    "exact match for GPU 0",
+			uuid:    "GPU-00000000-0000-0000-0000-000000000000",
+			wantID:  0,
+			wantErr: false,
+		},
+		{
+			name:    "exact match for GPU 1",
+			uuid:    "GPU-11111111-1111-1111-1111-111111111111",
+			wantID:  1,
+			wantErr: false,
+		},
+		{
+			name:    "GPU not found",
+			uuid:    "GPU-123",
+			wantID:  -1,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gpu, err := reader.GetInfoByUUID(tt.uuid)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Nil(t, gpu)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, gpu)
+				require.Equal(t, tt.wantID, gpu.GPUID)
+			}
+		})
+	}
+}
+
+func TestGetGPUByNVSwitchLink(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	reader := NewReader(metadataFile)
+
+	tests := []struct {
+		name          string
+		nvswitchPCI   string
+		linkID        int
+		wantGPUID     int
+		wantLocalLink int
+		wantErr       bool
+	}{
+		{
+			name:          "GPU 0 link 0",
+			nvswitchPCI:   "00000008:00:00.0",
+			linkID:        29,
+			wantGPUID:     0,
+			wantLocalLink: 0,
+			wantErr:       false,
+		},
+		{
+			name:          "GPU 0 link 1",
+			nvswitchPCI:   "00000008:00:00.0",
+			linkID:        28,
+			wantGPUID:     0,
+			wantLocalLink: 1,
+			wantErr:       false,
+		},
+		{
+			name:          "GPU 1 link 0",
+			nvswitchPCI:   "00000008:00:00.0",
+			linkID:        30,
+			wantGPUID:     1,
+			wantLocalLink: 0,
+			wantErr:       false,
+		},
+		{
+			name:        "nvswitch not found",
+			nvswitchPCI: "0000:99:00.0",
+			linkID:      0,
+			wantErr:     true,
+		},
+		{
+			name:        "link not found",
+			nvswitchPCI: "00000008:00:00.0",
+			linkID:      999,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gpu, localLink, err := reader.GetGPUByNVSwitchLink(tt.nvswitchPCI, tt.linkID)
+			if tt.wantErr {
+				require.Error(t, err)
+				require.Nil(t, gpu)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, gpu)
+				require.Equal(t, tt.wantGPUID, gpu.GPUID)
+				require.Equal(t, tt.wantLocalLink, localLink)
+			}
+		})
+	}
+}
+
+func TestGetChassisSerial(t *testing.T) {
+	t.Run("with chassis serial", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+		require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+		reader := NewReader(metadataFile)
+		serial := reader.GetChassisSerial()
+		require.NotNil(t, serial)
+		require.Equal(t, "CHASSIS-12345", *serial)
+	})
+
+	t.Run("without chassis serial", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+		require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataNoChassisSerial), 0600))
+
+		reader := NewReader(metadataFile)
+		serial := reader.GetChassisSerial()
+		require.Nil(t, serial)
+	})
+}
+
+func TestReaderFileNotFound(t *testing.T) {
+	reader := NewReader("/nonexistent/file.json")
+	_, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to load metadata for PCI lookup")
+	require.Contains(t, err.Error(), "failed to read metadata file")
+}
+
+func TestReaderMalformedJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte("{invalid json"), 0600))
+
+	reader := NewReader(metadataFile)
+	_, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to load metadata for PCI lookup")
+	require.Contains(t, err.Error(), "failed to parse metadata JSON")
+}
+
+func TestReaderRetriesAfterLoadFailure(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	reader := NewReader(metadataFile)
+
+	_, err := reader.GetGPUByPCI("0000:17:00.0")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to load metadata for PCI lookup 0000:17:00.0")
+	require.Contains(t, err.Error(), "failed to read metadata file")
+
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+
+	gpu, err := reader.GetGPUByPCI("0000:65:00.0")
+	require.NoError(t, err)
+	require.Equal(t, "GPU-11111111-1111-1111-1111-111111111111", gpu.UUID)
+}
+
+func TestGetGPUByNVSwitchLinkErrorWrapping(t *testing.T) {
+	reader := NewReader("/nonexistent/file.json")
+	_, _, err := reader.GetGPUByNVSwitchLink("0008:00:00.0", 29)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed to load metadata for NVSwitch lookup")
+	require.Contains(t, err.Error(), "0008:00:00.0")
+	require.Contains(t, err.Error(), "link 29")
+	require.Contains(t, err.Error(), "failed to read metadata file")
+}
+
+func TestNormalizePCI(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"0000:17:00.0", "0000:17:00"},
+		{"00000000:17:00.0", "0000:17:00"},
+		{"00000008:00:00.0", "0008:00:00"},
+		{"FFFF:AB:CD.0", "ffff:ab:cd"},
+		{"0000:17:00", "0000:17:00"},
+		{"invalid-pci", "invalid-pci"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := normalizePCI(tt.input)
+			require.Equal(t, tt.expected, result)
+		})
+	}
+}

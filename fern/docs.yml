@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
+
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+instances:
+  - url: nvsentinel.docs.buildwithfern.com/nvsentinel
+    custom-domain: docs.nvidia.com/nvsentinel
+    multi-source: true
+title: NVIDIA NVSentinel Documentation
+global-theme: nvidia
+metadata:
+  canonical-host: "docs.nvidia.com/nvsentinel"
+products:
+  - display-name: NVSentinel
+    slug: /
+    path: ../docs/index.yml
+    versions:
+      - display-name: v1.31.0
+        path: versions/v1.31.0.yml
+        slug: v1.31.0
+        availability: stable
+      - display-name: v1.30.0
+        path: versions/v1.30.0.yml
+        slug: v1.30.0
+        availability: stable
+      - display-name: v1.29.0
+        path: versions/v1.29.0.yml
+        slug: v1.29.0
+        availability: stable
+redirects:
+  - source: "/nvsentinel/index.html"
+    destination: "/nvsentinel/"
+  - source: "/nvsentinel/latest/:path*"
+    destination: "/nvsentinel/:path*"
+  - source: "/nvsentinel/dev/:path*"
+    destination: "/nvsentinel/:path*"
+logo:
+  href: /nvsentinel
+  right-text: Documentation
+navbar-links:
+  - type: github
+    value: https://github.com/NVIDIA/NVSentinel

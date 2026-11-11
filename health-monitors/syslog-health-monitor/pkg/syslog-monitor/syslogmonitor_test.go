@@ -1,0 +1,2005 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.package faultdiagnostics
+package syslogmonitor
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	pb "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/healthpub"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/types"
+)
+
+const (
+	TEST_NODE                   = "test-node"
+	TEST_AGENT                  = "test-agent"
+	TEST_COMPONENT              = "test-component"
+	TEST_JOURNAL_PATH           = "/fake/journal/path"
+	TEST_LOG_WITH_MATCH_IN_IT   = "Log with match in it"
+	TEST_LOG_WITH_MATCH_IN_IT_2 = "Another log with match in it"
+	JOURNAL_CLOSED_ERROR        = "journal is closed"
+)
+
+// MockJournalEntry represents a single journal entry
+type MockJournalEntry struct {
+	Message   string
+	BootID    string
+	Cursor    string
+	Fields    map[string]string
+	Timestamp string
+}
+
+// MockJournal is a mock implementation of the Journal interface for testing
+type MockJournal struct {
+	Entries         []MockJournalEntry
+	Path            string
+	CurrentPosition int
+	MatchFilters    []string
+	Disjunctions    int
+	Closed          bool
+	TestBootID      string
+	TestCursor      string
+	FailNextEntry   bool
+	FailGetBootID   bool
+	FailGetCursor   bool
+	FailGetData     bool
+	FailSeekCursor  bool
+	FailSeekTail    bool
+	// InclusiveSeekCursor simulates systemd behavior with journal matches active:
+	// the first Next() after SeekCursor returns the bookmarked entry itself.
+	InclusiveSeekCursor  bool
+	replayBookmarkOnNext bool
+	// Tracking fields for test assertions on seek behavior.
+	SeekHeadCalled       bool
+	LastSeekRealtimeUsec uint64
+	SeekRealtimeCalled   bool
+	// DataWithFieldName makes GetData return "FIELD=value", the whole data
+	// object, as sd_journal_get_data does on a real journal.
+	DataWithFieldName bool
+}
+
+// AddMatch adds a match filter for journal entries
+func (j *MockJournal) AddMatch(match string) error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	j.MatchFilters = append(j.MatchFilters, match)
+
+	return nil
+}
+
+// AddDisjunction inserts an OR between journal match groups.
+func (j *MockJournal) AddDisjunction() error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	j.Disjunctions++
+
+	return nil
+}
+
+// Close closes the journal
+func (j *MockJournal) Close() error {
+	j.Closed = true
+	return nil
+}
+
+// GetBootID retrieves the current boot ID
+func (j *MockJournal) GetBootID() (string, error) {
+	if j.Closed {
+		return "", errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailGetBootID {
+		return "", fmt.Errorf("forced GetBootID failure")
+	}
+
+	if j.TestBootID != "" {
+		return j.TestBootID, nil
+	}
+
+	if j.CurrentPosition >= 0 && j.CurrentPosition < len(j.Entries) {
+		return j.Entries[j.CurrentPosition].BootID, nil
+	}
+
+	return "mock-boot-id", nil
+}
+
+// GetCursor returns a cursor that can be used to seek to the current location
+func (j *MockJournal) GetCursor() (string, error) {
+	if j.Closed {
+		return "", errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailGetCursor {
+		return "", fmt.Errorf("forced GetCursor failure")
+	}
+
+	if j.TestCursor != "" {
+		return j.TestCursor, nil
+	}
+
+	if j.CurrentPosition >= 0 && j.CurrentPosition < len(j.Entries) {
+		return j.Entries[j.CurrentPosition].Cursor, nil
+	}
+
+	return "mock-cursor", nil
+}
+
+// GetData retrieves a field from the current journal entry
+func (j *MockJournal) GetData(field string) (string, error) {
+	if j.Closed {
+		return "", errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailGetData {
+		return "", fmt.Errorf("forced GetData failure")
+	}
+
+	if j.CurrentPosition < 0 || j.CurrentPosition >= len(j.Entries) {
+		return "", fmt.Errorf("invalid cursor position")
+	}
+
+	value := j.Entries[j.CurrentPosition].Message
+
+	if field != "MESSAGE" {
+		var ok bool
+
+		value, ok = j.Entries[j.CurrentPosition].Fields[field]
+		if !ok {
+			return "", fmt.Errorf("field not found: %s", field)
+		}
+	}
+
+	if j.DataWithFieldName {
+		return field + "=" + value, nil
+	}
+
+	return value, nil
+}
+
+// Next moves to the next journal entry
+func (j *MockJournal) Next() (uint64, error) {
+	if j.Closed {
+		return 0, errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailNextEntry {
+		return 0, fmt.Errorf("forced Next failure")
+	}
+
+	if j.replayBookmarkOnNext {
+		j.replayBookmarkOnNext = false
+		if j.CurrentPosition >= 0 && j.CurrentPosition < len(j.Entries) {
+			return 1, nil
+		}
+
+		return 0, io.EOF
+	}
+
+	j.CurrentPosition++
+	if j.CurrentPosition >= len(j.Entries) {
+		return 0, io.EOF
+	}
+
+	return 1, nil
+}
+
+// Previous moves to the previous journal entry
+func (j *MockJournal) Previous() (uint64, error) {
+	if j.Closed {
+		return 0, errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	j.CurrentPosition--
+	if j.CurrentPosition < 0 {
+		j.CurrentPosition = -1
+		return 0, io.EOF
+	}
+
+	return 1, nil
+}
+
+// SeekCursor seeks to a position indicated by a cursor
+func (j *MockJournal) SeekCursor(cursor string) error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailSeekCursor {
+		return fmt.Errorf("forced SeekCursor failure")
+	}
+
+	for i, entry := range j.Entries {
+		if entry.Cursor == cursor {
+			j.CurrentPosition = i
+			if j.InclusiveSeekCursor {
+				j.replayBookmarkOnNext = true
+			}
+
+			return nil
+		}
+	}
+
+	return fmt.Errorf("cursor not found: %s", cursor)
+}
+
+// SeekHead seeks to the beginning of the journal
+func (j *MockJournal) SeekHead() error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	j.SeekHeadCalled = true
+	j.CurrentPosition = -1
+
+	return nil
+}
+
+// SeekRealtimeUsec seeks to the entry closest to the given realtime timestamp
+func (j *MockJournal) SeekRealtimeUsec(usec uint64) error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	j.SeekRealtimeCalled = true
+	j.LastSeekRealtimeUsec = usec
+	j.CurrentPosition = -1
+
+	return nil
+}
+
+// SeekTail seeks to the end of the journal
+func (j *MockJournal) SeekTail() error {
+	if j.Closed {
+		return errors.New(JOURNAL_CLOSED_ERROR)
+	}
+
+	if j.FailSeekTail {
+		return fmt.Errorf("forced SeekTail failure")
+	}
+
+	if len(j.Entries) > 0 {
+		j.CurrentPosition = len(j.Entries) - 1
+	} else {
+		j.CurrentPosition = -1
+	}
+
+	return nil
+}
+
+// MockJournalFactory creates mock journal instances
+type MockJournalFactory struct {
+	JournalsByPath map[string]*MockJournal
+	DefaultJournal *MockJournal
+}
+
+// NewJournal creates a new system journal instance
+func (f *MockJournalFactory) NewJournal() (Journal, error) {
+	if f.DefaultJournal != nil {
+		return f.DefaultJournal, nil
+	}
+
+	return &MockJournal{
+		CurrentPosition: -1,
+		TestBootID:      "mock-boot-id",
+	}, nil
+}
+
+// NewJournalFromDir creates a journal from the specified directory
+func (f *MockJournalFactory) NewJournalFromDir(path string) (Journal, error) {
+	journal, ok := f.JournalsByPath[path]
+	if !ok {
+		return nil, fmt.Errorf("no mock journal configured for path: %s", path)
+	}
+
+	return journal, nil
+}
+
+// RequiresFileSystemCheck implements the JournalFactory interface
+func (f *MockJournalFactory) RequiresFileSystemCheck() bool {
+	return false // Mock journals don't need filesystem validation
+}
+
+// NewMockJournalFactory creates a factory for mock journal instances
+func NewMockJournalFactory() *MockJournalFactory {
+	return &MockJournalFactory{
+		JournalsByPath: make(map[string]*MockJournal),
+	}
+}
+
+// LogCheckConfig represents the YAML configuration structure
+type LogCheckConfig struct {
+	Checks []CheckDefinition `yaml:"checks"`
+}
+
+// recordingHandler records messages passed to ProcessLine for test assertions.
+type recordingHandler struct {
+	messages []string
+}
+
+func (h *recordingHandler) ProcessLine(message string) (*pb.HealthEvents, error) {
+	h.messages = append(h.messages, message)
+	return nil, nil
+}
+
+// Mock PlatformConnectorClient
+type mockPlatformConnectorClient struct {
+	RecordedHealthEvents []*pb.HealthEvents
+}
+
+func (m *mockPlatformConnectorClient) HealthEventOccurredV1(ctx context.Context, events *pb.HealthEvents, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.RecordedHealthEvents = append(m.RecordedHealthEvents, events)
+	return &emptypb.Empty{}, nil
+}
+
+func TestNewSyslogMonitor(t *testing.T) {
+	args := struct {
+		NodeName              string
+		Checks                []CheckDefinition
+		PcClient              pb.PlatformConnectorClient
+		DefaultAgentName      string
+		DefaultComponentClass string
+		PollingInterval       string
+	}{
+		NodeName: TEST_NODE,
+		Checks: []CheckDefinition{
+			{Name: "check1", JournalPath: "/some/path"}, // JournalPath is still relevant for the CheckDefinition
+		},
+		PcClient:              &mockPlatformConnectorClient{},
+		DefaultAgentName:      TEST_AGENT,
+		DefaultComponentClass: TEST_COMPONENT,
+		PollingInterval:       "60s",
+	}
+
+	// Test case 1: Valid configuration with default factory
+	testStateFile := "/tmp/test-syslog-monitor-state.json"
+	defer os.Remove(testStateFile) // Cleanup
+
+	filePath := testStateFile
+
+	monitor, err := NewSyslogMonitor(args.NodeName,
+		args.Checks, args.PcClient, args.DefaultAgentName, args.DefaultComponentClass, args.PollingInterval, filePath, "http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_STORE_ONLY, "", "", nil, "tcp://test", 30*time.Minute)
+	assert.NoError(t, err)
+	assert.NotNil(t, monitor)
+	assert.Equal(t, args.NodeName, monitor.nodeName)
+	assert.Equal(t, args.Checks, monitor.checks)
+	assert.NotNil(t, monitor.journalFactory, "Journal factory should not be nil")
+	assert.Equal(t, testStateFile, monitor.stateFilePath)
+	assert.Equal(t, pb.ProcessingStrategy_STORE_ONLY, monitor.processingStrategy)
+
+	// Test case 2: With specific fake factory
+	fakeJournalFactory := NewFakeJournalFactory()
+	fakeJournal := NewFakeJournal()
+	fakeJournal.Path = "/fake/journal"
+	fakeJournalFactory.AddJournal("/some/path", fakeJournal)
+
+	testStateFile2 := "/tmp/test-syslog-monitor-state2.json"
+	defer os.Remove(testStateFile2) // Cleanup
+
+	filePath = testStateFile2
+	monitor, err = NewSyslogMonitorWithFactory(args.NodeName,
+		args.Checks, args.PcClient, args.DefaultAgentName, args.DefaultComponentClass, args.PollingInterval, filePath, fakeJournalFactory, "http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION, "", "", nil, "tcp://test", 30*time.Minute)
+	assert.NoError(t, err)
+	assert.NotNil(t, monitor)
+	assert.Equal(t, fakeJournalFactory, monitor.journalFactory)
+}
+
+func TestPrepareHealthEvent(t *testing.T) {
+	check := CheckDefinition{
+		Name: "test_check",
+	}
+
+	fd := &SyslogMonitor{
+		nodeName:              TEST_NODE,
+		defaultAgentName:      TEST_AGENT,
+		defaultComponentClass: TEST_COMPONENT,
+	}
+
+	message := "test message"
+	errRes := types.ErrorResolution{
+		RecommendedAction: pb.RecommendedAction_RESTART_BM,
+	}
+	healthEvents := fd.prepareHealthEventWithAction(check, message, false, errRes)
+
+	assert.NotNil(t, healthEvents)
+	assert.Equal(t, uint32(1), healthEvents.Version)
+	assert.Len(t, healthEvents.Events, 1)
+
+	event := healthEvents.Events[0]
+	assert.Equal(t, uint32(1), event.Version)
+	assert.Equal(t, TEST_AGENT, event.Agent)
+	assert.Equal(t, "test_check", event.CheckName)
+	assert.Equal(t, TEST_COMPONENT, event.ComponentClass)
+	assert.Equal(t, TEST_NODE, event.NodeName)
+	assert.Equal(t, message, event.Message)
+	assert.False(t, event.IsHealthy)
+	assert.False(t, event.IsFatal)
+	assert.Equal(t, errRes.RecommendedAction, event.RecommendedAction)
+}
+
+// TestJournalProcessingLogic tests specific journal cursor handling logic
+func TestJournalProcessingLogic(t *testing.T) {
+	// Create a check definition
+	check := CheckDefinition{
+		Name:        "mockCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	// Create fake journal with some entries
+	fakeJournal := NewFakeJournal()
+	fakeJournal.AddEntryWithMessage("nothing", "cursor-1")
+	fakeJournal.AddEntryWithMessage("sxid123", "cursor-2")
+	fakeJournal.AddEntryWithMessage("Another error message", "cursor-3")
+
+	// Create factory and add journal
+	fakeJournalFactory := NewFakeJournalFactory()
+	fakeJournalFactory.AddJournal(check.JournalPath, fakeJournal)
+
+	// Create SyslogMonitor
+	testStateFile := "/tmp/test-syslog-monitor-state-4.json"
+	defer os.Remove(testStateFile)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		fakeJournalFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	sm.checkToHandlerMap["mockCheck"] = &mockHandler{
+		nodeName:              "test",
+		defaultAgentName:      "syslog-health-monitor",
+		defaultComponentClass: "GPU",
+		checkName:             "mockCheck",
+	}
+	// First run should initialize cursor
+	err = sm.executeCheck(check)
+	assert.NoError(t, err)
+
+	// Verify cursor was stored
+	cursor, exists := sm.checkLastCursors[check.Name]
+	assert.True(t, exists, "Cursor should be stored after first run")
+	assert.NotEmpty(t, cursor)
+
+	// Add new entries that would exceed threshold
+	fakeJournal.AddEntryWithMessage("New error message 1", "cursor-4")
+	fakeJournal.AddEntryWithMessage("New error message 2", "cursor-5")
+
+	// Create new mock client to track events clearly
+	mockPCClient := &mockPlatformConnectorClient{}
+	sm.pub = healthpub.New(mockPCClient, "tcp://test", sm.defaultAgentName)
+
+	// Next execution should process only new entries since the last cursor
+	err = sm.executeCheck(check)
+	assert.NoError(t, err)
+
+	// Since we have new entries with errors and count=0, we should get a health event
+	assert.NotEmpty(t, mockPCClient.RecordedHealthEvents, "Health event should be sent for entries above threshold")
+}
+
+type mockHandler struct {
+	nodeName              string
+	defaultAgentName      string
+	defaultComponentClass string
+	checkName             string
+}
+
+func (mh *mockHandler) ProcessLine(message string) (*pb.HealthEvents, error) {
+	if !strings.Contains(message, "sxid123") {
+		return nil, nil
+	}
+	event := &pb.HealthEvent{
+		Version:            1,
+		Agent:              mh.defaultAgentName,
+		CheckName:          mh.checkName,
+		ComponentClass:     mh.defaultComponentClass,
+		GeneratedTimestamp: timestamppb.New(time.Now()),
+		EntitiesImpacted: []*pb.Entity{
+			{EntityType: "GPU", EntityValue: "44"},
+		},
+		Message:           "TestMessage",
+		IsFatal:           true,
+		IsHealthy:         false,
+		NodeName:          mh.nodeName,
+		RecommendedAction: pb.RecommendedAction_RESTART_BM,
+		ErrorCode:         []string{"123"},
+	}
+
+	return &pb.HealthEvents{
+		Version: 1,
+		Events:  []*pb.HealthEvent{event},
+	}, nil
+}
+
+// TestJournalStateManagement tests state persistence and recovery
+func TestJournalStateManagement(t *testing.T) {
+	testStateFile := "/tmp/test-syslog-monitor-state-mgmt.json"
+	defer os.Remove(testStateFile)
+
+	check := CheckDefinition{
+		Name:        "stateCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "entry1", Cursor: "cursor-1", BootID: "boot-1"},
+			{Message: "entry2", Cursor: "cursor-2", BootID: "boot-1"},
+			{Message: "entry3", Cursor: "cursor-3", BootID: "boot-1"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-1",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	sm.checkToHandlerMap["stateCheck"] = &mockHandler{
+		nodeName:              "test",
+		defaultAgentName:      "syslog-health-monitor",
+		defaultComponentClass: "GPU",
+		checkName:             "stateCheck",
+	}
+
+	err = sm.executeCheck(check)
+	assert.NoError(t, err)
+
+	cursor, exists := sm.checkLastCursors[check.Name]
+	assert.True(t, exists)
+	assert.NotEmpty(t, cursor)
+
+	err = sm.saveCurrentState()
+	assert.NoError(t, err)
+
+	sm2, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	loadedCursor, exists := sm2.checkLastCursors[check.Name]
+	assert.True(t, exists)
+	assert.Equal(t, cursor, loadedCursor, "Loaded cursor should match saved cursor")
+}
+
+// TestBootIDChangeHandling tests boot ID change detection
+func TestBootIDChangeHandling(t *testing.T) {
+	testStateFile := "/tmp/test-syslog-monitor-bootid.json"
+	defer os.Remove(testStateFile)
+
+	check := CheckDefinition{
+		Name:        "bootCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "entry1", Cursor: "cursor-1", BootID: "boot-2"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+
+	initialState := syslogMonitorState{
+		BootID:           "boot-1",
+		CheckLastCursors: map[string]string{"bootCheck": "old-cursor"},
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(testStateFile, stateData, 0644)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	cursor, exists := sm.checkLastCursors[check.Name]
+	if exists {
+		assert.Empty(t, cursor, "Cursor should be cleared after boot ID change")
+	}
+}
+
+// TestBootIDChange_StateNotPersistedWhenSendSkipped: when the
+// platform-connector socket is missing, post-reboot healthy sends are
+// skipped via the healthpub gate; the new BootID must NOT be persisted
+// to disk so a subsequent retry can re-deliver. Once the socket
+// appears, a single Run() call must drain the pending flush and
+// persist the new BootID.
+func TestBootIDChange_StateNotPersistedWhenSendSkipped(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+	socketPathTest := tmpDir + "/no.sock"
+
+	oldBootID := "old-boot-id"
+	initialState := syslogMonitorState{
+		BootID:           oldBootID,
+		CheckLastCursors: map[string]string{XIDErrorCheck: "old-cursor"},
+	}
+	stateData, err := json.Marshal(initialState)
+	assert.NoError(t, err)
+	assert.NoError(t, os.WriteFile(stateFilePath, stateData, 0o644))
+
+	check := CheckDefinition{Name: XIDErrorCheck, JournalPath: TEST_JOURNAL_PATH}
+	mockJournal := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "entry1", Cursor: "cursor-1", BootID: "new-boot-id"}},
+		CurrentPosition: -1,
+		TestBootID:      "new-boot-id",
+	}
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+
+	// unix:// target whose socket file does not exist so the gate fires.
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"unix://"+socketPathTest,
+		30*time.Minute,
+	)
+	assert.NoError(t, err, "monitor must construct successfully even when send is skipped")
+	assert.NotNil(t, sm)
+
+	// fetchCurrentBootID reads the kernel boot-id; capture it from the
+	// constructor so the test is independent of the host's UUID.
+	expectedBootID := sm.currentBootID
+	require.NotEmpty(t, expectedBootID, "test prerequisite: kernel boot-id must be readable")
+	require.NotEqual(t, oldBootID, expectedBootID)
+
+	// In-memory cursors are cleared regardless of persistence.
+	cursor, exists := sm.checkLastCursors[check.Name]
+	if exists {
+		assert.Empty(t, cursor, "in-memory cursor should be cleared")
+	}
+
+	// On-disk state must still hold the OLD BootID.
+	loaded := readState(t, stateFilePath)
+	assert.Equal(t, oldBootID, loaded.BootID,
+		"BootID must remain old on disk when post-reboot healthy events were skipped")
+	assert.Equal(t, expectedBootID, sm.pendingPostRebootBootID,
+		"pendingPostRebootBootID must hold the current bootID for retry")
+
+	// Run() with the socket still missing must NOT persist the new
+	// BootID. Previously this was a regression: executeCheck →
+	// saveCurrentState would overwrite on-disk BootID with
+	// sm.currentBootID, breaking the retry guarantee after one cycle.
+	assert.NoError(t, sm.Run(context.Background()))
+
+	loaded = readState(t, stateFilePath)
+	assert.Equal(t, oldBootID, loaded.BootID,
+		"BootID must remain old on disk after Run() while flush is still pending")
+	assert.Equal(t, expectedBootID, sm.pendingPostRebootBootID,
+		"pendingPostRebootBootID must remain set after deferred Run()")
+
+	// Make the socket appear and call Run(); the pending flush should
+	// drain and persist the new BootID within one cycle.
+	require.NoError(t, os.WriteFile(socketPathTest, nil, 0o644))
+
+	assert.NoError(t, sm.Run(context.Background()))
+
+	loaded = readState(t, stateFilePath)
+	assert.Equal(t, expectedBootID, loaded.BootID,
+		"BootID must be persisted within one Run() after socket appears")
+	assert.Empty(t, sm.pendingPostRebootBootID,
+		"pendingPostRebootBootID must clear after successful flush")
+}
+
+// readState helper for the bootID-flush test.
+func readState(t *testing.T, stateFilePath string) syslogMonitorState {
+	t.Helper()
+
+	persisted, err := os.ReadFile(stateFilePath)
+	require.NoError(t, err)
+
+	var loaded syslogMonitorState
+	require.NoError(t, json.Unmarshal(persisted, &loaded))
+
+	return loaded
+}
+
+// TestBootIDChange_ProcessesEntriesFromBootStart verifies that after a
+// boot-ID change, the monitor seeks to the beginning of the current
+// boot's journal and processes entries that were emitted before the
+// monitor started, rather than skipping them by seeking to the tail.
+func TestBootIDChange_ProcessesEntriesFromBootStart(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{
+		Name:        "bootCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	// Journal contains a mixed-boot journal: one stale entry from the
+	// previous boot followed by entries from the current boot. The stale
+	// entry must be skipped by the application-level boot filter.
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "NVRM: Xid (PCI:0000:38:00): 48, stale previous-boot XID", Cursor: "cursor-0", BootID: "boot-1",
+				Fields: map[string]string{FieldBootID: "boot-1"}},
+			{Message: "NVRM: Xid (PCI:0000:38:00): 79, GPU has fallen off the bus", Cursor: "cursor-1", BootID: "boot-2",
+				Fields: map[string]string{FieldBootID: "boot-2"}},
+			{Message: "NVRM: Xid (PCI:0000:38:00): 154, GPU recovery action", Cursor: "cursor-2", BootID: "boot-2",
+				Fields: map[string]string{FieldBootID: "boot-2"}},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-2", CurrentPosition: -1}
+
+	// State from previous boot with a cursor that is now invalid.
+	initialState := syslogMonitorState{
+		Version:          stateFileVersion,
+		BootID:           "boot-1",
+		CheckLastCursors: map[string]string{"bootCheck": "old-cursor-from-boot-1"},
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	// Override currentBootID so the application-level boot filter matches
+	// the mock journal entries (on Linux, fetchCurrentBootID returns the
+	// real kernel UUID which would not match "boot-2").
+	sm.currentBootID = "boot-2"
+
+	// Register a recording handler so we can assert which messages were
+	// actually processed (vs skipped by the boot filter).
+	recorder := &recordingHandler{}
+	sm.checkToHandlerMap[check.Name] = recorder
+
+	// Boot change detected: cursors cleared, postRebootInit set.
+	assert.True(t, sm.postRebootInit, "postRebootInit must be true after boot-ID change")
+	_, hasCursor := sm.checkLastCursors[check.Name]
+	assert.False(t, hasCursor, "cursor must be cleared after boot-ID change")
+
+	// Run the first poll cycle.
+	assert.NoError(t, sm.Run(context.Background()))
+
+	// Entries from boot start must have been processed (cursor advanced).
+	cursor, exists := sm.checkLastCursors[check.Name]
+	assert.True(t, exists, "cursor must be saved after processing boot-start entries")
+	assert.Equal(t, "cursor-2", cursor, "cursor must be at the last processed entry")
+
+	// The stale boot-1 entry must have been skipped by the boot filter;
+	// only the two boot-2 entries should have reached the handler.
+	assert.Len(t, recorder.messages, 2, "only current-boot entries must be processed")
+	assert.Contains(t, recorder.messages[0], "Xid (PCI:0000:38:00): 79")
+	assert.Contains(t, recorder.messages[1], "Xid (PCI:0000:38:00): 154")
+	for _, msg := range recorder.messages {
+		assert.NotContains(t, msg, "stale previous-boot XID",
+			"stale boot-1 entry must not reach the handler")
+	}
+
+	// postRebootInit must be cleared after successful Run.
+	assert.False(t, sm.postRebootInit, "postRebootInit must be false after successful Run")
+}
+
+// TestBootIDChange_SecondPollResumesFromCursor verifies that after the
+// initial post-reboot scan, subsequent poll cycles resume from the saved
+// cursor rather than re-scanning from boot start.
+func TestBootIDChange_SecondPollResumesFromCursor(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{
+		Name:        "bootCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "entry-before-startup", Cursor: "cursor-1", BootID: "boot-2"},
+			{Message: "entry-after-startup", Cursor: "cursor-2", BootID: "boot-2"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-2", CurrentPosition: -1}
+
+	initialState := syslogMonitorState{
+		Version:          stateFileVersion,
+		BootID:           "boot-1",
+		CheckLastCursors: map[string]string{"bootCheck": "old-cursor"},
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	// First Run: processes from boot start.
+	assert.NoError(t, sm.Run(context.Background()))
+	assert.False(t, sm.postRebootInit, "postRebootInit must be cleared after first Run")
+
+	firstCursor := sm.checkLastCursors[check.Name]
+	assert.NotEmpty(t, firstCursor, "cursor must be saved after first Run")
+
+	// Add a new entry to the journal (simulating ongoing operation).
+	mockJournal.Entries = append(mockJournal.Entries, MockJournalEntry{
+		Message: "new-entry-after-first-poll", Cursor: "cursor-3", BootID: "boot-2",
+	})
+
+	// executeCheck closes the journal via defer after each Run cycle.
+	// Reset so the second Run can reuse the same mock instance.
+	mockJournal.Closed = false
+
+	// Second Run: must resume from cursor, not re-scan from boot start.
+	assert.NoError(t, sm.Run(context.Background()))
+
+	secondCursor := sm.checkLastCursors[check.Name]
+	assert.Equal(t, "cursor-3", secondCursor,
+		"second Run must process only new entries after the saved cursor")
+}
+
+// TestBootIDChange_RealJournalFormat_ReportsCurrentBootXIDsOnce runs the
+// post-reboot scan over data shaped the way a real journal returns it:
+// "FIELD=value" from GetData and _BOOT_ID without dashes. The XIDs this boot
+// logged before the monitor started are published, the previous boot's XID
+// is not, and the next poll publishes only what is new.
+func TestBootIDChange_RealJournalFormat_ReportsCurrentBootXIDsOnce(t *testing.T) {
+	const (
+		previousBootID = "0d9ea1b2-c3d4-4e5f-8a6b-7c8d9e0f1a2b"
+		currentBootID  = "127f6599-4adc-4c6f-955a-3217bb8bb2e3"
+	)
+
+	// journald writes _BOOT_ID as 32 hex digits, without dashes.
+	journaldFields := func(bootID string) map[string]string {
+		return map[string]string{FieldBootID: strings.ReplaceAll(bootID, "-", "")}
+	}
+
+	dir := t.TempDir()
+	stateFilePath := dir + "/state.json"
+	check := CheckDefinition{Name: XIDErrorCheck, JournalPath: TEST_JOURNAL_PATH}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "NVRM: Xid (PCI:0000:3b:00): 48, pid=0, name=, An uncorrectable double bit error (DBE) " +
+				"has been detected on GPU in the framebuffer at partition 0, subpartition 0.",
+				Cursor: "cursor-0", Fields: journaldFields(previousBootID)},
+			{Message: "NVRM: Xid (PCI:0000:3b:00): 79, pid=0, name=, GPU has fallen off the bus.",
+				Cursor: "cursor-1", Fields: journaldFields(currentBootID)},
+			{Message: "NVRM: Xid (PCI:0000:3b:00): 13, pid=4242, name=python3, Graphics SM Warp Exception " +
+				"on (GPC 0, TPC 0, SM 0): Out Of Range Address",
+				Cursor: "cursor-2", Fields: journaldFields(currentBootID)},
+		},
+		CurrentPosition:   -1,
+		TestBootID:        strings.ReplaceAll(currentBootID, "-", ""),
+		DataWithFieldName: true,
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+
+	// The state file survived the reboot, so it still names the previous boot.
+	stateData, err := json.Marshal(syslogMonitorState{
+		Version:           stateFileVersion,
+		BootID:            previousBootID,
+		CheckLastCursors:  map[string]string{check.Name: "cursor-from-the-previous-boot"},
+		BootStartScanDone: true,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(stateFilePath, stateData, 0o600))
+
+	client := &mockPlatformConnectorClient{}
+	sm, err := NewSyslogMonitorWithFactory(TEST_NODE, []CheckDefinition{check}, client,
+		TEST_AGENT, TEST_COMPONENT, "60s", stateFilePath, mockFactory,
+		"", dir+"/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "", nil, "tcp://test", 30*time.Minute)
+	require.NoError(t, err)
+	require.True(t, sm.postRebootInit, "the boot ID change starts the boot-start scan")
+
+	// What fetchCurrentBootID returns on the node, whatever machine runs the test.
+	sm.currentBootID = currentBootID
+
+	publishedXIDs := func() []string {
+		var codes []string
+
+		for _, batch := range client.RecordedHealthEvents {
+			for _, event := range batch.GetEvents() {
+				if !event.GetIsHealthy() {
+					codes = append(codes, event.GetErrorCode()...)
+				}
+			}
+		}
+
+		return codes
+	}
+
+	require.NoError(t, sm.Run(context.Background()))
+	assert.Equal(t, []string{"79", "13"}, publishedXIDs(),
+		"the scan publishes this boot's XIDs and skips the previous boot's")
+	assert.Equal(t, "cursor-2", sm.checkLastCursors[check.Name])
+	assert.False(t, sm.postRebootInit, "the scan is done after one successful run")
+
+	mockJournal.Entries = append(mockJournal.Entries, MockJournalEntry{
+		Message: "NVRM: Xid (PCI:0000:3b:00): 31, pid=4242, name=python3, Ch 00000008, intr 10000000. " +
+			"MMU Fault: ENGINE GRAPHICS GPCCLIENT_T1_0 faulted @ 0x7f2b_00000000. Fault is of type FAULT_PDE",
+		Cursor: "cursor-3", Fields: journaldFields(currentBootID),
+	})
+	mockJournal.Closed = false
+
+	require.NoError(t, sm.Run(context.Background()))
+	assert.Equal(t, []string{"79", "13", "31"}, publishedXIDs(), "the next poll publishes only the new XID")
+	assert.Equal(t, "cursor-3", sm.checkLastCursors[check.Name])
+}
+
+// TestNoBootChange_StillSeeksTail verifies that on first install (no
+// boot-ID change, no saved cursor), the monitor still seeks to the
+// journal tail and does NOT process historical entries.
+func TestNoBootChange_StillSeeksTail(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{
+		Name:        "bootCheck",
+		JournalPath: TEST_JOURNAL_PATH,
+	}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "old-entry-1", Cursor: "cursor-1", BootID: "boot-1"},
+			{Message: "old-entry-2", Cursor: "cursor-2", BootID: "boot-1"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-1",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-1", CurrentPosition: -1}
+
+	// State with same boot ID as current (no reboot detected).
+	// Empty BootID simulates first install (no previous state). The
+	// postRebootInit flag is only set when oldBootID != "", so this
+	// correctly exercises the SeekTail path on any platform.
+	initialState := syslogMonitorState{
+		Version:          stateFileVersion,
+		BootID:           "",
+		CheckLastCursors: map[string]string{},
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	// No boot change: postRebootInit must remain false.
+	assert.False(t, sm.postRebootInit, "postRebootInit must be false when no boot change detected")
+
+	// Run: should seek to tail (initializeJournalFromTail), saving cursor
+	// at the last entry without processing historical entries.
+	assert.NoError(t, sm.Run(context.Background()))
+
+	// SeekTail positions at the last entry; Previous() moves back one;
+	// cursor is saved at that position. No entries are processed in this
+	// cycle (processing starts on the NEXT cycle from after the cursor).
+	cursor, exists := sm.checkLastCursors[check.Name]
+	assert.True(t, exists, "cursor must be saved after tail initialization")
+	assert.NotEmpty(t, cursor, "cursor must not be empty")
+}
+
+// TestRunMultipleChecks tests running multiple checks in sequence
+func TestRunMultipleChecks(t *testing.T) {
+	check1 := CheckDefinition{
+		Name:        XIDErrorCheck,
+		JournalPath: "/path1",
+	}
+	check2 := CheckDefinition{
+		Name:        SXIDErrorCheck,
+		JournalPath: "/path2",
+	}
+
+	mockJournal1 := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "msg1", Cursor: "c1", BootID: "b1"}},
+		CurrentPosition: -1,
+		TestBootID:      "b1",
+	}
+	mockJournal2 := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "msg2", Cursor: "c2", BootID: "b1"}},
+		CurrentPosition: -1,
+		TestBootID:      "b1",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath["/path1"] = mockJournal1
+	mockFactory.JournalsByPath["/path2"] = mockJournal2
+
+	testStateFile := "/tmp/test-syslog-monitor-multi.json"
+	defer os.Remove(testStateFile)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check1, check2},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	err = sm.Run(context.Background())
+	assert.NoError(t, err)
+
+	assert.NotNil(t, sm.checkToHandlerMap[XIDErrorCheck], "XID handler should be initialized")
+	assert.NotNil(t, sm.checkToHandlerMap[SXIDErrorCheck], "SXID handler should be initialized")
+}
+
+// TestGPUFallenOffHandlerInitialization tests that the GPU Fallen Off handler is properly initialized
+func TestGPUFallenOffHandlerInitialization(t *testing.T) {
+	check := CheckDefinition{
+		Name:        GPUFallenOffCheck,
+		JournalPath: "/path",
+	}
+
+	mockJournal := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "test msg", Cursor: "c1", BootID: "b1"}},
+		CurrentPosition: -1,
+		TestBootID:      "b1",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath["/path"] = mockJournal
+
+	testStateFile := "/tmp/test-syslog-monitor-gpufallen.json"
+	defer os.Remove(testStateFile)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		testStateFile,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+	assert.NotNil(t, sm.checkToHandlerMap[GPUFallenOffCheck], "GPU Fallen Off handler should be initialized")
+}
+
+// TestConfigureTagFilters_XIDTagIncludesGPUResetAcknowledgements verifies that
+// the XID reader consumes kernel messages or tagged GPU reset acknowledgements,
+// while still excluding unrelated userspace journal traffic.
+func TestConfigureTagFilters_XIDTagIncludesGPUResetAcknowledgements(t *testing.T) {
+	for _, tag := range []string{"-k", "--dmesg"} {
+		t.Run(tag, func(t *testing.T) {
+			sm := &SyslogMonitor{}
+			mock := &MockJournal{}
+			check := CheckDefinition{Name: XIDErrorCheck, Tags: []string{tag}}
+
+			err := sm.configureTagFilters(mock, check)
+			assert.NoError(t, err)
+			assert.Equal(t, []string{
+				FieldTransport + "=" + TransportKernel,
+				FieldSyslogID + "=" + GPUResetSyslogID,
+			}, mock.MatchFilters)
+			assert.Equal(t, 1, mock.Disjunctions,
+				"kernel and GPU reset identifier matches must be ORed")
+		})
+	}
+}
+
+func TestConfigureTagFilters_NonXIDKernelCheckExcludesGPUResetAcknowledgements(t *testing.T) {
+	sm := &SyslogMonitor{}
+	mock := &MockJournal{}
+	check := CheckDefinition{Name: SXIDErrorCheck, Tags: []string{"-k"}}
+
+	err := sm.configureTagFilters(mock, check)
+	assert.NoError(t, err)
+	assert.Equal(t, []string{FieldTransport + "=" + TransportKernel}, mock.MatchFilters)
+	assert.Zero(t, mock.Disjunctions)
+}
+
+func TestFakeJournal_KernelOrGPUResetIdentifierFilter(t *testing.T) {
+	journal := NewFakeJournal()
+	journal.AddEntry(map[string]string{
+		FieldTransport: "journal",
+		FieldSyslogID:  "unrelated-service",
+	}, "unrelated")
+	journal.AddEntry(map[string]string{
+		FieldTransport: TransportKernel,
+	}, "kernel")
+	journal.AddEntry(map[string]string{
+		FieldTransport: "syslog",
+		FieldSyslogID:  GPUResetSyslogID,
+	}, "gpu-reset")
+
+	assert.NoError(t, journal.AddMatch(FieldTransport+"="+TransportKernel))
+	assert.NoError(t, journal.AddDisjunction())
+	assert.NoError(t, journal.AddMatch(FieldSyslogID+"="+GPUResetSyslogID))
+
+	advanced, err := journal.Next()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(1), advanced)
+	cursor, err := journal.GetCursor()
+	assert.NoError(t, err)
+	assert.Equal(t, "kernel", cursor)
+
+	advanced, err = journal.Next()
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(1), advanced)
+	cursor, err = journal.GetCursor()
+	assert.NoError(t, err)
+	assert.Equal(t, "gpu-reset", cursor)
+}
+
+// TestConfigureTagFilters_NoTagsAddsNoMatch verifies that a check with no tags
+// adds no journal match, i.e. it consumes every facility. This is the
+// pre-fix default behavior the kernel-origin checks must no longer rely on.
+func TestConfigureTagFilters_NoTagsAddsNoMatch(t *testing.T) {
+	sm := &SyslogMonitor{}
+	mock := &MockJournal{}
+	check := CheckDefinition{Name: "SomeUserspaceCheck"}
+
+	err := sm.configureTagFilters(mock, check)
+	assert.NoError(t, err)
+	assert.Empty(t, mock.MatchFilters, "a check with no tags should add no journal match")
+}
+
+// TestResumeFromLastCursor_SkipsBookmarkReReadWithFilteredJournal verifies that
+// resuming from a bookmark does not re-read the last processed kernel entry when
+// systemd returns that entry on the first Next() after SeekCursor with matches
+// active (_TRANSPORT=kernel / "-k"). See NVIDIA/NVSentinel#1417.
+func TestResumeFromLastCursor_SkipsBookmarkReReadWithFilteredJournal(t *testing.T) {
+	sm := &SyslogMonitor{
+		checkLastCursors: map[string]string{
+			XIDErrorCheck: "xid-cursor",
+		},
+	}
+	journal := &MockJournal{
+		InclusiveSeekCursor: true,
+		Entries: []MockJournalEntry{
+			{Cursor: "xid-cursor", Message: "NVRM: Xid (PCI:0008:06:00): 48"},
+		},
+		CurrentPosition: 0,
+		MatchFilters:    []string{FieldTransport + "=" + TransportKernel},
+	}
+	check := CheckDefinition{Name: XIDErrorCheck, Tags: []string{"-k"}}
+
+	ready, err := sm.resumeFromLastCursor(journal, check, "xid-cursor")
+	assert.NoError(t, err)
+	assert.False(t, ready, "should not re-read the bookmarked kernel XID when no newer entries exist")
+}
+
+// --- Unit tests for boot-start scan helpers ---
+
+func TestIsStaleBootEntry(t *testing.T) {
+	tests := []struct {
+		name          string
+		entryBootID   string
+		currentBootID string
+		getDataErr    bool
+		want          bool
+	}{
+		{"same boot", "boot-2", "boot-2", false, false},
+		{"different boot", "boot-1", "boot-2", false, true},
+		{"empty entry boot ID", "", "boot-2", false, false},
+		{"empty current boot ID", "boot-1", "", false, false},
+		{"GetData error", "", "boot-2", true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			journal := &MockJournal{
+				Entries: []MockJournalEntry{
+					{Message: "test", Cursor: "c1", BootID: tt.entryBootID, Fields: map[string]string{FieldBootID: tt.entryBootID}},
+				},
+				CurrentPosition: 0,
+				TestBootID:      tt.entryBootID,
+				FailGetData:     tt.getDataErr,
+			}
+
+			sm := &SyslogMonitor{currentBootID: tt.currentBootID}
+			got := sm.isStaleBootEntry(journal)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestIsStaleBootEntry_RealJournalFormat_MatchesTheCurrentBoot: a real journal
+// returns "_BOOT_ID=<id>" with the ID written without dashes, while the
+// monitor reads its own boot ID from /proc/sys/kernel/random/boot_id, which
+// has them. An entry from this boot must not be taken for one from an older
+// boot.
+func TestIsStaleBootEntry_RealJournalFormat_MatchesTheCurrentBoot(t *testing.T) {
+	const (
+		currentBootID  = "127f6599-4adc-4c6f-955a-3217bb8bb2e3"
+		previousBootID = "0d9ea1b2-c3d4-4e5f-8a6b-7c8d9e0f1a2b"
+	)
+
+	tests := []struct {
+		name          string
+		entryBootID   string
+		withFieldName bool
+		want          bool
+	}{
+		{"this boot, whole data object", currentBootID, true, false},
+		{"previous boot, whole data object", previousBootID, true, true},
+		{"this boot, value only", currentBootID, false, false},
+		{"previous boot, value only", previousBootID, false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// journald writes _BOOT_ID as 32 hex digits, without dashes.
+			journaldForm := strings.ReplaceAll(tt.entryBootID, "-", "")
+
+			journal := &MockJournal{
+				Entries: []MockJournalEntry{
+					{Message: "test", Cursor: "c1", Fields: map[string]string{FieldBootID: journaldForm}},
+				},
+				CurrentPosition:   0,
+				DataWithFieldName: tt.withFieldName,
+			}
+
+			sm := &SyslogMonitor{currentBootID: currentBootID}
+			assert.Equal(t, tt.want, sm.isStaleBootEntry(journal))
+		})
+	}
+}
+
+func TestSkipStaleBootEntry(t *testing.T) {
+	t.Run("normal advance", func(t *testing.T) {
+		journal := &MockJournal{
+			Entries: []MockJournalEntry{
+				{Message: "old", Cursor: "c1", BootID: "boot-1"},
+				{Message: "new", Cursor: "c2", BootID: "boot-2"},
+			},
+			CurrentPosition: 0,
+		}
+		sm := &SyslogMonitor{checkLastCursors: make(map[string]string)}
+		check := CheckDefinition{Name: "testCheck"}
+
+		exhausted, err := sm.skipStaleBootEntry(journal, check, "c1")
+		assert.NoError(t, err)
+		assert.False(t, exhausted)
+		assert.Equal(t, "c1", sm.checkLastCursors["testCheck"])
+	})
+
+	t.Run("journal exhausted", func(t *testing.T) {
+		journal := &MockJournal{
+			Entries:         []MockJournalEntry{{Message: "old", Cursor: "c1", BootID: "boot-1"}},
+			CurrentPosition: 0,
+		}
+		sm := &SyslogMonitor{checkLastCursors: make(map[string]string)}
+		check := CheckDefinition{Name: "testCheck"}
+
+		exhausted, err := sm.skipStaleBootEntry(journal, check, "c1")
+		assert.NoError(t, err)
+		assert.True(t, exhausted)
+	})
+}
+
+func TestInitializeJournalFromBootStart_UnlimitedLookback(t *testing.T) {
+	journal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "NVRM: Xid 79", Cursor: "c1", BootID: "boot-2"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	sm := &SyslogMonitor{
+		currentBootID:      "boot-2",
+		bootLookbackWindow: 0, // unlimited
+		checkLastCursors:   make(map[string]string),
+		checkToHandlerMap:  make(map[string]types.Handler),
+	}
+	check := CheckDefinition{Name: "testCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	err := sm.initializeJournalFromBootStart(journal, check)
+	assert.NoError(t, err)
+	assert.True(t, journal.SeekHeadCalled, "unlimited lookback must call SeekHead")
+	assert.False(t, journal.SeekRealtimeCalled, "unlimited lookback must NOT call SeekRealtimeUsec")
+}
+
+func TestInitializeJournalFromBootStart_WindowedLookback(t *testing.T) {
+	journal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "NVRM: Xid 79", Cursor: "c1", BootID: "boot-2"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	sm := &SyslogMonitor{
+		currentBootID:      "boot-2",
+		bootLookbackWindow: 2 * time.Hour,
+		checkLastCursors:   make(map[string]string),
+		checkToHandlerMap:  make(map[string]types.Handler),
+	}
+	check := CheckDefinition{Name: "testCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	err := sm.initializeJournalFromBootStart(journal, check)
+	assert.NoError(t, err)
+	assert.False(t, journal.SeekHeadCalled, "windowed lookback must NOT call SeekHead")
+	assert.True(t, journal.SeekRealtimeCalled, "windowed lookback must call SeekRealtimeUsec")
+	assert.Greater(t, journal.LastSeekRealtimeUsec, uint64(0))
+}
+
+func TestInitializeJournalFromBootStart_NoEntries(t *testing.T) {
+	journal := &MockJournal{
+		Entries:         []MockJournalEntry{},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	sm := &SyslogMonitor{
+		currentBootID:      "boot-2",
+		bootLookbackWindow: 2 * time.Hour,
+		checkLastCursors:   make(map[string]string),
+		checkToHandlerMap:  make(map[string]types.Handler),
+	}
+	check := CheckDefinition{Name: "testCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	err := sm.initializeJournalFromBootStart(journal, check)
+	assert.NoError(t, err)
+	// With no entries, falls back to initializeJournalFromTail which sets a cursor.
+	_, hasCursor := sm.checkLastCursors["testCheck"]
+	// Empty journal: tail fallback with no entries means no cursor set.
+	assert.False(t, hasCursor)
+}
+
+func TestBootStartScanDone_PersistedAfterScan(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{Name: "bootCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	mockJournal := &MockJournal{
+		Entries: []MockJournalEntry{
+			{Message: "entry1", Cursor: "cursor-1", BootID: "boot-2"},
+		},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-2", CurrentPosition: -1}
+
+	initialState := syslogMonitorState{
+		Version:          stateFileVersion,
+		BootID:           "boot-1",
+		CheckLastCursors: map[string]string{"bootCheck": "old-cursor"},
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+	assert.True(t, sm.postRebootInit)
+
+	// Run completes the scan.
+	assert.NoError(t, sm.Run(context.Background()))
+	assert.False(t, sm.postRebootInit)
+
+	// Verify state file has BootStartScanDone: true.
+	persisted, err := os.ReadFile(stateFilePath)
+	assert.NoError(t, err)
+
+	var saved syslogMonitorState
+	assert.NoError(t, json.Unmarshal(persisted, &saved))
+	assert.True(t, saved.BootStartScanDone, "BootStartScanDone must be true after successful scan")
+}
+
+func TestBootStartScanDone_CrashRecovery(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{Name: "bootCheck", JournalPath: TEST_JOURNAL_PATH}
+	mockJournal := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "entry1", Cursor: "c1", BootID: "boot-2"}},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-2", CurrentPosition: -1}
+
+	// Phase 1: discover the actual kernel boot ID.
+	_ = os.WriteFile(stateFilePath, []byte(`{"version":1,"boot_id":"","check_last_cursors":{}}`), 0o644)
+	probe, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	currentBootID := probe.currentBootID
+	require.NotEmpty(t, currentBootID, "test prerequisite: kernel boot-id must be readable")
+
+	// Phase 2: write state as if a previous run persisted BootID but crashed
+	// before the boot-start scan completed.
+	initialState := syslogMonitorState{
+		Version:           stateFileVersion,
+		BootID:            currentBootID,
+		CheckLastCursors:  map[string]string{},
+		BootStartScanDone: false,
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	// Reconstruct: handleBootIDChange sees same boot ID (no change), but
+	// BootStartScanDone=false triggers the disk-recovery path.
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	// The disk-recovery path must have set postRebootInit.
+	assert.True(t, sm.postRebootInit, "postRebootInit must be recovered from disk when BootStartScanDone is false")
+}
+
+func TestBootStartScanDone_NormalRestart(t *testing.T) {
+	tmpDir := t.TempDir()
+	stateFilePath := tmpDir + "/state.json"
+
+	check := CheckDefinition{Name: "bootCheck", JournalPath: TEST_JOURNAL_PATH}
+	mockJournal := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "entry1", Cursor: "cursor-1", BootID: "boot-2"}},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+	mockFactory.DefaultJournal = &MockJournal{TestBootID: "boot-2", CurrentPosition: -1}
+
+	// Phase 1: construct once to discover the actual kernel boot ID.
+	_ = os.WriteFile(stateFilePath, []byte(`{"version":1,"boot_id":"","check_last_cursors":{}}`), 0o644)
+	probe, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	currentBootID := probe.currentBootID
+	require.NotEmpty(t, currentBootID, "test prerequisite: kernel boot-id must be readable")
+
+	// Phase 2: write state as if a previous run completed successfully.
+	initialState := syslogMonitorState{
+		Version:           stateFileVersion,
+		BootID:            currentBootID,
+		CheckLastCursors:  map[string]string{"bootCheck": "cursor-1"},
+		BootStartScanDone: true,
+	}
+	stateData, _ := json.Marshal(initialState)
+	_ = os.WriteFile(stateFilePath, stateData, 0o644)
+
+	// Reconstruct with the matching boot ID.
+	sm, err := NewSyslogMonitorWithFactory(
+		TEST_NODE,
+		[]CheckDefinition{check},
+		&mockPlatformConnectorClient{},
+		TEST_AGENT,
+		TEST_COMPONENT,
+		"60s",
+		stateFilePath,
+		mockFactory,
+		"http://localhost:8080",
+		"/tmp/metadata.json",
+		pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "",
+		nil,
+		"tcp://test",
+		30*time.Minute,
+	)
+	assert.NoError(t, err)
+
+	// Normal restart: postRebootInit must remain false.
+	assert.False(t, sm.postRebootInit, "postRebootInit must be false when BootStartScanDone is true")
+}
+
+// countingHandler wraps a handler and counts ProcessLine calls; lines
+// containing "unparseable" fail as a handler error.
+type countingHandler struct {
+	inner types.Handler
+	calls int
+}
+
+func (h *countingHandler) ProcessLine(message string) (*pb.HealthEvents, error) {
+	h.calls++
+
+	if strings.Contains(message, "unparseable") {
+		return nil, errors.New("forced handler failure")
+	}
+
+	return h.inner.ProcessLine(message)
+}
+
+// TestExecuteCheck_UndeliveredEventStopsThePassWithoutBusyLooping: when the
+// publisher does not deliver the batch (missing socket, or a direct-mode
+// publisher that gave the batch up), the pass stops at that entry, keeps the
+// cursor and reports the failure, so the next poll retries it; it must neither
+// re-run the handler in a tight loop nor skip the entry. A line the handler
+// cannot process is skipped and the pass goes on.
+func TestExecuteCheck_UndeliveredEventStopsThePassWithoutBusyLooping(t *testing.T) {
+	check := CheckDefinition{Name: "mockCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	fakeJournal := NewFakeJournal()
+	fakeJournal.AddEntryWithMessage("nothing", "cursor-1")
+
+	fakeJournalFactory := NewFakeJournalFactory()
+	fakeJournalFactory.AddJournal(check.JournalPath, fakeJournal)
+
+	testStateFile := "/tmp/test-syslog-monitor-state-publish-rejection.json"
+	defer os.Remove(testStateFile)
+
+	mockPCClient := &mockPlatformConnectorClient{}
+	sm, err := NewSyslogMonitorWithFactory(TEST_NODE, []CheckDefinition{check}, mockPCClient,
+		TEST_AGENT, TEST_COMPONENT, "60s", testStateFile, fakeJournalFactory,
+		"http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "", nil, "tcp://test", 30*time.Minute)
+	require.NoError(t, err)
+
+	handler := &countingHandler{inner: &mockHandler{
+		nodeName: "test", defaultAgentName: "syslog-health-monitor", defaultComponentClass: "GPU", checkName: "mockCheck",
+	}}
+	sm.checkToHandlerMap["mockCheck"] = handler
+
+	require.NoError(t, sm.executeCheck(check), "first run initializes the cursor")
+
+	cursorBefore := sm.checkLastCursors[check.Name]
+	// Count from here.
+	publishedBefore := len(mockPCClient.RecordedHealthEvents)
+
+	fakeJournal.AddEntryWithMessage("unparseable line", "cursor-2")
+	fakeJournal.AddEntryWithMessage("sxid123 first", "cursor-3")
+	fakeJournal.AddEntryWithMessage("sxid123 second", "cursor-4")
+
+	// A unix target whose socket does not exist makes every Publish return
+	// ErrPlatformConnectorUnavailable at once, like a direct-mode publisher
+	// whose retry window ended.
+	sm.pub = healthpub.New(mockPCClient, "unix:///nonexistent/nvsentinel/pc.sock", sm.defaultAgentName)
+
+	require.ErrorIs(t, sm.executeCheck(check), errSendFailed, "the pass reports the undelivered event")
+
+	assert.Len(t, mockPCClient.RecordedHealthEvents, publishedBefore, "nothing was accepted")
+	assert.Equal(t, 2, handler.calls, "the unparseable line is skipped, the rejected line handled once")
+	assert.Equal(t, "cursor-2", sm.checkLastCursors[check.Name],
+		"the cursor moves past the skipped line and stops before the rejected one")
+	assert.NotEqual(t, cursorBefore, sm.checkLastCursors[check.Name])
+
+	// The connector is back: the next poll resumes at the rejected entry.
+	sm.pub = healthpub.New(mockPCClient, "tcp://test", sm.defaultAgentName)
+	require.NoError(t, sm.executeCheck(check))
+
+	assert.Len(t, mockPCClient.RecordedHealthEvents, publishedBefore+2,
+		"both matching lines are published after recovery")
+	assert.Equal(t, "cursor-4", sm.checkLastCursors[check.Name])
+}
+
+// rejectingPlatformConnectorClient answers the calls up to rejectThrough with
+// InvalidArgument, the status a server gives a batch it will never accept,
+// and records the rest like mockPlatformConnectorClient.
+type rejectingPlatformConnectorClient struct {
+	mockPlatformConnectorClient
+	calls         int
+	rejectThrough int
+}
+
+func (m *rejectingPlatformConnectorClient) HealthEventOccurredV1(
+	ctx context.Context, events *pb.HealthEvents, opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	m.calls++
+	if m.calls <= m.rejectThrough {
+		return nil, status.Error(codes.InvalidArgument, "health event failed validation")
+	}
+
+	return m.mockPlatformConnectorClient.HealthEventOccurredV1(ctx, events, opts...)
+}
+
+// TestExecuteCheck_RejectedEventIsSkippedNotRetried: a batch the platform
+// connector refuses for good is skipped like a line the handler cannot
+// process: the cursor moves past it and the pass goes on, instead of stopping
+// at the entry and offering the same batch again on every poll.
+func TestExecuteCheck_RejectedEventIsSkippedNotRetried(t *testing.T) {
+	check := CheckDefinition{Name: "mockCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	fakeJournal := NewFakeJournal()
+	fakeJournal.AddEntryWithMessage("nothing", "cursor-1")
+
+	fakeJournalFactory := NewFakeJournalFactory()
+	fakeJournalFactory.AddJournal(check.JournalPath, fakeJournal)
+
+	testStateFile := "/tmp/test-syslog-monitor-state-publish-rejected.json"
+	defer os.Remove(testStateFile)
+
+	client := &rejectingPlatformConnectorClient{}
+	sm, err := NewSyslogMonitorWithFactory(TEST_NODE, []CheckDefinition{check}, client,
+		TEST_AGENT, TEST_COMPONENT, "60s", testStateFile, fakeJournalFactory,
+		"http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "", nil, "tcp://test", 30*time.Minute)
+	require.NoError(t, err)
+
+	handler := &countingHandler{inner: &mockHandler{
+		nodeName: "test", defaultAgentName: "syslog-health-monitor", defaultComponentClass: "GPU", checkName: "mockCheck",
+	}}
+	sm.checkToHandlerMap["mockCheck"] = handler
+
+	require.NoError(t, sm.executeCheck(check), "first run initializes the cursor")
+
+	// Count from here, and refuse exactly the next batch.
+	publishedBefore := len(client.RecordedHealthEvents)
+	client.rejectThrough = client.calls + 1
+
+	fakeJournal.AddEntryWithMessage("sxid123 first", "cursor-2")
+	fakeJournal.AddEntryWithMessage("sxid123 second", "cursor-3")
+
+	require.NoError(t, sm.executeCheck(check))
+
+	assert.Equal(t, 2, handler.calls, "each line is handled once")
+	assert.Len(t, client.RecordedHealthEvents, publishedBefore+1,
+		"the rejected batch is skipped and the next one is published")
+	assert.Equal(t, "cursor-3", sm.checkLastCursors[check.Name], "the cursor moves past the rejected entry")
+}
+
+// marshallingPlatformConnectorClient encodes each batch the way the gRPC
+// client does before sending it, and fails the same way when the batch cannot
+// be encoded. Batches that encode are recorded like mockPlatformConnectorClient.
+type marshallingPlatformConnectorClient struct {
+	mockPlatformConnectorClient
+}
+
+func (m *marshallingPlatformConnectorClient) HealthEventOccurredV1(
+	ctx context.Context, events *pb.HealthEvents, opts ...grpc.CallOption,
+) (*emptypb.Empty, error) {
+	if _, err := proto.Marshal(events); err != nil {
+		return nil, status.Errorf(codes.Internal, "grpc: error while marshaling: %v", err)
+	}
+
+	return m.mockPlatformConnectorClient.HealthEventOccurredV1(ctx, events, opts...)
+}
+
+// TestExecuteCheck_InvalidUTF8Line_DoesNotStopTheCheck: journald hands MESSAGE
+// over as raw bytes, and the task name in a kernel XID line can be bytes that
+// are not UTF-8. A health event holding them cannot be encoded (proto3 strings
+// must be UTF-8), so the pass used to stop at that entry on every poll and no
+// later XID was reported. The line is published with those bytes replaced and
+// the pass goes on.
+func TestExecuteCheck_InvalidUTF8Line_DoesNotStopTheCheck(t *testing.T) {
+	const xid13Line = "NVRM: Xid (PCI:0000:3b:00): 13, pid=4242, name=%s, " +
+		"Graphics SM Warp Exception on (GPC 0, TPC 0, SM 0): Out Of Range Address"
+
+	const xid79Line = "NVRM: Xid (PCI:0000:3b:00): 79, pid=0, name=, GPU has fallen off the bus."
+
+	tests := []struct {
+		name     string
+		taskName string
+		want     string
+	}{
+		{
+			name:     "valid UTF-8 task name is kept",
+			taskName: "\u8BAD\u7EC3\u4EFB\u52A1",
+			want:     "\u8BAD\u7EC3\u4EFB\u52A1",
+		},
+		{
+			name:     "task name with bytes that are not UTF-8",
+			taskName: "\xff\xfejob",
+			want:     "\uFFFDjob",
+		},
+		{
+			// The kernel keeps the first 15 bytes of a task name, so a UTF-8
+			// name can end inside a character: "a" and five three-byte
+			// characters are 16 bytes.
+			name:     "UTF-8 task name cut at 15 bytes",
+			taskName: "a\u8BAD\u7EC3\u4EFB\u52A1\u4E94"[:15],
+			want:     "a\u8BAD\u7EC3\u4EFB\u52A1\uFFFD",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			check := CheckDefinition{Name: XIDErrorCheck, JournalPath: TEST_JOURNAL_PATH}
+
+			fakeJournal := NewFakeJournal()
+			fakeJournal.AddEntryWithMessage("nothing", "cursor-1")
+
+			fakeJournalFactory := NewFakeJournalFactory()
+			fakeJournalFactory.AddJournal(check.JournalPath, fakeJournal)
+
+			client := &marshallingPlatformConnectorClient{}
+			sm, err := NewSyslogMonitorWithFactory(TEST_NODE, []CheckDefinition{check}, client,
+				TEST_AGENT, TEST_COMPONENT, "60s", dir+"/state.json", fakeJournalFactory,
+				"", dir+"/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+				"", "", nil, "tcp://test", 30*time.Minute)
+			require.NoError(t, err)
+
+			require.NoError(t, sm.executeCheck(check), "first run initializes the cursor")
+
+			fakeJournal.AddEntryWithMessage(fmt.Sprintf(xid13Line, tt.taskName), "cursor-2")
+			fakeJournal.AddEntryWithMessage(xid79Line, "cursor-3")
+
+			require.NoError(t, sm.executeCheck(check))
+
+			var errorCodes, messages []string
+
+			for _, batch := range client.RecordedHealthEvents {
+				for _, event := range batch.GetEvents() {
+					errorCodes = append(errorCodes, event.GetErrorCode()...)
+					messages = append(messages, event.GetMessage())
+				}
+			}
+
+			assert.Equal(t, []string{"13", "79"}, errorCodes, "both XIDs are published")
+			assert.Equal(t, []string{fmt.Sprintf(xid13Line, tt.want), xid79Line}, messages,
+				"bytes that are not UTF-8 are replaced and valid text is kept")
+			assert.Equal(t, "cursor-3", sm.checkLastCursors[check.Name], "the cursor moves past both entries")
+		})
+	}
+}
+
+// TestBootIDChange_RejectedFlushDoesNotBlockTheChecks: the post-reboot flush
+// runs from Run(), not the constructor, and a healthy event the platform
+// connector refuses for good counts as flushed: the new BootID is persisted
+// and the checks run, instead of every cycle re-offering the same batch.
+func TestBootIDChange_RejectedFlushDoesNotBlockTheChecks(t *testing.T) {
+	stateFilePath := t.TempDir() + "/state.json"
+
+	initialState := syslogMonitorState{
+		BootID:           "boot-1",
+		CheckLastCursors: map[string]string{"bootCheck": "old-cursor"},
+	}
+	stateData, err := json.Marshal(initialState)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(stateFilePath, stateData, 0o644))
+
+	check := CheckDefinition{Name: "bootCheck", JournalPath: TEST_JOURNAL_PATH}
+
+	mockJournal := &MockJournal{
+		Entries:         []MockJournalEntry{{Message: "entry1", Cursor: "cursor-1", BootID: "boot-2"}},
+		CurrentPosition: -1,
+		TestBootID:      "boot-2",
+	}
+	mockFactory := NewMockJournalFactory()
+	mockFactory.JournalsByPath[check.JournalPath] = mockJournal
+
+	client := &rejectingPlatformConnectorClient{rejectThrough: 1}
+	sm, err := NewSyslogMonitorWithFactory(TEST_NODE, []CheckDefinition{check}, client,
+		TEST_AGENT, TEST_COMPONENT, "60s", stateFilePath, mockFactory,
+		"http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+		"", "", nil, "tcp://test", 30*time.Minute)
+	require.NoError(t, err)
+
+	pending := sm.pendingPostRebootBootID
+	require.NotEmpty(t, pending, "the constructor leaves the flush to Run()")
+	require.Empty(t, client.RecordedHealthEvents)
+
+	require.NoError(t, sm.Run(context.Background()))
+
+	require.Empty(t, sm.pendingPostRebootBootID, "a rejected healthy event counts as flushed")
+	require.Equal(t, 1, client.calls, "the rejected batch is offered once")
+
+	persisted, err := os.ReadFile(stateFilePath)
+	require.NoError(t, err)
+	require.Contains(t, string(persisted), pending, "the new BootID is persisted")
+}

@@ -1,0 +1,210 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package breaker provides types and interfaces for the fault quarantine circuit breaker.
+package breaker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+)
+
+type CursorMode string
+
+const (
+	CursorModeResume CursorMode = "RESUME"
+	CursorModeCreate CursorMode = "CREATE"
+)
+
+// K8sClientOperations defines the minimal interface needed by the circuit breaker
+type K8sClientOperations interface {
+	GetTotalNodes(ctx context.Context) (int, error)
+	// GetCordonedNodes returns how many nodes NVSentinel currently holds quarantined.
+	// Only nodes quarantined by NVSentinel are counted: other controllers cordon nodes
+	// too, for example GPU operator upgrade flows, and those must not consume this
+	// breaker's budget.
+	GetCordonedNodes(ctx context.Context) (int, error)
+	EnsureCircuitBreakerConfigMap(ctx context.Context, name, namespace string, initialStatus State) error
+	ReadCircuitBreakerState(ctx context.Context, name, namespace string) (State, error)
+	WriteCircuitBreakerState(ctx context.Context, name, namespace string, status State) error
+	ReadCursorMode(ctx context.Context, name, namespace string) (CursorMode, error)
+	WriteCursorMode(ctx context.Context, name, namespace string, mode CursorMode) error
+}
+
+// CircuitBreakerConfig holds the Kubernetes-specific configuration for the circuit breaker
+type CircuitBreakerConfig struct {
+	Namespace  string
+	Name       string
+	Percentage int
+	Duration   time.Duration
+}
+
+// State represents the current state of the circuit breaker
+type State string
+
+const (
+	// StateClosed indicates the breaker is allowing operation
+	StateClosed State = "CLOSED"
+	// StateTripped indicates the breaker is blocking operations
+	StateTripped State = "TRIPPED"
+)
+
+type CircuitBreaker interface {
+	// AddCordonEvent records a node cordoning event in the sliding window
+	AddCordonEvent(nodeName string)
+	// IsTripped checks if the breaker should prevent further cordoning
+	IsTripped(ctx context.Context) (bool, error)
+	// ForceState manually sets the breaker state (CLOSED or TRIPPED)
+	ForceState(ctx context.Context, s State) error
+	// CurrentState returns the current breaker state
+	CurrentState() State
+
+	GetCursorMode(ctx context.Context) (CursorMode, error)
+	SetCursorMode(ctx context.Context, mode CursorMode) error
+}
+
+// Config holds the configuration parameters for the sliding window circuit breaker.
+// It defines the time window, trip threshold, and K8s client for state persistence.
+type Config struct {
+	// Window defines the sliding time window over which cordon events are counted.
+	// Default: 5 minutes. Events older than this window are automatically discarded.
+	Window time.Duration
+
+	// TripPercentage is the percentage of GPU nodes that, if reached by recent
+	// cordon events within Window, will trip the breaker (e.g., 50 for 50%).
+	// Default: 50 (50% of GPU nodes). Zero disables the percentage bound.
+	TripPercentage float64
+
+	// TripMaxNodes is an absolute node count that, if reached by recent cordon
+	// events within Window, will trip the breaker regardless of fleet size. Zero
+	// disables it. When both bounds are set the lower one binds, so a fleet that
+	// grows cannot silently raise the effective limit.
+	TripMaxNodes int
+
+	// TripMaxCordonedNodes is a standing bound: the breaker trips when this many nodes
+	// are quarantined by NVSentinel at once, regardless of when they were cordoned.
+	// Zero disables it, and it is off by default.
+	//
+	// The two bounds above count cordon events inside Window, so neither limits how many
+	// nodes end up cordoned in total: a rate that stays under the threshold can cordon a
+	// whole fleet over enough windows. This bound is a level rather than a rate and is
+	// the only one that caps that.
+	TripMaxCordonedNodes int
+
+	// TripMaxCordonedPercentage is the percentage form of TripMaxCordonedNodes: the breaker
+	// trips when this share of the GPU fleet is quarantined by NVSentinel at once. Zero
+	// disables it, and it is off by default.
+	//
+	// Pairs with TripMaxCordonedNodes exactly as TripPercentage pairs with TripMaxNodes:
+	// when both are set the lower one binds, so growing the fleet cannot silently raise the
+	// effective limit. Prefer this form when the blast radius you care about is a share of
+	// the fleet rather than a number of machines, since an absolute count silently changes
+	// meaning as the fleet is resized.
+	TripMaxCordonedPercentage float64
+
+	// K8sClient provides operations for node counts and ConfigMap state persistence
+	K8sClient K8sClientOperations
+
+	// ConfigMapName is the name of the ConfigMap used for state persistence
+	ConfigMapName string
+
+	// ConfigMapNamespace is the namespace of the ConfigMap
+	ConfigMapNamespace string
+}
+
+// validatePercentageBound rejects percentage values that would misbehave inside
+// resolveThreshold rather than failing loudly. NaN passes every comparison there and survives
+// as int(NaN), which is 0, leaving the breaker tripped from startup with no cordons at all.
+// Infinities are caught by the fleet-size comparison, but rejecting them here is explicit
+// rather than lucky. A negative value is ignored by resolveThreshold, so it silently does
+// nothing rather than what it looks like.
+func validatePercentageBound(name string, percentage float64) error {
+	if math.IsNaN(percentage) || math.IsInf(percentage, 0) {
+		return fmt.Errorf("circuit breaker %s must be a finite number, got %v", name, percentage)
+	}
+
+	if percentage < 0 {
+		return fmt.Errorf("circuit breaker %s must not be negative, got %v", name, percentage)
+	}
+
+	return nil
+}
+
+// validateBounds rejects a configuration that cannot act as a limit. It lives here rather
+// than in the initializer so every caller is covered, including tests that build a Config
+// directly.
+//
+// Neither bound set leaves the threshold at 0, and IsTripped compares with >=, so the
+// breaker would trip on its first evaluation with no cordons at all. A negative value is
+// ignored by tripThreshold, so it silently does nothing rather than what it looks like.
+func (c Config) validateBounds() error {
+	if err := validatePercentageBound("percentage", c.TripPercentage); err != nil {
+		return err
+	}
+
+	if err := validatePercentageBound("maxCordonedPercentage", c.TripMaxCordonedPercentage); err != nil {
+		return err
+	}
+
+	if c.TripMaxNodes < 0 {
+		return fmt.Errorf("circuit breaker maxNodes must not be negative, got %d", c.TripMaxNodes)
+	}
+
+	if c.TripMaxCordonedNodes < 0 {
+		return fmt.Errorf("circuit breaker maxCordonedNodes must not be negative, got %d", c.TripMaxCordonedNodes)
+	}
+
+	if c.TripPercentage == 0 && c.TripMaxNodes == 0 &&
+		c.TripMaxCordonedNodes == 0 && c.TripMaxCordonedPercentage == 0 {
+		return errors.New(
+			"circuit breaker requires percentage, maxNodes, maxCordonedNodes or maxCordonedPercentage " +
+				"to be set to a positive value")
+	}
+
+	return nil
+}
+
+// slidingWindowBreaker implements CircuitBreaker using a ring buffer approach.
+// It tracks unique nodes that have been cordoned in time-based buckets and automatically
+// expires old events as the window slides forward.
+type slidingWindowBreaker struct {
+	// cfg holds the breaker configuration (window size, trip ratio, etc.)
+	cfg Config
+	// mu protects all mutable fields from concurrent access
+	mu sync.RWMutex
+
+	// Ring buffer implementation for sliding window
+	// bucketSize defines the duration represented by each bucket (fixed at 1 second)
+	bucketSize time.Duration
+	// buckets holds per-bucket counts of recent cordon events forming a ring buffer
+	// For a 5-minute window, this contains 300 buckets (5 * 60 seconds)
+	buckets []int
+	// startTime marks the time corresponding to buckets[0]; used to advance the ring
+	// as time progresses, ensuring the window slides correctly
+	startTime time.Time
+
+	// Node tracking for unique cordon events within the sliding window
+	// nodeToIndex maps node name to the bucket index where it was last cordoned
+	nodeToIndex map[string]int
+	// indexToNodes maps bucket index to a set of node names cordoned in that bucket
+	indexToNodes map[int]map[string]bool
+
+	// state is the current breaker state (CLOSED or TRIPPED)
+	// Can be manually forced via ForceState() or automatically set by IsTripped()
+	state State
+}

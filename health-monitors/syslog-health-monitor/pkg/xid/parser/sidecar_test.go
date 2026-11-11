@@ -1,0 +1,457 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package parser
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestSidecarParser_WaitUntilReady_ImmediatelyReady(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	p := NewSidecarParser(server.URL, "test-node", func() string { return "570.148.08" })
+	err := p.WaitUntilReady(context.Background(), 5, 100*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestSidecarParser_WaitUntilReady_BecomesReadyAfterDelay(t *testing.T) {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	addr := listener.Addr().String()
+	listener.Close()
+
+	go func() {
+		time.Sleep(1 * time.Second)
+		ln, listenErr := net.Listen("tcp", addr)
+		if listenErr != nil {
+			return
+		}
+		defer ln.Close()
+		// Keep accepting until test ends
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	p := NewSidecarParser(fmt.Sprintf("http://%s", addr), "test-node", func() string { return "570.148.08" })
+	err = p.WaitUntilReady(context.Background(), 15, 200*time.Millisecond)
+	assert.NoError(t, err)
+}
+
+func TestSidecarParser_WaitUntilReady_ContextCancelled(t *testing.T) {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	addr := listener.Addr().String()
+	listener.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	p := NewSidecarParser(fmt.Sprintf("http://%s", addr), "test-node", func() string { return "570.148.08" })
+	err = p.WaitUntilReady(ctx, 30, 200*time.Millisecond)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context")
+}
+
+func TestSidecarParser_WaitUntilReady_ExhaustsRetries(t *testing.T) {
+	listener, err := net.Listen("tcp", "localhost:0")
+	require.NoError(t, err)
+
+	addr := listener.Addr().String()
+	listener.Close()
+
+	p := NewSidecarParser(fmt.Sprintf("http://%s", addr), "test-node", func() string { return "570.148.08" })
+	err = p.WaitUntilReady(context.Background(), 3, 100*time.Millisecond)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not ready after 3 attempts")
+}
+
+func TestSidecarParser_Parse(t *testing.T) {
+	testCases := []struct {
+		name               string
+		message            string
+		mockResponse       *Response
+		mockStatusCode     int
+		expectedSuccess    bool
+		expectedXIDCode    int
+		expectedPCIAddr    string
+		expectedMnemonic   string
+		expectedErrorCode  string
+		expectError        bool
+		expectedErrorType  string
+		expectedResolution string
+	}{
+		{
+			name:    "Successful XID parsing with full details",
+			message: "NVRM: Xid (PCI:0000:66:00): 32, pid=2280636, name=train.3, Channel ID 0000000d intr0 00040000",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					Context:             "GPU context",
+					DecodedXIDStr:       "32",
+					Driver:              "nvidia-driver-550",
+					InvestigatoryAction: "Check GPU memory",
+					Machine:             "DGX-A100",
+					Mnemonic:            "XID 32",
+					Name:                "32",
+					Number:              32,
+					PCIE:                "0000:66:00",
+					Resolution:          "APPLICATION_RESTART",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    32,
+			expectedPCIAddr:    "0000:66:00",
+			expectedMnemonic:   "XID 32",
+			expectedErrorCode:  "32",
+			expectedResolution: "APPLICATION_RESTART",
+		},
+		{
+			name:    "Sidecar parsing failure",
+			message: "NVRM: Invalid message format",
+			mockResponse: &Response{
+				Success: false,
+				Error:   "Failed to parse XID message",
+			},
+			mockStatusCode:  200,
+			expectedSuccess: false,
+		},
+		{
+			name:              "HTTP server error",
+			message:           "NVRM: Xid (PCI:0000:66:00): 32, pid=1234",
+			mockStatusCode:    500,
+			expectError:       true,
+			expectedErrorType: "request_sending_error",
+		},
+		{
+			name:    "Minimal response fields",
+			message: "NVRM: Xid (PCI:0000:9b:00): 46, pid=1234",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					Number: 46,
+					PCIE:   "0000:9b:00",
+				},
+			},
+			mockStatusCode:    200,
+			expectedSuccess:   true,
+			expectedXIDCode:   46,
+			expectedPCIAddr:   "0000:9b:00",
+			expectedMnemonic:  "",
+			expectedErrorCode: "",
+		},
+		{
+			name:    "XID 154",
+			message: "NVRM: Xid (PCI:0008:01:00): 154, GPU recovery action changed from 0x0 (None) to 0x1 (GPU Reset Required)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					Context:             "GPU context",
+					DecodedXIDStr:       "154",
+					Driver:              "nvidia-driver-550",
+					InvestigatoryAction: "Check GPU memory",
+					Machine:             "DGX-A100",
+					Mnemonic:            "XID 154",
+					Name:                "154",
+					Number:              154,
+					PCIE:                "0008:01:00",
+					Resolution:          "GPU Reset Required",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0008:01:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "COMPONENT_RESET",
+		},
+		{
+			name:    "XID 154 with R610 wording OS Reboot",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x2 (OS Reboot)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					Context:             "GPU context",
+					DecodedXIDStr:       "154",
+					Driver:              "nvidia-driver-615",
+					InvestigatoryAction: "Reboot the node",
+					Machine:             "DGX-A100",
+					Mnemonic:            "XID 154",
+					Name:                "154",
+					Number:              154,
+					PCIE:                "0000:61:00",
+					Resolution:          "OS Reboot",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "RESTART_BM",
+		},
+		{
+			name:    "XID 154 with R610 wording PF FLR",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x1 (PF FLR)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					Context:             "GPU context",
+					DecodedXIDStr:       "154",
+					Driver:              "nvidia-driver-615",
+					InvestigatoryAction: "Reset the GPU",
+					Machine:             "DGX-A100",
+					Mnemonic:            "XID 154",
+					Name:                "154",
+					Number:              154,
+					PCIE:                "0000:61:00",
+					Resolution:          "PF FLR",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "COMPONENT_RESET",
+		},
+		{
+			name:    "XID 154 with R610 wording Bus Reset",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x6 (Bus Reset)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					DecodedXIDStr: "154",
+					Mnemonic:      "XID 154",
+					Name:          "154",
+					Number:        154,
+					PCIE:          "0000:61:00",
+					Resolution:    "Bus Reset",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "RESTART_BM",
+		},
+		{
+			name:    "XID 154 with R610 wording System Reboot",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x7 (System Reboot)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					DecodedXIDStr: "154",
+					Mnemonic:      "XID 154",
+					Name:          "154",
+					Number:        154,
+					PCIE:          "0000:61:00",
+					Resolution:    "System Reboot",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "RESTART_BM",
+		},
+		{
+			name:    "XID 154 Drain P2P needs an operator",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x3 (Drain P2P)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					DecodedXIDStr: "154",
+					Mnemonic:      "XID 154",
+					Name:          "154",
+					Number:        154,
+					PCIE:          "0000:61:00",
+					Resolution:    "Drain P2P",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "CONTACT_SUPPORT",
+		},
+		{
+			name:    "XID 154 Recover IMEX Domain needs an operator",
+			message: "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x5 (Recover IMEX Domain)",
+			mockResponse: &Response{
+				Success: true,
+				Result: XIDDetails{
+					DecodedXIDStr: "154",
+					Mnemonic:      "XID 154",
+					Name:          "154",
+					Number:        154,
+					PCIE:          "0000:61:00",
+					Resolution:    "Recover IMEX Domain",
+				},
+			},
+			mockStatusCode:     200,
+			expectedSuccess:    true,
+			expectedXIDCode:    154,
+			expectedPCIAddr:    "0000:61:00",
+			expectedMnemonic:   "XID 154",
+			expectedErrorCode:  "154",
+			expectedResolution: "CONTACT_SUPPORT",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var capturedRequest *Request
+			var capturedMethod string
+			var capturedContentType string
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				capturedMethod = r.Method
+				capturedContentType = r.Header.Get("Content-Type")
+
+				var req Request
+				if err := json.NewDecoder(r.Body).Decode(&req); err == nil {
+					capturedRequest = &req
+				}
+
+				w.WriteHeader(tc.mockStatusCode)
+
+				if tc.mockStatusCode == 200 && tc.mockResponse != nil {
+					w.Header().Set("Content-Type", "application/json")
+					if err := json.NewEncoder(w).Encode(tc.mockResponse); err != nil {
+						t.Fatalf("encode response: %v", err)
+					}
+				} else if tc.mockStatusCode != 200 {
+					if _, err := w.Write([]byte("Server error")); err != nil {
+						t.Fatalf("write error response: %v", err)
+					}
+				}
+			}))
+			defer server.Close()
+
+			parser := NewSidecarParser(server.URL, "test-node", func() string { return "570.148.08" })
+
+			result, err := parser.Parse(tc.message)
+
+			if !tc.expectError || tc.mockStatusCode == 200 {
+				assert.Equal(t, "POST", capturedMethod, "Should use POST method")
+				assert.Equal(t, "application/json", capturedContentType, "Should set JSON content type")
+				if capturedRequest != nil {
+					assert.Equal(t, tc.message, capturedRequest.XIDMessage, "Request should contain the XID message")
+				}
+			}
+
+			if tc.expectError {
+				require.Error(t, err, "Expected error for test case")
+				return
+			}
+
+			if !tc.expectedSuccess {
+				require.NotNil(t, result, "Result should not be nil when no error")
+				assert.False(t, result.Success, "Expected Success to be false for unsuccessful case")
+				return
+			}
+
+			require.NoError(t, err, "Parse should not return error for valid response")
+			require.NotNil(t, result, "Result should not be nil for valid response")
+			assert.True(t, result.Success, "Parse should succeed for valid response")
+
+			assert.Equal(t, tc.expectedXIDCode, result.Result.Number, "XID code should match")
+			assert.Equal(t, tc.expectedPCIAddr, result.Result.PCIE, "PCI address should match")
+			assert.Equal(t, tc.expectedMnemonic, result.Result.Mnemonic, "Mnemonic should match")
+			assert.Equal(t, tc.expectedErrorCode, result.Result.DecodedXIDStr, "Decoded XID string should match")
+			assert.Equal(t, tc.expectedErrorCode, result.Result.Name, "Name should match")
+			assert.Equal(t, tc.expectedResolution, result.Result.Resolution, "Resolution should match")
+
+			assert.Empty(t, result.Error, "Error field should be empty for successful parse")
+		})
+	}
+}
+
+func TestSidecarParser_Parse_XID149ExamplePreservesGuidance(t *testing.T) {
+	const message = "NVRM: Xid (PCI:0008:06:00): 149, NETIR_LINK_DOWN  Fatal   XC0 i0 Link 03 " +
+		"(0x02540c91 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000)"
+	const driverVersion = "580.173.02"
+
+	// The input uses an observed XID format. The analyzer response is synthetic:
+	// this verifies transport and field preservation, not a catalog decision.
+	const response = `{"success":true,"result":{` +
+		`"number":149,"decoded_xid_string":"149","pcie_bdf":"0008:06:00",` +
+		`"resolution":"NONE","investigatory_action":"Example investigation"}}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "/decode-xid", r.URL.Path)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+
+		var request Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+
+			return
+		}
+
+		assert.Equal(t, message, request.XIDMessage)
+		assert.Equal(t, driverVersion, request.DriverVersion)
+		w.Header().Set("Content-Type", "application/json")
+
+		if _, err := io.WriteString(w, response); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	p := NewSidecarParser(server.URL, "test-node", func() string { return driverVersion })
+	result, err := p.Parse(message)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.True(t, result.Success)
+	assert.Equal(t, 149, result.Result.Number)
+	assert.Equal(t, "149", result.Result.DecodedXIDStr)
+	assert.Equal(t, "0008:06:00", result.Result.PCIE)
+	assert.Equal(t, "NONE", result.Result.Resolution)
+	assert.Equal(t, "Example investigation", result.Result.InvestigatoryAction)
+}

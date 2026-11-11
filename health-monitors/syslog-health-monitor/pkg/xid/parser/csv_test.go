@@ -1,0 +1,413 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package parser
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	pb "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/common"
+)
+
+func TestCSVParser_Parse(t *testing.T) {
+	errorResolutionMap, err := common.LoadErrorResolutionMap()
+	if err != nil {
+		t.Fatalf("Failed to load embedded XID mapping: %v", err)
+	}
+	require.NotEmpty(t, errorResolutionMap, "XID error resolution map should not be empty")
+
+	nvl5Rules, err := common.GetNVL5DecodingRules()
+	if err != nil {
+		t.Fatalf("Failed to load embedded XID mapping: %v", err)
+	}
+	require.NotEmpty(t, nvl5Rules, "XID error resolution map should not be empty")
+
+	// Pre-R575 driver so NVL5 matching uses the V1 IntrInfo patterns.
+	parser := NewCSVParser("test-node", errorResolutionMap, nvl5Rules, func() string { return "570.148.08" })
+
+	testCases := []struct {
+		name              string
+		message           string
+		expectedSuccess   bool
+		expectedXIDCode   int
+		expectedPCIAddr   string
+		expectedAction    pb.RecommendedAction
+		expectedMnemonic  string
+		expectedErrorCode string
+		expectedMetadata  map[string]string
+	}{
+		{
+			name:              "NL5 XID",
+			message:           "NVRM: Xid (PCI:0018:01:00): 149, NETIR_LINK_EVT  Fatal   XC0 i0 Link 09 (0x025525c6 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000)",
+			expectedSuccess:   true,
+			expectedXIDCode:   149,
+			expectedPCIAddr:   "0018:01:00",
+			expectedAction:    pb.RecommendedAction_COMPONENT_RESET,
+			expectedMnemonic:  "NETIR_LINK_EVT/NETIR_LINK_DOWN",
+			expectedErrorCode: "149.NETIR_LINK_EVT",
+		},
+		{
+			name:              "Parse metadata from XID-13",
+			message:           "NVRM: Xid (PCI:0000:b5:00): 13, pid='<unknown>', name=<unknown>, Graphics SM Warp Exception on (GPC 1, TPC 3, SM 0): Out Of Range Address",
+			expectedSuccess:   true,
+			expectedXIDCode:   13,
+			expectedPCIAddr:   "0000:b5:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 13",
+			expectedErrorCode: "13",
+			expectedMetadata:  map[string]string{"GPC": "1", "TPC": "3", "SM": "0"},
+		},
+		{
+			name:              "XID 13 with no GPC, TPC, or SM values",
+			message:           "NVRM: Xid (PCI:0000:b5:00): 13, pid='<unknown>', name=<unknown>, Graphics Exception: ESR 0x50df30=0x107000e 0x50df34=0x20 0x50df28=0xf81eb60 0x50df2c=0x1174",
+			expectedSuccess:   true,
+			expectedXIDCode:   13,
+			expectedPCIAddr:   "0000:b5:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 13",
+			expectedErrorCode: "13",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 74 with NVLINK ID and registers values",
+			message:           "NVRM: Xid (PCI:0003:00:00): 74, pid='<unknown>', name=<unknown>, NVLink: fatal error detected on link 14(0x0, 0x0, 0x10000, 0x0, 0x0, 0x0, 0x0)",
+			expectedSuccess:   true,
+			expectedXIDCode:   74,
+			expectedPCIAddr:   "0003:00:00",
+			expectedAction:    pb.RecommendedAction_CONTACT_SUPPORT,
+			expectedMnemonic:  "XID 74",
+			expectedErrorCode: "74",
+			expectedMetadata: map[string]string{
+				"NVLINK": "14",
+				"REG0":   "00000000000000000000000000000000",
+				"REG1":   "00000000000000000000000000000000",
+				"REG2":   "00000000000000010000000000000000",
+				"REG3":   "00000000000000000000000000000000",
+				"REG4":   "00000000000000000000000000000000",
+				"REG5":   "00000000000000000000000000000000",
+				"REG6":   "00000000000000000000000000000000",
+			},
+		},
+		{
+			name:              "Complex XID format with all fields",
+			message:           "NVRM: Xid (PCI:0000:66:00): 32, pid=2280636, name=train.3, Channel ID 0000000d intr0 00040000",
+			expectedSuccess:   true,
+			expectedXIDCode:   32,
+			expectedPCIAddr:   "0000:66:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 32",
+			expectedErrorCode: "32",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "Minimal XID format",
+			message:           "NVRM: Xid (PCI:0000:3f:00): 46",
+			expectedSuccess:   true,
+			expectedXIDCode:   46,
+			expectedPCIAddr:   "0000:3f:00",
+			expectedAction:    pb.RecommendedAction_COMPONENT_RESET,
+			expectedMnemonic:  "XID 46",
+			expectedErrorCode: "46",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "Different PCI address format",
+			message:           "NVRM: Xid (PCI:0001:ab:cd): 69, pid=1310987, name=train.3, Class Error: ChId 0008, Class 0000cbc0, Offset 00000184, Data ffffffff, ErrorCode 00000004",
+			expectedSuccess:   true,
+			expectedXIDCode:   69,
+			expectedPCIAddr:   "0001:ab:cd",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 69",
+			expectedErrorCode: "69",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "Different XID code",
+			message:           "NVRM: Xid (PCI:0000:9b:00): 8, pid=5678, name=idle_timeout",
+			expectedSuccess:   true,
+			expectedXIDCode:   8,
+			expectedPCIAddr:   "0000:9b:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 8",
+			expectedErrorCode: "8",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID attributed to a MIG GPU instance",
+			message:           "NVRM: Xid (PCI:0000:01:00 GPU-I:05): 94, pid=7194, Contained: CE User Channel (0x9). RST: No, D-RST: No",
+			expectedSuccess:   true,
+			expectedXIDCode:   94,
+			expectedPCIAddr:   "0000:01:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 94",
+			expectedErrorCode: "94",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID attributed to a MIG GPU and compute instance",
+			message:           "NVRM: Xid (PCI:0000:01:00 GPU-I:05 GPU-CI:01): 94, pid=7194, name=train.3, Contained: CE User Channel (0x9). RST: No, D-RST: No",
+			expectedSuccess:   true,
+			expectedXIDCode:   94,
+			expectedPCIAddr:   "0000:01:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 94",
+			expectedErrorCode: "94",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "Uncontained XID attributed to a MIG GPU instance",
+			message:           "NVRM: Xid (PCI:0000:01:00 GPU-I:05): 95, pid=7062, Uncontained: LTC TAG (0x2, 0x1). RST: Yes, D-RST: No",
+			expectedSuccess:   true,
+			expectedXIDCode:   95,
+			expectedPCIAddr:   "0000:01:00",
+			expectedAction:    pb.RecommendedAction_COMPONENT_RESET,
+			expectedMnemonic:  "XID 95",
+			expectedErrorCode: "95",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "Unknown XID defaults to CONTACT_SUPPORT",
+			message:           "NVRM: Xid (PCI:0000:66:00): 999, pid=1234, name=test",
+			expectedSuccess:   true,
+			expectedXIDCode:   999,
+			expectedPCIAddr:   "0000:66:00",
+			expectedAction:    pb.RecommendedAction_CONTACT_SUPPORT,
+			expectedMnemonic:  "XID 999",
+			expectedErrorCode: "999",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:            "Non-XID NVRM message",
+			message:         "NVRM: GPU at PCI:0000:66:00: GPU-12345678-1234-5678-9abc-def012345678",
+			expectedSuccess: false,
+		},
+		{
+			name:            "Non-NVRM message",
+			message:         "[Wed Dec 11 13:23:01 2024] Linux version 5.15.0-117-generic",
+			expectedSuccess: false,
+		},
+		{
+			name:            "Empty message",
+			message:         "",
+			expectedSuccess: false,
+		},
+		{
+			name:            "Malformed XID - missing PCI",
+			message:         "NVRM: Xid : 32, pid=2280636",
+			expectedSuccess: false,
+		},
+		{
+			name:            "Malformed XID - invalid number",
+			message:         "NVRM: Xid (PCI:0000:66:00): abc, pid=2280636",
+			expectedSuccess: false,
+		},
+		{
+			name:              "XID 154",
+			message:           "NVRM: Xid (PCI:0008:01:00): 154, GPU recovery action changed from 0x0 (None) to 0x1 (GPU Reset Required)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0008:01:00",
+			expectedAction:    pb.RecommendedAction_COMPONENT_RESET,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 recovery action returned to None",
+			message:           "NVRM: Xid (PCI:0008:01:00): 154, GPU recovery action changed from 0x1 (GPU Reset Required) to 0x0 (None)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0008:01:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 with R610 wording PF FLR",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x1 (PF FLR)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_COMPONENT_RESET,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 with R610 wording OS Reboot",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x2 (OS Reboot)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_RESTART_BM,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 with R610 wording returned to None",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x2 (OS Reboot) to 0x0 (None)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_NONE,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 with R610 wording Bus Reset",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x6 (Bus Reset)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_RESTART_BM,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 with R610 wording System Reboot",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x7 (System Reboot)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_RESTART_BM,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 Drain P2P needs an operator",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x3 (Drain P2P)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_CONTACT_SUPPORT,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			name:              "XID 154 Recover IMEX Domain needs an operator",
+			message:           "NVRM: Xid (PCI:0000:61:00): 154, GPU recovery action changed from 0x0 (None) to 0x5 (Recover IMEX Domain)",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:61:00",
+			expectedAction:    pb.RecommendedAction_CONTACT_SUPPORT,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+		{
+			// Untrusted/garbage syslog line that matches the XID 154 pattern but has its
+			// last ')' before its last '(' (trailing unmatched '('). The parser must not
+			// panic with slice-bounds-out-of-range and must fall back to CONTACT_SUPPORT.
+			name:              "XID 154 with out-of-order parens does not panic",
+			message:           "NVRM: Xid (PCI:0000:01:00): 154 (",
+			expectedSuccess:   true,
+			expectedXIDCode:   154,
+			expectedPCIAddr:   "0000:01:00",
+			expectedAction:    pb.RecommendedAction_CONTACT_SUPPORT,
+			expectedMnemonic:  "XID 154",
+			expectedErrorCode: "154",
+			expectedMetadata:  map[string]string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := parser.Parse(tc.message)
+
+			if !tc.expectedSuccess {
+				assert.False(t, result.Success, "Expected Success to be false for unsuccessful case")
+				return
+			}
+
+			require.NoError(t, err, "Parse should not return error for valid XID message")
+			require.NotNil(t, result, "Result should not be nil for valid XID message")
+			assert.True(t, result.Success, "Parse should succeed for valid XID message")
+
+			assert.Equal(t, tc.expectedXIDCode, result.Result.Number, "XID code should match")
+			assert.Equal(t, tc.expectedPCIAddr, result.Result.PCIE, "PCI address should match")
+			assert.Equal(t, tc.expectedMnemonic, result.Result.Mnemonic, "Mnemonic should match")
+			assert.Equal(t, tc.expectedErrorCode, result.Result.DecodedXIDStr, "Decoded XID string should match")
+			assert.Equal(t, tc.expectedErrorCode, result.Result.Name, "Name should match")
+			assert.Equal(t, tc.expectedMetadata, result.Result.Metadata, "Metadata should match")
+
+			// Verify the resolution matches the expected action from the test case
+			assert.Equal(t, tc.expectedAction.String(), result.Result.Resolution,
+				"XID %d resolution should match expected action", tc.expectedXIDCode)
+
+			assert.Empty(t, result.Result.Driver, "Driver should be empty as requested")
+			assert.Empty(t, result.Error, "Error field should be empty for successful parse")
+		})
+	}
+}
+
+// TestCSVParser_NVL5PerMessageDriverVersionSelection verifies that a single
+// CSVParser selects the V1 vs V2 NVL5 IntrInfo pattern per message based on the
+// driver version resolved at parse time (not snapshotted at construction). The
+// same parser instance must decode the same message differently as the live
+// driver version changes.
+func TestCSVParser_NVL5PerMessageDriverVersionSelection(t *testing.T) {
+	errorResolutionMap, err := common.LoadErrorResolutionMap()
+	require.NoError(t, err)
+
+	nvl5Rules, err := common.GetNVL5DecodingRules()
+	require.NoError(t, err)
+
+	// intrInfo=0x00000082 matches the V1 IntrInfo pattern for XID 145 RLW_REMAP
+	// (RESET_GPU -> COMPONENT_RESET) but matches no V2 pattern.
+	msgMatchesV1 := "NVRM: Xid (PCI:0000:00:08.0): 145, RLW_REMAP Nonfatal XC1 i0 Link 10 " +
+		"(0x00000082 0x00000040 0x00000000 0x00000000 0x00000000 0x00000000)"
+	// intrInfo=0x00000004 matches the V2 pattern but no V1 pattern.
+	msgMatchesV2 := "NVRM: Xid (PCI:0000:00:08.0): 145, RLW_REMAP Nonfatal XC1 i0 Link 10 " +
+		"(0x00000004 0x00000040 0x00000000 0x00000000 0x00000000 0x00000000)"
+
+	// Single parser instance whose driver version is mutated between calls.
+	driverVersion := ""
+	parser := NewCSVParser("test-node", errorResolutionMap, nvl5Rules, func() string { return driverVersion })
+
+	cases := []struct {
+		name           string
+		driver         string
+		message        string
+		wantResolution pb.RecommendedAction
+	}{
+		{"pre-R575 matches V1", "570.148.08", msgMatchesV1, pb.RecommendedAction_COMPONENT_RESET},
+		{"pre-R575 does not match V2", "570.148.08", msgMatchesV2, pb.RecommendedAction_NONE},
+		{"R575+ matches V2", "580.105.08", msgMatchesV2, pb.RecommendedAction_COMPONENT_RESET},
+		{"R575+ does not match V1", "580.105.08", msgMatchesV1, pb.RecommendedAction_NONE},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			driverVersion = tc.driver
+
+			result, parseErr := parser.Parse(tc.message)
+			require.NoError(t, parseErr)
+			require.NotNil(t, result)
+			require.True(t, result.Success)
+
+			assert.Equal(t, tc.wantResolution.String(), result.Result.Resolution,
+				"driver %q on same parser should select the matching NVL5 pattern", tc.driver)
+		})
+	}
+}

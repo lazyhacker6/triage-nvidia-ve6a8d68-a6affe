@@ -1,0 +1,105 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+type Rule struct {
+	Kind       string `toml:"kind"`
+	Expression string `toml:"expression"`
+}
+
+type Taint struct {
+	Key         string `toml:"key"    json:"key"`
+	Value       string `toml:"value"  json:"value"`
+	Effect      string `toml:"effect" json:"effect"`
+	PreExisting bool   `toml:"-"      json:"preExisting"`
+}
+
+type Label struct {
+	Key   string `toml:"key"`
+	Value string `toml:"value"`
+}
+
+// AppliedLabel is the persisted quarantine-session label winner. Priority and
+// Order preserve the same conflict policy used while evaluating one event so
+// later events cannot downgrade an active session label. Missing fields in
+// legacy annotations decode as zero and remain backward compatible.
+type AppliedLabel struct {
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	Priority int    `json:"priority,omitempty"`
+	Order    int    `json:"order,omitempty"`
+}
+
+type Cordon struct {
+	ShouldCordon bool `toml:"shouldCordon"`
+}
+
+type CircuitBreaker struct {
+	Percentage       int `toml:"percentage"`
+	MaxNodes         int `toml:"maxNodes"`
+	MaxCordonedNodes int `toml:"maxCordonedNodes"`
+	// MaxCordonedPercentage is the percentage form of MaxCordonedNodes. When both are set
+	// the lower one binds.
+	MaxCordonedPercentage int    `toml:"maxCordonedPercentage"`
+	Duration              string `toml:"duration"`
+}
+
+type Match struct {
+	Any []Rule `toml:"any"`
+	All []Rule `toml:"all"`
+}
+
+type RuleSetMeta struct {
+	Enabled  bool   `toml:"enabled"`
+	Version  string `toml:"version"`
+	Name     string `toml:"name"`
+	Priority int    `toml:"priority"`
+	Match    Match  `toml:"match"`
+}
+
+type QuarantineRuleSet struct {
+	RuleSetMeta
+	Taint  Taint  `toml:"taint"`
+	Label  Label  `toml:"label"`
+	Cordon Cordon `toml:"cordon"`
+}
+
+type ValidationRuleSet struct {
+	RuleSetMeta
+	Tests []string `toml:"tests"`
+}
+
+// The ValidationConfig configures how fault-quarantine creates ValidationRequest CRDs after a quarantine
+// session's unhealthy events have all recovered and at least 1 event from the quarantine session required
+// a validation test according to Validation.RuleSets.
+type ValidationConfig struct {
+	Enabled           bool                `toml:"enabled"`
+	ApiGroup          string              `toml:"apiGroup"`
+	Version           string              `toml:"version"`
+	Kind              string              `toml:"kind"`
+	Resource          string              `toml:"resource"`
+	TemplateMountPath string              `toml:"templateMountPath"`
+	TemplateFileName  string              `toml:"templateFileName"`
+	RuleSets          []ValidationRuleSet `toml:"ruleSets"`
+	// PartialDrainEnabled must match node-drainer's partialDrainEnabled.
+	PartialDrainEnabled bool `toml:"partialDrainEnabled"`
+}
+
+type TomlConfig struct {
+	LabelPrefix    string              `toml:"label-prefix"`
+	CircuitBreaker CircuitBreaker      `toml:"circuitBreaker"`
+	RuleSets       []QuarantineRuleSet `toml:"rule-sets"`
+	Validation     ValidationConfig    `toml:"validation"`
+}

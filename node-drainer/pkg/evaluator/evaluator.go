@@ -1,0 +1,686 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package evaluator
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/drain"
+	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
+	annotation "github.com/nvidia/nvsentinel/fault-quarantine/pkg/healthEventsAnnotation"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/config"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/customdrain"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/queue"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+)
+
+const (
+	customDrainPollInterval = 30 * time.Second
+)
+
+// DrainScope distinguishes a whole-node drain from one scoped to a single entity. It is used
+// as a metric label, so it is a small fixed set rather than a free-form string.
+type DrainScope string
+
+const (
+	DrainScopeFull    DrainScope = "full"
+	DrainScopePartial DrainScope = "partial"
+)
+
+// NewNodeDrainEvaluator compiles pod drain policies and creates a drain evaluator.
+// It returns an error when a configured pod drain policy is invalid.
+func NewNodeDrainEvaluator(
+	cfg config.TomlConfig,
+	informers InformersInterface,
+	customDrainClient CustomDrainClientInterface,
+) (DrainEvaluator, error) {
+	policies, err := config.CompilePodDrainPolicies(cfg.PodDrainPolicies)
+	if err != nil {
+		return nil, fmt.Errorf("compile pod drain policies: %w", err)
+	}
+
+	customDrainNodes, err := config.CompileCustomDrainNodeSelector(cfg.CustomDrain)
+	if err != nil {
+		return nil, fmt.Errorf("compile custom drain node selector: %w", err)
+	}
+
+	return &NodeDrainEvaluator{
+		config:            cfg,
+		informers:         informers,
+		customDrainClient: customDrainClient,
+		podPolicies:       policies,
+		customDrainNodes:  customDrainNodes,
+	}, nil
+}
+
+// EvaluateEvent method has been removed - use EvaluateEventWithDatabase instead
+
+// checkPreconditions returns an early result if the event should not proceed
+// to full drain evaluation. Returns nil if evaluation should continue.
+func checkPreconditions(ctx context.Context, healthEvent model.HealthEventWithStatus) *DrainActionResult {
+	nodeName := healthEvent.HealthEvent.NodeName
+
+	if healthEvent.HealthEventStatus == nil {
+		slog.WarnContext(ctx, "HealthEventStatus is nil, cannot evaluate event", "node", nodeName)
+		return &DrainActionResult{Action: ActionWait, WaitDelay: time.Minute}
+	}
+
+	statusStr := healthEvent.HealthEventStatus.NodeQuarantined
+	if statusStr == "" || statusStr == string(model.UnQuarantined) {
+		return &DrainActionResult{Action: ActionSkip}
+	}
+
+	if healthEvent.HealthEventStatus.UserPodsEvictionStatus == nil {
+		slog.WarnContext(ctx, "HealthEventStatus is missing UserPodsEvictionStatus", "node", nodeName)
+		return &DrainActionResult{Action: ActionWait, WaitDelay: time.Minute}
+	}
+
+	if isTerminalStatus(model.Status(healthEvent.HealthEventStatus.UserPodsEvictionStatus.Status)) {
+		slog.InfoContext(ctx, "Event for node is in terminal state, skipping", "node", nodeName)
+		return &DrainActionResult{Action: ActionSkip}
+	}
+
+	if healthEvent.HealthEvent.IsHealthy {
+		return &DrainActionResult{Action: ActionMarkAlreadyDrained, Status: model.AlreadyDrained}
+	}
+
+	// Honor DrainOverrides.Skip: mark drain as already completed so
+	// fault-remediation can proceed immediately without waiting for pods.
+	// This is used by ergatos debug events where drain is intentionally
+	// skipped to test the Slack notification pipeline.
+	if healthEvent.HealthEvent.DrainOverrides != nil &&
+		healthEvent.HealthEvent.DrainOverrides.Skip {
+		slog.InfoContext(ctx, "DrainOverrides.Skip is true, skipping drain for node",
+			"node", nodeName)
+
+		return &DrainActionResult{Action: ActionMarkAlreadyDrained, Status: model.AlreadyDrained}
+	}
+
+	return nil
+}
+
+// EvaluateEventWithDatabase evaluates using the new database-agnostic interface
+func (e *NodeDrainEvaluator) EvaluateEventWithDatabase(ctx context.Context, healthEvent model.HealthEventWithStatus,
+	database queue.DataStore, healthEventStore datastore.HealthEventStore) (*DrainActionResult, error) {
+	if result := checkPreconditions(ctx, healthEvent); result != nil {
+		return result, nil
+	}
+
+	nodeName := healthEvent.HealthEvent.NodeName
+	statusStr := healthEvent.HealthEventStatus.NodeQuarantined
+
+	partialDrainEntity, err := drain.PartialDrainEntity(healthEvent.HealthEvent, e.config.PartialDrainEnabled)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to check if node should be partially drained",
+			"node", nodeName,
+			"error", err)
+
+		_, span := tracing.StartSpan(ctx, "node_drainer.evaluate_event")
+		defer span.End()
+
+		tracing.RecordError(span, err)
+		span.SetAttributes(
+			attribute.String("node_drainer.error.type", "partial_drain_check_failed"),
+			attribute.String("node_drainer.error.message", err.Error()),
+		)
+
+		return &DrainActionResult{
+			Action: ActionUpdateStatus,
+			Status: model.StatusFailed,
+		}, nil
+	}
+
+	result := e.handleAlreadyQuarantined(ctx, statusStr, healthEvent, partialDrainEntity, healthEventStore)
+	if result != nil {
+		return result, nil
+	}
+
+	useCustomDrain, retry := e.shouldUseCustomDrain(ctx, nodeName)
+	if retry != nil {
+		return retry, nil
+	}
+
+	if useCustomDrain {
+		r, err := e.evaluateCustomDrain(ctx, healthEvent, partialDrainEntity)
+		return r, err
+	}
+
+	r, err := e.evaluateUserNamespaceActions(ctx, healthEvent, partialDrainEntity)
+
+	return r, err
+}
+
+// shouldUseCustomDrain reports whether the node is drained by the custom drain plugin
+// rather than the built-in eviction path. When customDrain.nodeSelector is set the answer
+// depends on the node's labels, and a node the informer cannot resolve yields a retry
+// result instead of a decision: guessing either path would drain the node the wrong way.
+func (e *NodeDrainEvaluator) shouldUseCustomDrain(ctx context.Context, nodeName string) (bool, *DrainActionResult) {
+	if !e.config.CustomDrain.Enabled || e.customDrainClient == nil {
+		return false, nil
+	}
+
+	if !e.customDrainNodes.IsScoped() {
+		return true, nil
+	}
+
+	node, err := e.informers.GetNode(nodeName)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to get node to evaluate customDrain.nodeSelector, retrying",
+			"node", nodeName,
+			"error", err)
+
+		return false, &DrainActionResult{Action: ActionWait, WaitDelay: time.Minute}
+	}
+
+	matches := e.customDrainNodes.Matches(node)
+
+	slog.InfoContext(ctx, "Selected drain path for node",
+		"node", nodeName,
+		"customDrain", matches)
+
+	return matches, nil
+}
+
+func (e *NodeDrainEvaluator) handleAlreadyQuarantined(ctx context.Context, statusStr string,
+	healthEvent model.HealthEventWithStatus, partialDrainEntity *protos.Entity,
+	healthEventStore datastore.HealthEventStore) *DrainActionResult {
+	if statusStr != string(model.AlreadyQuarantined) {
+		return nil
+	}
+
+	nodeName := healthEvent.HealthEvent.NodeName
+
+	isDrained, hasQuarantineAnnotation, err := e.isNodeAlreadyDrained(ctx, healthEvent.HealthEvent.Id, partialDrainEntity,
+		nodeName, healthEventStore)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to check if node is already drained",
+			"node", nodeName,
+			"error", err)
+
+		return &DrainActionResult{
+			Action:    ActionWait,
+			WaitDelay: time.Minute,
+		}
+	}
+
+	if !hasQuarantineAnnotation {
+		slog.InfoContext(ctx, "Cancelling stale AlreadyQuarantined event with no active quarantine annotation",
+			"node", nodeName)
+
+		return &DrainActionResult{
+			Action: ActionCancel,
+			Status: model.Cancelled,
+		}
+	}
+
+	if isDrained {
+		return &DrainActionResult{
+			Action: ActionMarkAlreadyDrained,
+			Status: model.AlreadyDrained,
+		}
+	}
+
+	return nil
+}
+
+// evaluateUserNamespaceActions selects the next drain action using pod policies
+// when configured, or the legacy namespace rules otherwise.
+func (e *NodeDrainEvaluator) evaluateUserNamespaceActions(ctx context.Context,
+	healthEvent model.HealthEventWithStatus, partialDrainEntity *protos.Entity) (*DrainActionResult, error) {
+	if len(e.config.PodDrainPolicies) > 0 {
+		return e.evaluatePodPolicyActions(ctx, healthEvent, partialDrainEntity)
+	}
+
+	nodeName := healthEvent.HealthEvent.NodeName
+
+	systemNamespaces := e.config.SystemNamespaces
+	ns := namespaces{
+		immediateEvictionNamespaces:  make([]string, 0),
+		allowCompletionNamespaces:    make([]string, 0),
+		deleteAfterTimeoutNamespaces: make([]string, 0),
+	}
+	forceImmediateEviction := healthEvent.HealthEvent.DrainOverrides != nil &&
+		healthEvent.HealthEvent.DrainOverrides.Force
+
+	if forceImmediateEviction {
+		slog.InfoContext(ctx, "DrainOverrides.Force is true, forcing immediate eviction for all namespaces on node",
+			"node", nodeName)
+	}
+
+	for _, userNamespace := range e.config.UserNamespaces {
+		matchedNamespaces, err := e.informers.GetNamespacesMatchingPattern(ctx,
+			userNamespace.Name, systemNamespaces, nodeName)
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to get namespaces for pattern",
+				"pattern", userNamespace.Name,
+				"error", err)
+
+			return &DrainActionResult{
+				Action:    ActionWait,
+				WaitDelay: time.Minute,
+			}, nil
+		}
+
+		mapUserNamespacesToMode(ctx, &ns, forceImmediateEviction, userNamespace, matchedNamespaces)
+	}
+
+	return e.getAction(ctx, ns, nodeName, partialDrainEntity), nil
+}
+
+func mapUserNamespacesToMode(
+	ctx context.Context, ns *namespaces, forceImmediateEviction bool,
+	userNamespace config.UserNamespace, matchedNamespaces []string,
+) {
+	switch {
+	case forceImmediateEviction || userNamespace.Mode == config.ModeImmediateEvict:
+		ns.immediateEvictionNamespaces = append(ns.immediateEvictionNamespaces, matchedNamespaces...)
+	case userNamespace.Mode == config.ModeAllowCompletion:
+		ns.allowCompletionNamespaces = append(ns.allowCompletionNamespaces, matchedNamespaces...)
+	case userNamespace.Mode == config.ModeDeleteAfterTimeout:
+		ns.deleteAfterTimeoutNamespaces = append(ns.deleteAfterTimeoutNamespaces, matchedNamespaces...)
+	default:
+		slog.ErrorContext(ctx, "unsupported mode", "mode", userNamespace.Mode)
+	}
+}
+
+// getAction checks Immediate, DeleteAfterTimeout, then AllowCompletion workloads,
+// carrying each mode's pod filter into the returned action.
+func (e *NodeDrainEvaluator) getAction(ctx context.Context, ns namespaces, nodeName string,
+	partialDrainEntity *protos.Entity) *DrainActionResult {
+	if len(ns.immediateEvictionNamespaces) > 0 {
+		timeout := e.config.EvictionTimeoutInSeconds.Duration
+		if !e.informers.CheckIfAllPodsAreEvictedInImmediateMode(ctx, ns.immediateEvictionNamespaces, nodeName,
+			timeout, partialDrainEntity, ns.podFilters[config.ModeImmediateEvict]) {
+			slog.InfoContext(ctx, "Performing immediate eviction for node", "node", nodeName)
+
+			return &DrainActionResult{
+				Action:             ActionEvictImmediate,
+				Namespaces:         ns.immediateEvictionNamespaces,
+				Timeout:            timeout,
+				PartialDrainEntity: partialDrainEntity,
+				PodFilter:          ns.podFilters[config.ModeImmediateEvict],
+			}
+		}
+	}
+
+	// Priority 2: DeleteAfterTimeout - pods have a deadline and must be force-deleted after timeout
+	// Process BEFORE AllowCompletion to ensure timeout-based eviction is not blocked
+	if len(ns.deleteAfterTimeoutNamespaces) > 0 {
+		action := e.handleDeleteAfterTimeoutNamespaces(ctx, ns, nodeName, partialDrainEntity)
+		if action != nil {
+			return action
+		}
+	}
+
+	// Priority 3: AllowCompletion - pods wait indefinitely for natural completion
+	// Checked last since they have no deadline (unlike DeleteAfterTimeout)
+	if len(ns.allowCompletionNamespaces) > 0 {
+		action := e.handleAllowCompletionNamespaces(ctx, ns, nodeName, partialDrainEntity)
+		if action != nil {
+			return action
+		}
+	}
+
+	slog.InfoContext(ctx, "All pods evicted successfully on node", "node", nodeName)
+
+	return &DrainActionResult{
+		Action: ActionUpdateStatus,
+		Status: model.StatusSucceeded,
+	}
+}
+
+// handleAllowCompletionNamespaces requests a completion check while selected pods
+// remain or cannot be listed, and returns nil once no selected pods remain.
+func (e *NodeDrainEvaluator) handleAllowCompletionNamespaces(ctx context.Context, ns namespaces, nodeName string,
+	partialDrainEntity *protos.Entity) *DrainActionResult {
+	hasRemainingPods := false
+
+	for _, namespace := range ns.allowCompletionNamespaces {
+		pods, err := e.informers.FindEvictablePodsInNamespaceAndNode(ctx, namespace, nodeName, partialDrainEntity,
+			ns.podFilters[config.ModeAllowCompletion])
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to check pods in namespace on node",
+				"namespace", namespace,
+				"node", nodeName,
+				"error", err)
+
+			hasRemainingPods = true
+
+			break
+		}
+
+		if len(pods) > 0 {
+			hasRemainingPods = true
+			break
+		}
+	}
+
+	if hasRemainingPods {
+		slog.InfoContext(ctx, "Checking pod completion status for AllowCompletion namespaces on node",
+			"node", nodeName)
+
+		return &DrainActionResult{
+			Action:             ActionCheckCompletion,
+			Namespaces:         ns.allowCompletionNamespaces,
+			PartialDrainEntity: partialDrainEntity,
+			PodFilter:          ns.podFilters[config.ModeAllowCompletion],
+		}
+	}
+
+	return nil
+}
+
+// handleDeleteAfterTimeoutNamespaces requests a deadline-based drain while selected
+// pods remain or cannot be listed, and returns nil once no selected pods remain.
+func (e *NodeDrainEvaluator) handleDeleteAfterTimeoutNamespaces(ctx context.Context, ns namespaces, nodeName string,
+	partialDrainEntity *protos.Entity) *DrainActionResult {
+	hasRemainingPods := false
+
+	for _, namespace := range ns.deleteAfterTimeoutNamespaces {
+		pods, err := e.informers.FindEvictablePodsInNamespaceAndNode(ctx, namespace, nodeName, partialDrainEntity,
+			ns.podFilters[config.ModeDeleteAfterTimeout])
+		if err != nil {
+			slog.ErrorContext(ctx, "Failed to check pods in namespace on node",
+				"namespace", namespace,
+				"node", nodeName,
+				"error", err)
+
+			hasRemainingPods = true
+
+			break
+		}
+
+		if len(pods) > 0 {
+			hasRemainingPods = true
+			break
+		}
+	}
+
+	if hasRemainingPods {
+		slog.InfoContext(ctx, "Deleting pods after timeout for DeleteAfterTimeout namespaces on node",
+			"node", nodeName)
+
+		return &DrainActionResult{
+			Action:             ActionEvictWithTimeout,
+			Namespaces:         ns.deleteAfterTimeoutNamespaces,
+			Timeout:            time.Duration(e.config.DeleteAfterTimeoutMinutes) * time.Minute,
+			PartialDrainEntity: partialDrainEntity,
+			PodFilter:          ns.podFilters[config.ModeDeleteAfterTimeout],
+		}
+	}
+
+	return nil
+}
+
+func isTerminalStatus(status model.Status) bool {
+	return status == model.StatusSucceeded ||
+		status == model.StatusFailed ||
+		status == model.Cancelled ||
+		status == model.AlreadyDrained
+}
+
+func (e *NodeDrainEvaluator) evaluateCustomDrain(ctx context.Context, healthEvent model.HealthEventWithStatus,
+	partialDrainEntity *protos.Entity) (*DrainActionResult, error) {
+	nodeName := healthEvent.HealthEvent.NodeName
+	eventID := healthEvent.HealthEvent.Id
+
+	if eventID == "" {
+		return nil, fmt.Errorf("health event for node %s is missing Id, cannot generate DrainRequest CR name", nodeName)
+	}
+
+	crName := customdrain.GenerateCRName(nodeName, eventID)
+
+	nodeHasCR, nodeDrainComplete, err := e.customDrainClient.ExistsForNode(ctx, nodeName)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to check if any drain CR exists for node",
+			"node", nodeName,
+			"error", err)
+
+		return &DrainActionResult{
+			Action:    ActionWait,
+			WaitDelay: customDrainPollInterval,
+		}, nil
+	}
+
+	if !nodeHasCR {
+		systemNamespaces := e.config.SystemNamespaces
+
+		namespaces, err := e.informers.GetNamespacesMatchingPattern(ctx, "*", systemNamespaces, nodeName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get user namespaces: %w", err)
+		}
+
+		slog.InfoContext(ctx, "Creating custom drain CR",
+			"node", nodeName,
+			"crName", crName)
+
+		return &DrainActionResult{
+			Action:             ActionCreateCR,
+			Namespaces:         namespaces,
+			PartialDrainEntity: partialDrainEntity,
+		}, nil
+	}
+
+	crExists, isComplete, err := e.customDrainClient.GetCRStatus(ctx, crName)
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to get drain CR status",
+			"node", nodeName,
+			"crName", crName,
+			"error", err)
+
+		span := tracing.SpanFromContext(ctx)
+		span.SetAttributes(
+			attribute.String("node_drainer.custom_cr.name", crName),
+			attribute.String("node_drainer.custom_cr.status", "error"),
+		)
+
+		return &DrainActionResult{
+			Action:    ActionWait,
+			WaitDelay: customDrainPollInterval,
+		}, nil
+	}
+
+	if !crExists {
+		if nodeDrainComplete {
+			slog.InfoContext(ctx, "Another drain CR completed for this node, marking as already drained",
+				"node", nodeName)
+
+			return &DrainActionResult{
+				Action: ActionMarkAlreadyDrained,
+				Status: model.AlreadyDrained,
+			}, nil
+		}
+
+		slog.InfoContext(ctx, "Another drain CR is in progress for this node, waiting",
+			"node", nodeName)
+
+		return &DrainActionResult{
+			Action:    ActionWait,
+			WaitDelay: customDrainPollInterval,
+		}, nil
+	}
+
+	span := tracing.SpanFromContext(ctx)
+	if !isComplete {
+		slog.DebugContext(ctx, "Drain CR in progress",
+			"node", nodeName,
+			"crName", crName)
+
+		span.SetAttributes(
+			attribute.String("node_drainer.custom_cr.name", crName),
+		)
+
+		return &DrainActionResult{
+			Action:    ActionWait,
+			WaitDelay: customDrainPollInterval,
+		}, nil
+	}
+
+	slog.InfoContext(ctx, "Drain CR completed",
+		"node", nodeName,
+		"crName", crName)
+
+	span.SetAttributes(
+		attribute.String("node_drainer.custom_cr.name", crName),
+		attribute.String("node_drainer.custom_cr.status", "completed"),
+	)
+
+	return &DrainActionResult{
+		Action: ActionMarkAlreadyDrained,
+		Status: model.AlreadyDrained,
+	}, nil
+}
+
+/*
+This function determines whether we can skip draining for the current unhealthy HealthEvent. A full drain can be
+skipped if a previous full drain completed against the node after it was most-recently quarantined. Additionally,
+a partial drain can be skipped if either a previous full drain or a previous partial drain against the same impacted
+entity completed against the node after it was most-recently quarantined.
+
+To discover the set of unhealthy HealthEvents which may allow a drain to be skipped, we will fetch the
+quarantineHealthEvent annotation for the current node. Each HealthEvent on the annotation includes the object ID
+which can be used to query the backing DB for an up-to-date full HealthEventWithStatus object which includes its
+current drain status.
+
+Partial drain example:
+
+1. Suppose the current HealthEvent received by the node-drainer is for event 70bd4fc9ffa9f5eca91c340c which has
+recommended action COMPONENT_RESET and impacted entity GPU_UUID GPU-123.
+
+2. Next, we fetch the quarantineHealthEvent annotation for the current node, and it has the following 2 events:
+
+	   [{
+	    id: '68bd4fc9ffa9f5eca91c340c',
+		version: 1,
+		agent: 'syslog-health-monitor',
+		componentclass: 'GPU',
+		checkname: 'SysLogsXIDError',
+		isfatal: true,
+		ishealthy: false,
+		recommendedaction: 2,
+		entitiesimpacted: [
+		  {
+			entitytype: 'GPU_UUID',
+			entityvalue: 'GPU-123'
+		  }
+		],
+		nodename: 'node-123'
+	  },
+	  {
+	    id: '70bd4fc9ffa9f5eca91c340c',
+		version: 1,
+		agent: 'syslog-health-monitor',
+		componentclass: 'GPU',
+		checkname: 'SysLogsXIDError',
+		isfatal: true,
+		ishealthy: false,
+		recommendedaction: 2,
+		entitiesimpacted: [
+		  {
+			entitytype: 'GPU_UUID',
+			entityvalue: 'GPU-123'
+		  }
+		],
+		nodename: 'node-123'
+	  }]
+
+3. The second HealthEvent with ID 70bd4fc9ffa9f5eca91c340c matches the ID for our current event so we will ignore that
+event. The first event has ID 68bd4fc9ffa9f5eca91c340c and corresponds to a different event so we will query our
+backing database with this ID. Suppose the full HealthEventWithStatus item includes this status section:
+
+		healtheventstatus: {
+		  nodequarantined: 'Quarantined',
+		  userpodsevictionstatus: {
+		    status: 'Succeeded'
+		  },
+		  faultremediated: null
+	    }
+
+4. Since this previous drain completed and was a partial drain which matches the same GPU-123 impacted entity, we will
+skip draining for the current event 70bd4fc9ffa9f5eca91c340c and update its status section to:
+
+		healtheventstatus: {
+		  nodequarantined: 'Quarantined',
+		  userpodsevictionstatus: {
+		    status: 'AlreadyDrained'
+		  },
+		  faultremediated: null
+	    }
+*/
+func (e *NodeDrainEvaluator) isNodeAlreadyDrained(ctx context.Context, currentEventId string,
+	currentPartialDrainEntity *protos.Entity, nodeName string,
+	healthEventStore datastore.HealthEventStore) (bool, bool, error) {
+	node, err := e.informers.GetNode(nodeName)
+	if err != nil {
+		return false, false, fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+
+	quarantineHealthEventAnnotationStr, ok := node.Annotations[common.QuarantineHealthEventAnnotationKey]
+	if !ok {
+		slog.InfoContext(ctx, "No quarantine annotation found for node", "node", nodeName)
+
+		return false, false, nil
+	}
+
+	var healthEventsMap annotation.HealthEventsAnnotationMap
+
+	err = healthEventsMap.UnmarshalJSON([]byte(quarantineHealthEventAnnotationStr))
+	if err != nil {
+		return false, true, fmt.Errorf("failed to unmarshal quarantine annotation for node %s: %w", nodeName, err)
+	}
+
+	slog.InfoContext(ctx, "HealthEvents which are part of quarantineHealthEvent annotation",
+		"eventCount", len(healthEventsMap.Events))
+
+	events := make([]*protos.HealthEvent, 0, len(healthEventsMap.Events))
+	for _, healthEventFromAnnotation := range healthEventsMap.Events {
+		if len(healthEventFromAnnotation.Id) == 0 {
+			slog.ErrorContext(ctx, "HealthEvent is missing ID for database lookup, expected for old events",
+				"message", healthEventFromAnnotation.Message)
+
+			continue
+		}
+
+		events = append(events, healthEventFromAnnotation)
+	}
+
+	alreadyDrained, err := drain.IsNodeDrained(ctx, healthEventStore, nodeName, events, currentEventId,
+		currentPartialDrainEntity, e.config.PartialDrainEnabled)
+	if err != nil {
+		return false, true, err
+	}
+
+	return alreadyDrained, true, nil
+}
+
+// DrainScopeFor reports whether the event drains the whole node or a single entity, and the
+// entity when the drain is partial. Callers need both, so returning them together keeps the
+// scope label and the entity from being derived independently and drifting apart.
+func DrainScopeFor(healthEvent *protos.HealthEvent, partialDrainEnabled bool) (DrainScope, *protos.Entity) {
+	entity, err := drain.PartialDrainEntity(healthEvent, partialDrainEnabled)
+	if err != nil || entity == nil {
+		return DrainScopeFull, nil
+	}
+
+	return DrainScopePartial, entity
+}

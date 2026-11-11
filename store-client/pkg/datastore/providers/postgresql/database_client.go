@@ -1,0 +1,1134 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package postgresql
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"maps"
+	"reflect"
+	"slices"
+	"strings"
+	"unicode"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+	"github.com/nvidia/nvsentinel/store-client/pkg/query"
+)
+
+// MongoDB operator constants
+const (
+	maintenanceEventTableName = "maintenance_events"
+	trueString                = "TRUE"
+	nodeQuarantinedStatusPath = "healtheventstatus.nodequarantined"
+)
+
+// PostgreSQLDatabaseClient implements client.DatabaseClient for PostgreSQL
+// This provides backward compatibility with services using the legacy DatabaseClient interface
+type PostgreSQLDatabaseClient struct {
+	db         *sql.DB
+	tableName  string
+	connString string // For creating LISTEN connections
+}
+
+// toSnakeCase converts PascalCase strings to snake_case for PostgreSQL table names
+// Examples: "HealthEvents" -> "health_events", "MaintenanceEvents" -> "maintenance_events"
+func toSnakeCase(s string) string {
+	if s == "" {
+		return s
+	}
+
+	var result strings.Builder
+
+	for i, r := range s {
+		if unicode.IsUpper(r) {
+			// Add underscore before uppercase letters (except first character)
+			if i > 0 {
+				result.WriteRune('_')
+			}
+
+			result.WriteRune(unicode.ToLower(r))
+		} else {
+			result.WriteRune(r)
+		}
+	}
+
+	return result.String()
+}
+
+// transformFilterMapForMaintenanceEvents converts filter map keys to snake_case
+// for the maintenance_events table to use indexed columns instead of JSON queries.
+// Example: {"scheduledStartTime": {"$gt": now}} -> {"scheduled_start_time": {"$gt": now}}
+func transformFilterMapForMaintenanceEvents(filterMap map[string]any) map[string]any {
+	transformed := make(map[string]any)
+
+	for key, value := range filterMap {
+		snakeCaseKey := toSnakeCase(key)
+
+		if valueMap, ok := value.(map[string]any); ok {
+			transformedValue := make(map[string]any)
+			maps.Copy(transformedValue, valueMap)
+			transformed[snakeCaseKey] = transformedValue
+		} else {
+			transformed[snakeCaseKey] = value
+		}
+	}
+
+	return transformed
+}
+
+// NewPostgreSQLDatabaseClient creates a new PostgreSQL database client
+// Converts MongoDB-style PascalCase table names to PostgreSQL snake_case
+func NewPostgreSQLDatabaseClient(db *sql.DB, tableName string) client.DatabaseClient {
+	// Convert PascalCase to snake_case for PostgreSQL compatibility
+	// MongoDB: "HealthEvents" -> PostgreSQL: "health_events"
+	snakeCaseTableName := toSnakeCase(tableName)
+
+	slog.Info("Creating PostgreSQL database client",
+		"originalTableName", tableName,
+		"postgresTableName", snakeCaseTableName)
+
+	return &PostgreSQLDatabaseClient{
+		db:         db,
+		tableName:  snakeCaseTableName,
+		connString: "", // Empty connString - will fall back to polling if needed
+	}
+}
+
+// NewPostgreSQLDatabaseClientWithConnString creates a client with connection string for LISTEN/NOTIFY
+func NewPostgreSQLDatabaseClientWithConnString(db *sql.DB, tableName string, connString string) client.DatabaseClient {
+	// Convert PascalCase to snake_case for PostgreSQL compatibility
+	snakeCaseTableName := toSnakeCase(tableName)
+
+	slog.Info("Creating PostgreSQL database client with LISTEN/NOTIFY support",
+		"originalTableName", tableName,
+		"postgresTableName", snakeCaseTableName)
+
+	return &PostgreSQLDatabaseClient{
+		db:         db,
+		tableName:  snakeCaseTableName,
+		connString: connString, // Store for LISTEN connections
+	}
+}
+
+// insertSingleHealthEvent inserts one health event using the PostgreSQL-specific schema
+func (c *PostgreSQLDatabaseClient) insertSingleHealthEvent(
+	ctx context.Context, healthStore *PostgreSQLHealthEventStore, doc any,
+) (any, error) {
+	modelEvent, ok := doc.(model.HealthEventWithStatus)
+	if !ok {
+		slog.Error("Type assertion failed in insertSingleHealthEvent",
+			"expectedType", "model.HealthEventWithStatus",
+			"actualType", fmt.Sprintf("%T", doc))
+
+		return nil, fmt.Errorf("expected HealthEventWithStatus but got %T", doc)
+	}
+
+	// CRITICAL: Extract index fields from the protobuf BEFORE JSON marshaling
+	// After JSON marshal/unmarshal, the protobuf is converted to a map and we lose type info
+	var indexFields healthEventIndexFields
+	if modelEvent.HealthEvent != nil {
+		indexFields = healthEventIndexFields{
+			nodeName:          modelEvent.HealthEvent.NodeName,
+			eventType:         modelEvent.HealthEvent.CheckName,
+			severity:          modelEvent.HealthEvent.ComponentClass,
+			recommendedAction: modelEvent.HealthEvent.RecommendedAction.String(),
+		}
+
+		slog.Debug("Extracted index fields from protobuf", "nodeName", indexFields.nodeName)
+	} else {
+		slog.Debug("modelEvent.HealthEvent is nil, using empty index fields")
+	}
+
+	// Convert model.HealthEventWithStatus to datastore.HealthEventWithStatus
+	// by marshaling to JSON and unmarshaling to the datastore type
+	modelJSON, err := json.Marshal(modelEvent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal model health event: %w", err)
+	}
+
+	var datastoreEvent datastore.HealthEventWithStatus
+	if err := json.Unmarshal(modelJSON, &datastoreEvent); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal to datastore health event: %w", err)
+	}
+
+	// Use the PostgreSQL health event store to insert with proper schema
+	// Pass the index fields we extracted from the protobuf
+	// Not logged here: a duplicate on the idempotency index is the expected
+	// answer to a resend, and the caller classifies and reports the rest.
+	err = healthStore.InsertHealthEventsWithIndexFields(ctx, &datastoreEvent, indexFields)
+	if err != nil {
+		return nil, fmt.Errorf("[postgresql:insert] failed to insert documents: %w", err)
+	}
+
+	// For now, use a placeholder ID since InsertHealthEvents doesn't return the ID
+	// In the future, we could modify InsertHealthEvents to return the generated UUID
+	return "inserted", nil
+}
+
+// InsertManyIdempotent inserts documents one at a time, in order, resuming
+// past duplicates on the idempotency index and stopping at any other failure;
+// see client.InsertManyIdempotentWith.
+func (c *PostgreSQLDatabaseClient) InsertManyIdempotent(
+	ctx context.Context, documents []any,
+) (*client.InsertManyResult, error) {
+	slog.Debug("InsertManyIdempotent called", "documentCount", len(documents), "tableName", c.tableName)
+
+	healthStore := NewPostgreSQLHealthEventStore(c.db)
+
+	return client.InsertManyIdempotentWith(ctx, documents, func(ctx context.Context, doc any) (string, error) {
+		return c.insertSingleDocument(ctx, healthStore, doc)
+	})
+}
+
+// insertSingleDocument inserts one document on its own, outside a transaction,
+// so a failure on one document leaves the ones before it stored: a health
+// event goes through the health event store with its index fields, anything
+// else as JSON, like InsertMany. The datastore's error is returned unwrapped
+// beyond the store's own wrapping, so the caller can read its SQLSTATE.
+func (c *PostgreSQLDatabaseClient) insertSingleDocument(
+	ctx context.Context, healthStore *PostgreSQLHealthEventStore, doc any,
+) (string, error) {
+	if _, ok := doc.(model.HealthEventWithStatus); ok {
+		id, err := c.insertSingleHealthEvent(ctx, healthStore, doc)
+		if err != nil {
+			return "", err
+		}
+
+		return fmt.Sprint(id), nil
+	}
+
+	jsonData, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal document: %w", err)
+	}
+
+	//nolint:gosec // G201: table name from config, values are parameterized
+	query := fmt.Sprintf("INSERT INTO %s (data) VALUES ($1) RETURNING id", c.tableName)
+
+	var id string
+	if err := c.db.QueryRowContext(ctx, query, jsonData).Scan(&id); err != nil {
+		return "", err
+	}
+
+	return id, nil
+}
+
+// VerifyHealthEventIdempotencyIndex checks the full idempotency index definition,
+// returning datastore.ErrIndexMissing or datastore.ErrIndexMismatch on deviation.
+func (c *PostgreSQLDatabaseClient) VerifyHealthEventIdempotencyIndex(ctx context.Context) error {
+	return client.NewPostgreSQLClientFromDB(c.db, c.tableName).VerifyHealthEventIdempotencyIndex(ctx)
+}
+
+// UpdateDocumentStatus updates a specific status field in a document
+func (c *PostgreSQLDatabaseClient) UpdateDocumentStatus(
+	ctx context.Context, documentID string, statusPath string, status any,
+) error {
+	// Use query builder to create update
+	update := query.NewUpdate().Set(statusPath, status)
+
+	// For health_events table with nodequarantined status, also update denormalized column
+	if c.tableName == healthEventsTable && statusPath == nodeQuarantinedStatusPath {
+		update.Set("node_quarantined", status)
+	}
+
+	setClause, args := update.ToSQL()
+
+	// For health_events table, use direct id column comparison
+	// For other tables, use JSON path data->>'_id'
+	var whereClause string
+
+	if c.tableName == healthEventsTable {
+		whereClause = fmt.Sprintf("id = $%d", len(args)+1)
+	} else {
+		whereClause = fmt.Sprintf("data->>'_id' = $%d", len(args)+1)
+	}
+
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	query := fmt.Sprintf(
+		"UPDATE %s SET %s WHERE %s",
+		c.tableName, setClause, whereClause,
+	)
+
+	args = append(args, documentID)
+
+	result, err := c.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update document status: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("document not found: %s", documentID)
+	}
+
+	return nil
+}
+
+// UpdateDocumentStatusFields updates multiple status fields in a document in one operation.
+func (c *PostgreSQLDatabaseClient) UpdateDocumentStatusFields(
+	ctx context.Context, documentID string, fields map[string]any,
+) error {
+	if len(fields) == 0 {
+		return nil
+	}
+
+	update := query.NewUpdate()
+
+	for path, value := range fields {
+		update.Set(path, value)
+
+		if c.tableName == healthEventsTable && path == nodeQuarantinedStatusPath {
+			update.Set("node_quarantined", value)
+		}
+	}
+
+	setClause, args := update.ToSQL()
+
+	var whereClause string
+
+	if c.tableName == healthEventsTable {
+		whereClause = fmt.Sprintf("id = $%d", len(args)+1)
+	} else {
+		whereClause = fmt.Sprintf("data->>'_id' = $%d", len(args)+1)
+	}
+
+	//nolint:gosec // G201: table name is controlled internally
+	q := fmt.Sprintf("UPDATE %s SET %s WHERE %s", c.tableName, setClause, whereClause)
+
+	args = append(args, documentID)
+
+	result, err := c.db.ExecContext(ctx, q, args...)
+	if err != nil {
+		return fmt.Errorf("failed to update document status fields: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("document not found: %s", documentID)
+	}
+
+	return nil
+}
+
+// UpdateDocument updates a single document matching the filter
+func (c *PostgreSQLDatabaseClient) UpdateDocument(
+	ctx context.Context, filter any, update any,
+) (*client.UpdateResult, error) {
+	return c.updateDocuments(ctx, filter, update, false)
+}
+
+// UpdateManyDocuments updates all documents matching the filter
+func (c *PostgreSQLDatabaseClient) UpdateManyDocuments(
+	ctx context.Context, filter any, update any,
+) (*client.UpdateResult, error) {
+	return c.updateDocuments(ctx, filter, update, true)
+}
+
+// convertFilterToWhereClause converts various filter formats to SQL WHERE clause
+// The paramOffset parameter specifies where parameter numbering should start
+func (c *PostgreSQLDatabaseClient) convertFilterToWhereClause(
+	filter any, paramOffset int,
+) (string, []any, error) {
+	if builder, ok := filter.(*query.Builder); ok {
+		whereClause, filterArgs := builder.ToSQLWithOffset(paramOffset)
+
+		return whereClause, filterArgs, nil
+	}
+
+	// Try to convert filter to map[string]any if it's a compatible type
+	// This handles bson.M which is essentially map[string]any
+	// MongoDB builder factory may be registered as the default, so we may receive MongoDB types
+	filterMap := c.convertFilterToMap(filter)
+
+	if filterMap != nil {
+		conditions, err := c.filterMapToConditions(filterMap)
+		if err != nil {
+			return "", nil, err
+		}
+
+		var finalCondition query.Condition
+
+		if len(conditions) == 1 {
+			finalCondition = conditions[0]
+		} else if len(conditions) > 1 {
+			finalCondition = query.And(conditions...)
+		}
+
+		builder := query.New().Build(finalCondition)
+		whereClause, filterArgs := builder.ToSQLWithOffset(paramOffset)
+
+		return whereClause, filterArgs, nil
+	}
+
+	slog.Error("Unsupported filter type", "filterType", fmt.Sprintf("%T", filter))
+
+	return "", nil, fmt.Errorf("unsupported filter type: %T", filter)
+}
+
+// convertUpdateToSetClause converts various update formats to SQL SET clause
+func (c *PostgreSQLDatabaseClient) convertUpdateToSetClause(
+	update any,
+) (string, []any, error) {
+	if updateBuilder, ok := update.(*query.UpdateBuilder); ok {
+		setClause, updateArgs := updateBuilder.ToSQL()
+
+		return setClause, updateArgs, nil
+	}
+
+	setFields, err := c.resolveSetFields(update)
+	if err != nil {
+		return "", nil, err
+	}
+
+	builder := query.NewUpdate()
+
+	for key, value := range setFields {
+		slog.Debug("Adding field to UpdateBuilder", "key", key, "value", value, "valueType", fmt.Sprintf("%T", value))
+		builder.Set(key, value)
+		c.syncDenormalizedColumns(builder, key, value)
+	}
+
+	setClause, updateArgs := builder.ToSQL()
+
+	return setClause, updateArgs, nil
+}
+
+func (c *PostgreSQLDatabaseClient) resolveSetFields(
+	update any,
+) (map[string]any, error) {
+	updateMap := c.convertFilterToMap(update)
+	if updateMap == nil {
+		return nil, fmt.Errorf("unsupported update type: %T", update)
+	}
+
+	setOp, hasSet := updateMap["$set"]
+	if !hasSet {
+		slog.Debug("Direct field updates (no $set)", "setFields", updateMap)
+
+		return updateMap, nil
+	}
+
+	for key := range updateMap {
+		if key != "$set" && strings.HasPrefix(key, "$") {
+			return nil, fmt.Errorf("unsupported MongoDB update operator %q: only $set is supported", key)
+		}
+	}
+
+	setFields := c.convertFilterToMap(setOp)
+	if setFields == nil {
+		return nil, fmt.Errorf("$set value must be a map type, got: %T", setOp)
+	}
+
+	slog.Debug("Found $set operator", "setFields", setFields)
+
+	return setFields, nil
+}
+
+// syncDenormalizedColumns updates denormalized columns that must stay in sync with JSONB document fields.
+func (c *PostgreSQLDatabaseClient) syncDenormalizedColumns(
+	builder *query.UpdateBuilder, key string, value any,
+) {
+	// For health_events table, also update denormalized columns to keep them in sync
+	// This ensures PostgreSQL changelog triggers capture the correct values
+	if c.tableName == healthEventsTable && key == nodeQuarantinedStatusPath {
+		slog.Debug("Also updating denormalized node_quarantined column", "value", value)
+		builder.Set("node_quarantined", value)
+	}
+
+	// For maintenance_events table, when updating denormalized columns (like status),
+	// also update the corresponding field in the JSONB document to keep them in sync.
+	// This is critical because queries may filter on either the column or the document field.
+	if c.tableName == maintenanceEventTableName && key == fieldStatus {
+		slog.Debug("Also updating document.status field to keep in sync with column", "value", value)
+		builder.SetDocumentField(fieldStatus, value)
+	}
+}
+
+// updateDocuments is the internal implementation for update operations
+func (c *PostgreSQLDatabaseClient) updateDocuments(
+	ctx context.Context, filter any, update any, updateMany bool,
+) (*client.UpdateResult, error) {
+	setClause, updateArgs, err := c.convertUpdateToSetClause(update)
+	if err != nil {
+		return nil, fmt.Errorf("convert update to SET clause: %w", err)
+	}
+
+	paramOffset := len(updateArgs) + 1
+
+	whereClause, filterArgs, err := c.convertFilterToWhereClause(filter, paramOffset)
+	if err != nil {
+		return nil, fmt.Errorf("convert filter to WHERE clause: %w", err)
+	}
+
+	allArgs := slices.Concat(updateArgs, filterArgs)
+
+	// Build query
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	sql := fmt.Sprintf("UPDATE %s SET %s WHERE %s", c.tableName, setClause, whereClause)
+	// PostgreSQL doesn't support LIMIT in UPDATE, use subquery instead for single update
+	// In most cases updateMany=true, so we don't need this optimization
+
+	slog.Debug("Executing UPDATE query",
+		"sql", sql,
+		"updateArgs", updateArgs,
+		"filterArgs", filterArgs,
+		"allArgs", allArgs)
+
+	result, err := c.db.ExecContext(ctx, sql, allArgs...)
+	if err != nil {
+		slog.Error("Failed to execute UPDATE query",
+			"error", err,
+			"sql", sql,
+			"updateArgs", updateArgs,
+			"filterArgs", filterArgs)
+
+		return nil, fmt.Errorf("failed to update documents: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return &client.UpdateResult{
+		MatchedCount:  rowsAffected,
+		ModifiedCount: rowsAffected,
+	}, nil
+}
+
+// UpsertDocument inserts or updates a document
+func (c *PostgreSQLDatabaseClient) UpsertDocument(
+	ctx context.Context, filter any, document any,
+) (*client.UpdateResult, error) {
+	// For maintenance_events table, use the specialized store implementation
+	// which properly handles the denormalized schema with indexed columns
+	if c.tableName == maintenanceEventTableName {
+		return c.upsertMaintenanceEvent(ctx, document)
+	}
+
+	// For other tables, use generic JSONB document storage
+	jsonData, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal document: %w", err)
+	}
+
+	// PostgreSQL UPSERT using ON CONFLICT
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	query := fmt.Sprintf(
+		`INSERT INTO %s (data) VALUES ($1)
+		ON CONFLICT ((data->>'_id')) DO UPDATE SET data = EXCLUDED.data`,
+		c.tableName,
+	)
+
+	result, err := c.db.ExecContext(ctx, query, jsonData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upsert document: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	return &client.UpdateResult{
+		MatchedCount:  rowsAffected,
+		ModifiedCount: rowsAffected,
+		UpsertedCount: rowsAffected,
+	}, nil
+}
+
+// upsertMaintenanceEvent handles upserts for the maintenance_events table
+// which uses a specialized schema with indexed columns
+func (c *PostgreSQLDatabaseClient) upsertMaintenanceEvent(
+	ctx context.Context, document any,
+) (*client.UpdateResult, error) {
+	// Convert document to MaintenanceEvent type
+	var event model.MaintenanceEvent
+
+	// Marshal and unmarshal to convert between types
+	jsonData, err := json.Marshal(document)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal maintenance event: %w", err)
+	}
+
+	if err := json.Unmarshal(jsonData, &event); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal maintenance event: %w", err)
+	}
+
+	// Use the specialized maintenance event store with result tracking
+	store := NewPostgreSQLMaintenanceEventStore(c.db)
+
+	wasInserted, err := store.upsertMaintenanceEventWithResult(ctx, &event)
+	if err != nil {
+		return nil, err
+	}
+
+	// Return accurate counts based on whether it was INSERT or UPDATE
+	if wasInserted {
+		return &client.UpdateResult{
+			MatchedCount:  0,
+			ModifiedCount: 0,
+			UpsertedCount: 1,
+		}, nil
+	}
+
+	return &client.UpdateResult{
+		MatchedCount:  1,
+		ModifiedCount: 1,
+		UpsertedCount: 0,
+	}, nil
+}
+
+var knownColumnMappings = map[string]string{
+	//nolint:goconst // identity/canonicalisation table; literals are the data
+	"createdAt": "created_at",
+	"updatedAt": "updated_at",
+	"_id":       "id",
+	"id":        "id",
+}
+
+// convertMongoSortToSQL converts MongoDB-style sort options to SQL ORDER BY clause
+func convertMongoSortToSQL(sortOptions any) string {
+	sortMap, ok := sortOptions.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	var orderByClauses []string
+
+	for field, direction := range sortMap {
+		sqlDirection := "ASC"
+		if isDescending(direction) {
+			sqlDirection = "DESC"
+		}
+
+		var fieldSQL string
+
+		if colName, ok := knownColumnMappings[field]; ok {
+			fieldSQL = colName
+		} else {
+			// For nested fields, use JSONB operators
+			fieldSQL = fmt.Sprintf("document->>'%s'", field)
+		}
+
+		orderByClauses = append(orderByClauses, fmt.Sprintf("%s %s", fieldSQL, sqlDirection))
+	}
+
+	if len(orderByClauses) > 0 {
+		return " ORDER BY " + strings.Join(orderByClauses, ", ")
+	}
+
+	return ""
+}
+
+func isDescending(direction any) bool {
+	switch v := direction.(type) {
+	case int:
+		return v < 0
+	case int8:
+		return v < 0
+	case int16:
+		return v < 0
+	case int32:
+		return v < 0
+	case int64:
+		return v < 0
+	case float32:
+		return v < 0
+	case float64:
+		return v < 0
+	}
+
+	return false
+}
+
+// convertFilterToMap converts various filter types to map[string]interface{}.
+// This handles bson.M and other map-like types that are
+// essentially map[string]interface{} under the hood.
+func (c *PostgreSQLDatabaseClient) convertFilterToMap(filter any) map[string]any {
+	// Direct type assertion for map[string]interface{}
+	if filterMap, ok := filter.(map[string]any); ok {
+		return filterMap
+	}
+
+	// Use reflection to handle bson.M and other map types
+	// bson.M is defined as: type M map[string]interface{}
+	// So we can convert it using reflection
+	v := reflect.ValueOf(filter)
+	if v.Kind() == reflect.Map && v.Type().Key().Kind() == reflect.String {
+		result := make(map[string]any)
+
+		for _, key := range v.MapKeys() {
+			result[key.String()] = v.MapIndex(key).Interface()
+		}
+
+		return result
+	}
+
+	return nil
+}
+
+// convertToInterfaceSlice converts various slice types to []interface{}.
+// This handles []string, []interface{}, bson.A, and other slice types.
+func (c *PostgreSQLDatabaseClient) convertToInterfaceSlice(value any) []any {
+	// Direct type assertion for []interface{}
+	if slice, ok := value.([]any); ok {
+		return slice
+	}
+
+	// Handle []string directly (common case)
+	if strSlice, ok := value.([]string); ok {
+		result := make([]any, len(strSlice))
+
+		for i, s := range strSlice {
+			result[i] = s
+		}
+
+		return result
+	}
+
+	// Use reflection for other slice types (including bson.A which is []interface{})
+	v := reflect.ValueOf(value)
+	if v.Kind() == reflect.Slice {
+		result := make([]any, v.Len())
+
+		for i := range v.Len() {
+			result[i] = v.Index(i).Interface()
+		}
+
+		return result
+	}
+
+	return nil
+}
+
+// operatorToCondition converts a MongoDB operator and value to a query.Condition.
+// Returns the condition and any error encountered.
+func (c *PostgreSQLDatabaseClient) operatorToCondition(key, op string, opValue any) (query.Condition, error) {
+	switch op {
+	case opNe:
+		return query.Ne(key, opValue), nil
+	case opEq:
+		return query.Eq(key, opValue), nil
+	case opGt:
+		return query.Gt(key, opValue), nil
+	case opGte:
+		return query.Gte(key, opValue), nil
+	case opLt:
+		return query.Lt(key, opValue), nil
+	case opLte:
+		return query.Lte(key, opValue), nil
+	case opIn:
+		inValues := c.convertToInterfaceSlice(opValue)
+		if inValues != nil {
+			return query.In(key, inValues), nil
+		}
+
+		return nil, fmt.Errorf("$in operator requires array value for key %q, got: %T", key, opValue)
+	default:
+		return nil, fmt.Errorf("unsupported MongoDB operator: %s", op)
+	}
+}
+
+// filterMapToConditions converts a MongoDB-style filter map to query conditions.
+// Handles logical operators ($and, $or) and comparison operators ($eq, $ne, $gt, etc.)
+func (c *PostgreSQLDatabaseClient) filterMapToConditions(filterMap map[string]any) ([]query.Condition, error) {
+	var conditions []query.Condition
+
+	for key, value := range filterMap {
+		if key == opAnd || key == opOr {
+			subConditions, err := c.processLogicalOperator(key, value)
+			if err != nil {
+				return nil, err
+			}
+
+			conditions = append(conditions, subConditions...)
+
+			continue
+		}
+
+		valueMap := c.convertFilterToMap(value)
+		if valueMap != nil {
+			for op, opValue := range valueMap {
+				cond, err := c.operatorToCondition(key, op, opValue)
+				if err != nil {
+					return nil, err
+				}
+
+				if cond != nil {
+					conditions = append(conditions, cond)
+				}
+			}
+		} else {
+			conditions = append(conditions, query.Eq(key, value))
+		}
+	}
+
+	return conditions, nil
+}
+
+// conditionsToWhereClause combines conditions with AND and converts to SQL WHERE clause.
+func conditionsToWhereClause(conditions []query.Condition) (whereClause string, args []any) {
+	if len(conditions) == 0 {
+		return trueString, nil
+	}
+
+	var finalCondition query.Condition
+	if len(conditions) == 1 {
+		finalCondition = conditions[0]
+	} else {
+		finalCondition = query.And(conditions...)
+	}
+
+	builder := query.New().Build(finalCondition)
+
+	return builder.ToSQL()
+}
+
+// processLogicalOperator processes $and and $or operators from MongoDB-style filters.
+// It extracts the array of sub-filters and recursively processes each one.
+func (c *PostgreSQLDatabaseClient) processLogicalOperator(operator string, value any) ([]query.Condition, error) {
+	var conditions []query.Condition
+
+	filterArray := c.convertToInterfaceSlice(value)
+	if filterArray == nil {
+		return nil, fmt.Errorf("%s operator requires array value, got: %T", operator, value)
+	}
+
+	for _, subFilter := range filterArray {
+		subFilterMap := c.convertFilterToMap(subFilter)
+		if subFilterMap == nil {
+			return nil, fmt.Errorf("%s sub-filter must be a map, got: %T", operator, subFilter)
+		}
+
+		if c.tableName == maintenanceEventTableName {
+			subFilterMap = transformFilterMapForMaintenanceEvents(subFilterMap)
+		}
+
+		subConditions, err := c.filterMapToConditions(subFilterMap)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", operator, err)
+		}
+
+		conditions = append(conditions, subConditions...)
+	}
+
+	return conditions, nil
+}
+
+// FindOne finds a single document matching the filter
+//
+//nolint:dupl // Similar structure to Find is intentional - different return types and options handling
+func (c *PostgreSQLDatabaseClient) FindOne(
+	ctx context.Context, filter any, options *client.FindOneOptions,
+) (client.SingleResult, error) {
+	var whereClause string
+
+	var args []any
+
+	if builder, ok := filter.(*query.Builder); ok {
+		whereClause, args = builder.ToSQL()
+	} else {
+		var err error
+
+		whereClause, args, err = c.resolveFilterMapForFind(filter)
+		if err != nil {
+			return nil, fmt.Errorf("resolving filter for FindOne: %w", err)
+		}
+	}
+
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	sqlQuery := fmt.Sprintf("SELECT document FROM %s WHERE %s", c.tableName, whereClause)
+
+	// Apply sort options if provided
+	if options != nil && options.Sort != nil {
+		sortClause := convertMongoSortToSQL(options.Sort)
+		sqlQuery += sortClause
+	}
+
+	sqlQuery += " LIMIT 1"
+
+	var jsonData []byte
+
+	err := c.db.QueryRowContext(ctx, sqlQuery, args...).Scan(&jsonData)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return &postgresqlSingleResult{err: client.ErrNoDocuments}, nil
+		}
+
+		slog.Error("Query execution failed", "error", err)
+
+		return nil, fmt.Errorf("failed to query document: %w", err)
+	}
+
+	return &postgresqlSingleResult{data: jsonData}, nil
+}
+
+// Find finds all documents matching the filter
+//
+//nolint:dupl // Similar structure to FindOne is intentional - different return types and options handling
+func (c *PostgreSQLDatabaseClient) Find(
+	ctx context.Context, filter any, options *client.FindOptions,
+) (client.Cursor, error) {
+	// Convert filter to SQL WHERE clause
+	var whereClause string
+
+	var args []any
+
+	if builder, ok := filter.(*query.Builder); ok {
+		whereClause, args = builder.ToSQL()
+	} else {
+		var err error
+
+		whereClause, args, err = c.resolveFilterMapForFind(filter)
+		if err != nil {
+			return nil, fmt.Errorf("resolving filter for Find: %w", err)
+		}
+	}
+
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	query := fmt.Sprintf("SELECT document FROM %s WHERE %s", c.tableName, whereClause)
+
+	// Apply options
+	if options != nil {
+		if options.Limit != nil && *options.Limit > 0 {
+			query += fmt.Sprintf(" LIMIT %d", *options.Limit)
+		}
+	}
+
+	rows, err := c.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query documents: %w", err)
+	}
+
+	return &postgresqlCursor{rows: rows}, nil
+}
+
+func (c *PostgreSQLDatabaseClient) resolveFilterMapForFind(
+	filter any,
+) (string, []any, error) {
+	if filter == nil {
+		return trueString, nil, nil
+	}
+
+	filterMap := c.convertFilterToMap(filter)
+	if filterMap == nil {
+		return "", nil, fmt.Errorf("unsupported filter type: %T", filter)
+	}
+
+	// For maintenance_events table, transform field names to snake_case
+	if c.tableName == maintenanceEventTableName {
+		filterMap = transformFilterMapForMaintenanceEvents(filterMap)
+	}
+
+	conditions, err := c.filterMapToConditions(filterMap)
+	if err != nil {
+		return "", nil, fmt.Errorf("filterMapToConditions for table %s: %w", c.tableName, err)
+	}
+
+	whereClause, args := conditionsToWhereClause(conditions)
+
+	return whereClause, args, nil
+}
+
+// CountDocuments counts documents matching the filter
+func (c *PostgreSQLDatabaseClient) CountDocuments(
+	ctx context.Context, filter any, options *client.CountOptions,
+) (int64, error) {
+	var whereClause string
+
+	var args []any
+
+	if builder, ok := filter.(*query.Builder); ok {
+		whereClause, args = builder.ToSQL()
+	} else if filterMap := c.convertFilterToMap(filter); filterMap != nil {
+		conditions, err := c.filterMapToConditions(filterMap)
+		if err != nil {
+			return 0, err
+		}
+
+		whereClause, args = conditionsToWhereClause(conditions)
+	} else {
+		whereClause = trueString
+	}
+
+	//nolint:gosec // G201: table name is controlled internally, not from user input
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE %s", c.tableName, whereClause)
+
+	var count int64
+
+	err := c.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count documents: %w", err)
+	}
+
+	return count, nil
+}
+
+// Aggregate performs aggregation operations (limited support for PostgreSQL)
+func (c *PostgreSQLDatabaseClient) Aggregate(
+	ctx context.Context, pipeline any,
+) (client.Cursor, error) {
+	slog.Debug("Aggregate called on PostgreSQL database client",
+		"tableName", c.tableName)
+
+	// Create a PostgreSQLClient to handle the aggregation
+	// This reuses the existing db connection
+	postgresClient := client.NewPostgreSQLClientFromDB(c.db, c.tableName)
+
+	// Delegate to the PostgreSQLClient implementation
+	return postgresClient.Aggregate(ctx, pipeline)
+}
+
+// Ping checks the database connection
+func (c *PostgreSQLDatabaseClient) Ping(ctx context.Context) error {
+	return c.db.PingContext(ctx)
+}
+
+// NewChangeStreamWatcher creates a new change stream watcher
+func (c *PostgreSQLDatabaseClient) NewChangeStreamWatcher(
+	ctx context.Context, tokenConfig client.TokenConfig, pipeline any,
+) (client.ChangeStreamWatcher, error) {
+	// Create watcher in hybrid mode (LISTEN/NOTIFY + polling fallback)
+	// c.connString is populated via NewPostgreSQLDatabaseClientWithConnString()
+	watcher := NewPostgreSQLChangeStreamWatcher(c.db, tokenConfig.ClientName, c.tableName, c.connString, ModeHybrid)
+
+	// Apply pipeline filter if provided
+	// Two-layer filtering:
+	// 1. Server-side: SQL WHERE clause (built from w.pipeline in fetchNewChanges)
+	// 2. Application-side: PipelineFilter (handles edge cases SQL can't express)
+	if pipeline != nil {
+		// Store raw pipeline for SQL filter building
+		watcher.pipeline = pipeline
+
+		// Create application-side filter as fallback
+		pipelineFilter, err := NewPipelineFilter(pipeline)
+		if err != nil {
+			slog.Warn("Failed to create pipeline filter", "error", err)
+		} else {
+			watcher.pipelineFilter = pipelineFilter
+		}
+	}
+
+	// Return the adapter that implements client.ChangeStreamWatcher
+	return NewPostgreSQLChangeStreamAdapter(watcher), nil
+}
+
+// Close closes the database connection
+func (c *PostgreSQLDatabaseClient) Close(ctx context.Context) error {
+	return c.db.Close()
+}
+
+func (c *PostgreSQLDatabaseClient) DeleteResumeToken(ctx context.Context, tokenConfig client.TokenConfig) error {
+	query := "DELETE FROM resume_tokens WHERE client_name = $1"
+
+	_, err := c.db.ExecContext(ctx, query, tokenConfig.ClientName)
+	if err != nil {
+		return fmt.Errorf("failed to delete resume token: %w", err)
+	}
+
+	return nil
+}
+
+// --- Helper types for results ---
+
+type postgresqlSingleResult struct {
+	data []byte
+	err  error
+}
+
+func (r *postgresqlSingleResult) Decode(v any) error {
+	if r.err != nil {
+		return r.err
+	}
+
+	return json.Unmarshal(r.data, v)
+}
+
+func (r *postgresqlSingleResult) Err() error {
+	return r.err
+}
+
+type postgresqlCursor struct {
+	rows *sql.Rows
+}
+
+func (c *postgresqlCursor) Next(ctx context.Context) bool {
+	return c.rows.Next()
+}
+
+func (c *postgresqlCursor) Decode(v any) error {
+	var jsonData []byte
+	if err := c.rows.Scan(&jsonData); err != nil {
+		return fmt.Errorf("failed to scan row: %w", err)
+	}
+
+	return json.Unmarshal(jsonData, v)
+}
+
+func (c *postgresqlCursor) Close(ctx context.Context) error {
+	return c.rows.Close()
+}
+
+func (c *postgresqlCursor) Err() error {
+	return c.rows.Err()
+}
+
+func (c *postgresqlCursor) All(ctx context.Context, results any) error {
+	// Results should be a pointer to a slice
+	resultsVal := reflect.ValueOf(results)
+	if resultsVal.Kind() != reflect.Pointer || resultsVal.Elem().Kind() != reflect.Slice {
+		return fmt.Errorf("results must be a pointer to a slice")
+	}
+
+	sliceVal := resultsVal.Elem()
+	elemType := sliceVal.Type().Elem()
+
+	for c.rows.Next() {
+		// Create a new element of the slice type
+		elemPtr := reflect.New(elemType)
+
+		var jsonData []byte
+		if err := c.rows.Scan(&jsonData); err != nil {
+			return fmt.Errorf("failed to scan row: %w", err)
+		}
+
+		if err := json.Unmarshal(jsonData, elemPtr.Interface()); err != nil {
+			return fmt.Errorf("failed to unmarshal document: %w", err)
+		}
+
+		sliceVal = reflect.Append(sliceVal, elemPtr.Elem())
+	}
+
+	resultsVal.Elem().Set(sliceVal)
+
+	return c.rows.Err()
+}
+
+// Verify that PostgreSQLDatabaseClient implements client.DatabaseClient
+var _ client.DatabaseClient = (*PostgreSQLDatabaseClient)(nil)

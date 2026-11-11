@@ -1,0 +1,2608 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package reconciler
+
+import (
+	"context"
+	"log"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/statemanager"
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/annotation"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/common"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/config"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/events"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/metrics"
+	"github.com/nvidia/nvsentinel/fault-remediation/pkg/remediation"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+	"github.com/nvidia/nvsentinel/store-client/pkg/testutils"
+	"github.com/nvidia/nvsentinel/store-client/pkg/utils"
+)
+
+// publishLiveEvent feeds an event through the change stream the way platform-connectors
+// would, and makes it fetchable by document ID. Both halves are needed: the reconciler
+// queues only the ID, so a live event the store cannot serve looks like a deleted one.
+func publishLiveEvent(t *testing.T, event datastore.Event, resumeToken string) {
+	t.Helper()
+
+	mockStore.SeedEvent(t, event)
+
+	mockWatcher.EventsChan <- datastore.EventWithToken{
+		Event:       event,
+		ResumeToken: []byte(resumeToken),
+	}
+}
+
+var (
+	restartRemediationActions = map[string]config.MaintenanceResource{
+		"RESTART_BM": {
+			ApiGroup:              "janitor.dgxc.nvidia.com",
+			Version:               "v1alpha1",
+			Kind:                  "RebootNode",
+			TemplateFileName:      "rebootnode-template.yaml",
+			CompleteConditionType: "NodeReady",
+			EquivalenceGroup:      "restart",
+		},
+		"RESTART_VM": {
+			ApiGroup:              "janitor.dgxc.nvidia.com",
+			Version:               "v1alpha1",
+			Kind:                  "RebootNode",
+			TemplateFileName:      "rebootnode-template.yaml",
+			CompleteConditionType: "NodeReady",
+			EquivalenceGroup:      "restart",
+		},
+	}
+	restartAndResetRemediationActions = map[string]config.MaintenanceResource{
+		"RESTART_BM": {
+			ApiGroup:              "janitor.dgxc.nvidia.com",
+			Version:               "v1alpha1",
+			Kind:                  "RebootNode",
+			TemplateFileName:      "rebootnode-template.yaml",
+			CompleteConditionType: "NodeReady",
+			EquivalenceGroup:      "restart",
+		},
+		"RESTART_VM": {
+			ApiGroup:              "janitor.dgxc.nvidia.com",
+			Version:               "v1alpha1",
+			Kind:                  "RebootNode",
+			TemplateFileName:      "rebootnode-template.yaml",
+			CompleteConditionType: "NodeReady",
+			EquivalenceGroup:      "restart",
+		},
+		"COMPONENT_RESET": {
+			ApiGroup:                     "janitor.dgxc.nvidia.com",
+			Version:                      "v1alpha1",
+			Kind:                         "GPUReset",
+			TemplateFileName:             "gpureset-template.yaml",
+			CompleteConditionType:        "Complete",
+			EquivalenceGroup:             "reset",
+			ImpactedEntityScope:          "GPU_UUID",
+			SupersedingEquivalenceGroups: []string{"restart"},
+		},
+	}
+)
+
+// MockChangeStreamWatcher provides a mock implementation of datastore.ChangeStreamWatcher for testing
+type MockChangeStreamWatcher struct {
+	// Used for concurrency safety between reconciler calling writes and tests reading counts
+	mu                  sync.Mutex
+	EventsChan          chan datastore.EventWithToken
+	markProcessedCount  int
+	markProcessedTokens [][]byte
+}
+
+// NewMockChangeStreamWatcher creates a new mock change stream Watcher
+func NewMockChangeStreamWatcher() *MockChangeStreamWatcher {
+	return &MockChangeStreamWatcher{
+		EventsChan: make(chan datastore.EventWithToken, 10),
+	}
+}
+
+// Events returns the read-only events channel
+func (m *MockChangeStreamWatcher) Events() <-chan datastore.EventWithToken {
+	return m.EventsChan
+}
+
+// Start starts the change stream Watcher (no-op for tests)
+func (m *MockChangeStreamWatcher) Start(ctx context.Context) {
+	// No-op for tests
+}
+
+// MarkProcessed marks an event as processed (no-op for tests)
+func (m *MockChangeStreamWatcher) MarkProcessed(ctx context.Context, token []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.markProcessedCount++
+	m.markProcessedTokens = append(m.markProcessedTokens, token)
+
+	return nil
+}
+
+// MarkProcessedTokens returns the tokens passed to MarkProcessed, in call order.
+func (m *MockChangeStreamWatcher) MarkProcessedTokens() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return slices.Clone(m.markProcessedTokens)
+}
+
+// Close closes the change stream Watcher
+func (m *MockChangeStreamWatcher) Close(ctx context.Context) error {
+	close(m.EventsChan)
+	return nil
+}
+
+// GetCallCounts returns the call counts for various methods (for testing purposes)
+func (m *MockChangeStreamWatcher) GetCallCounts() (int, int, int, int) {
+	// Return counts for: start, markProcessed, close, getUnprocessed
+	// For simplicity, only tracking markProcessed
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return 0, m.markProcessedCount, 0, 0
+}
+
+// MockHealthEventStore provides a mock implementation of datastore.HealthEventStore for testing
+type MockHealthEventStore struct {
+	UpdateHealthEventStatusFn        func(ctx context.Context, id string, status datastore.HealthEventStatus) error
+	FindHealthEventsByQueryFn        func(ctx context.Context, builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error)
+	FindHealthEventsByQueryBatchedFn func(ctx context.Context, builder datastore.QueryBuilder, batchSize int, fn func([]datastore.HealthEventWithStatus) error) error
+	// Counters are written from the controller goroutine and polled by tests, so they
+	// must be atomic to stay race-free.
+	updateCalled                 atomic.Int64
+	findHealthEventsByQueryCalls atomic.Int64
+	// recordedDecisions holds the last remediation decision recorded for each document ID.
+	// A decision is recorded before the reconciler acts, so it is not counted in updateCalled.
+	recordedDecisions sync.Map
+	// seededEvents answers lookups by document ID. The reconciler queues only an event's
+	// ID and loads the document when the worker runs, so a test that publishes a live
+	// event must also make it fetchable. Every other query falls through to
+	// FindHealthEventsByQueryFn.
+	seededEvents sync.Map
+}
+
+// SeedEvent makes event resolvable by its document ID, storing the document as the datastore
+// would hold it: change-stream events arrive wrapped in fullDocument, but what is persisted
+// — and therefore what a later fetch returns — is the document inside that wrapper.
+func (m *MockHealthEventStore) SeedEvent(t *testing.T, event datastore.Event) {
+	t.Helper()
+
+	documentID, err := utils.ExtractDocumentID(event)
+	require.NoError(t, err, "a seeded event must carry a document ID")
+
+	stored := event
+	if fullDocument, wrapped := event["fullDocument"].(map[string]any); wrapped {
+		stored = datastore.Event(fullDocument)
+	}
+
+	m.seededEvents.Store(documentID, stored)
+}
+
+// documentIDFromQuery reports the document ID a by-ID lookup asks for. Query values for the
+// _id field are converted to a driver object ID when the ID is hex, so accept either form.
+func documentIDFromQuery(builder datastore.QueryBuilder) (string, bool) {
+	filter := builder.ToMongo()
+	if len(filter) != 1 {
+		return "", false
+	}
+
+	value, isIDQuery := filter["_id"]
+	if !isIDQuery {
+		return "", false
+	}
+
+	switch id := value.(type) {
+	case string:
+		return id, true
+	case interface{ Hex() string }:
+		return id.Hex(), true
+	default:
+		return "", false
+	}
+}
+
+// UpdateHealthEventStatus updates a health event status (mock implementation)
+func (m *MockHealthEventStore) UpdateHealthEventStatus(ctx context.Context, id string, status datastore.HealthEventStatus) error {
+	if m.UpdateHealthEventStatusFn != nil {
+		return m.UpdateHealthEventStatusFn(ctx, id, status)
+	}
+	return nil
+}
+
+// Implement other required methods with no-op for testing
+func (m *MockHealthEventStore) InsertHealthEvents(ctx context.Context, events *datastore.HealthEventWithStatus) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) UpdateHealthEventStatusByNode(ctx context.Context, nodeName string, status datastore.HealthEventStatus) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByNode(ctx context.Context, nodeName string) ([]datastore.HealthEventWithStatus, error) {
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByFilter(ctx context.Context, filter map[string]any) ([]datastore.HealthEventWithStatus, error) {
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByStatus(ctx context.Context, status datastore.Status) ([]datastore.HealthEventWithStatus, error) {
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) UpdateNodeQuarantineStatus(ctx context.Context, eventID string, status datastore.Status, spanID string) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) UpdatePodEvictionStatus(ctx context.Context, eventID string, status datastore.OperationStatus) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) UpdateRemediationStatus(ctx context.Context, eventID string, status any) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) CheckIfNodeAlreadyDrained(ctx context.Context, nodeName string) (bool, error) {
+	return false, nil
+}
+
+func (m *MockHealthEventStore) FindLatestEventForNode(ctx context.Context, nodeName string) (*datastore.HealthEventWithStatus, error) {
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByQuery(ctx context.Context, builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error) {
+	m.findHealthEventsByQueryCalls.Add(1)
+
+	// An explicitly configured function wins, so a test can still stage a specific reply for
+	// a document a live event already seeded.
+	if m.FindHealthEventsByQueryFn != nil {
+		return m.FindHealthEventsByQueryFn(ctx, builder)
+	}
+
+	if documentID, isIDQuery := documentIDFromQuery(builder); isIDQuery {
+		if stored, seeded := m.seededEvents.Load(documentID); seeded {
+			return []datastore.HealthEventWithStatus{{RawEvent: stored.(datastore.Event)}}, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) FindLatestHealthEventByQuery(_ context.Context, _ datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error) {
+	return nil, nil
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByQueryBatched(ctx context.Context, builder datastore.QueryBuilder, batchSize int, fn func([]datastore.HealthEventWithStatus) error) error {
+	if m.FindHealthEventsByQueryBatchedFn != nil {
+		return m.FindHealthEventsByQueryBatchedFn(ctx, builder, batchSize, fn)
+	}
+
+	return nil
+}
+
+func (m *MockHealthEventStore) UpdateHealthEventsByQuery(ctx context.Context, queryBuilder datastore.QueryBuilder, updateBuilder datastore.UpdateBuilder) error {
+	return nil
+}
+
+func (m *MockHealthEventStore) UpdateSpanID(ctx context.Context, id string, serviceName string, spanID string) error {
+	return nil
+}
+
+var (
+	ctrlRuntimeClient    client.Client
+	ctrlRuntimeAPIReader client.Reader
+	testClient           *kubernetes.Clientset
+	testDynamic          dynamic.Interface
+	testContext          context.Context
+	testCancelFunc       context.CancelFunc
+	testEnv              *envtest.Environment
+	testRestConfig       *rest.Config
+	mockWatcher          *MockChangeStreamWatcher
+	mockStore            *MockHealthEventStore
+	reconciler           *FaultRemediationReconciler
+)
+
+func TestMain(m *testing.M) {
+	var err error
+	testContext, testCancelFunc = context.WithCancel(context.Background())
+
+	// Get the path to CRD files. These are symlinks to CRDs in Janitor Helm chart
+	rebootNodeCRDPath := filepath.Join("testdata", "janitor.dgxc.nvidia.com_rebootnodes.yaml")
+	gpuResetCRDPath := filepath.Join("testdata", "janitor.dgxc.nvidia.com_gpuresets.yaml")
+
+	// Setup envtest environment with CRDs
+	testEnv = &envtest.Environment{
+		CRDDirectoryPaths: []string{filepath.Dir(rebootNodeCRDPath), filepath.Dir(gpuResetCRDPath)},
+	}
+
+	testRestConfig, err = testEnv.Start()
+	if err != nil {
+		log.Fatalf("Failed to start test environment: %v", err)
+	}
+
+	testClient, err = kubernetes.NewForConfig(testRestConfig)
+	if err != nil {
+		log.Fatalf("Failed to create kubernetes client: %v", err)
+	}
+
+	testDynamic, err = dynamic.NewForConfig(testRestConfig)
+	if err != nil {
+		log.Fatalf("Failed to create dynamic client: %v", err)
+	}
+
+	mgr, err := ctrl.NewManager(testEnv.Config, ctrl.Options{
+		Scheme: scheme.Scheme,
+		Metrics: metricsserver.Options{
+			BindAddress: "0",
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	ctrlRuntimeClient = mgr.GetClient()
+	ctrlRuntimeAPIReader = mgr.GetAPIReader()
+
+	remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+	if err != nil {
+		log.Fatalf("Failed to create remediation client: %v", err)
+	}
+
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      statemanager.NewStateManager(testClient),
+		NodeReader:        ctrlRuntimeAPIReader,
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+		// Keep requeues fast so tests can observe events waiting behind an
+		// in-progress CR being reconsidered within an Eventually window.
+		InProgressRequeueDelay: 200 * time.Millisecond,
+	}
+
+	// Create mock health event store
+	mockStore = &MockHealthEventStore{}
+	mockStore.UpdateHealthEventStatusFn = func(ctx context.Context, id string, status datastore.HealthEventStatus) error {
+		if status.RemediationDecision != nil {
+			mockStore.recordedDecisions.Store(id, *status.RemediationDecision)
+			return nil
+		}
+
+		mockStore.updateCalled.Add(1)
+		return nil
+	}
+
+	// Create mock Watcher with event channel
+	mockWatcher = NewMockChangeStreamWatcher()
+
+	reconciler = NewFaultRemediationReconciler(nil, mockWatcher, mockStore, cfg, false)
+
+	_, err = reconciler.SetupWithManager(testContext, mgr)
+	if err != nil {
+		log.Fatalf("Failed to launch reconciler with mgr %v", err)
+	}
+
+	go func() {
+		if err := mgr.Start(testContext); err != nil {
+			log.Fatalf("Failed to start the test environment manager: %v", err)
+		}
+	}()
+
+	// Create test nodes with dummy labels to avoid nil map panic
+	dummyLabels := map[string]string{"test": "label"}
+	createTestNode(testContext, "test-node-1", nil, dummyLabels)
+	createTestNode(testContext, "test-node-2", nil, dummyLabels)
+	createTestNode(testContext, "test-node-3", nil, dummyLabels)
+	createTestNode(testContext, "node-with-annotation", nil, dummyLabels)
+
+	exitCode := m.Run()
+
+	tearDownTestEnvironment()
+	os.Exit(exitCode)
+}
+
+func createTestNode(ctx context.Context, name string, annotations map[string]string, labels map[string]string) {
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	node := &corev1.Node{
+		Name:        name,
+		Annotations: annotations,
+		Labels:      labels,
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:   corev1.NodeReady,
+					Status: corev1.ConditionTrue,
+				},
+			},
+		},
+	}
+	_, err := testClient.CoreV1().Nodes().Create(ctx, node, metav1.CreateOptions{})
+	if err != nil {
+		log.Fatalf("Failed to create test node %s: %v", name, err)
+	}
+
+	// The reconciler reads nodes from the informer cache, and treats a node that is not there as
+	// deleted. Wait until the cache has the node.
+	err = wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 10*time.Second, true,
+		func(ctx context.Context) (bool, error) {
+			err := ctrlRuntimeClient.Get(ctx, client.ObjectKey{Name: name}, &corev1.Node{})
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+
+			return err == nil, err
+		})
+	if err != nil {
+		log.Fatalf("Test node %s did not reach the informer cache: %v", name, err)
+	}
+}
+
+func tearDownTestEnvironment() {
+	testCancelFunc()
+	if err := testEnv.Stop(); err != nil {
+		log.Fatalf("Failed to stop test environment: %v", err)
+	}
+}
+
+// createTestRemediationClient creates a real FaultRemediationClient for e2e tests
+func createTestRemediationClient(dryRun bool,
+	remediationActions map[string]config.MaintenanceResource) (remediation.FaultRemediationClientInterface, error) {
+	remediationConfig := config.TomlConfig{
+		Template: config.Template{
+			MountPath: "./templates",
+		},
+		RemediationActions: remediationActions,
+	}
+
+	return remediation.NewRemediationClient(ctrlRuntimeClient, dryRun, remediationConfig)
+}
+
+func TestCRBasedDeduplication_Integration(t *testing.T) {
+	ctx := testContext
+
+	nodeName := "test-node-dedup-" + "test-node-123"
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	t.Run("FirstEvent_CreatesAnnotation", func(t *testing.T) {
+		cleanupNodeAnnotations(ctx, t, nodeName)
+
+		remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+		assert.NoError(t, err)
+		stateManager := statemanager.NewStateManager(testClient)
+
+		cfg := ReconcilerConfig{
+			RemediationClient: remediationClient,
+			StateManager:      stateManager,
+			UpdateMaxRetries:  3,
+			UpdateRetryDelay:  100 * time.Millisecond,
+		}
+
+		r := &FaultRemediationReconciler{
+			Config:            cfg,
+			annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+		}
+
+		// Process Event 1
+		healthEventDoc := &events.HealthEventDoc{
+			ID: "test-event-id-1",
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_RESTART_BM,
+			},
+		}
+		groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions, healthEventDoc.HealthEvent)
+		assert.NoError(t, err)
+
+		// TODO: ignoring error otherwise need to properly walk state transitions
+		_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+
+		crName, err := r.performRemediation(ctx, healthEventDoc, groupConfig)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, crName)
+
+		// Verify annotation exists on node
+		node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Contains(t, node.Annotations, annotation.AnnotationKey, "Annotation should be created")
+
+		// Verify annotation content
+		state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+		require.NoError(t, err)
+		assert.Contains(t, state.EquivalenceGroups, "restart")
+		assert.NotEmpty(t, state.EquivalenceGroups["restart"].MaintenanceCR)
+		assert.WithinDuration(t, time.Now(), state.EquivalenceGroups["restart"].CreatedAt, 5*time.Second)
+
+		// Verify CR was actually created
+		gvr := schema.GroupVersionResource{
+			Group:    "janitor.dgxc.nvidia.com",
+			Version:  "v1alpha1",
+			Resource: "rebootnodes",
+		}
+		cr, err := testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, nodeName, cr.Object["spec"].(map[string]any)["nodeName"])
+
+		// Cleanup
+		_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+	})
+
+	t.Run("SecondEvent_SkippedWhenCRInProgress", func(t *testing.T) {
+		cleanupNodeAnnotations(ctx, t, nodeName)
+
+		remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+		assert.NoError(t, err)
+
+		stateManager := statemanager.NewStateManager(testClient)
+
+		cfg := ReconcilerConfig{
+			RemediationClient: remediationClient,
+			StateManager:      stateManager,
+			UpdateMaxRetries:  3,
+			UpdateRetryDelay:  100 * time.Millisecond,
+		}
+		r := &FaultRemediationReconciler{
+			Config:            cfg,
+			annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+		}
+
+		// Event 1: Create first CR
+		event1 := &events.HealthEventDoc{
+			ID: "test-event-id-cr-1",
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_RESTART_BM,
+			},
+		}
+		groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions, event1.HealthEvent)
+		assert.NoError(t, err)
+		// TODO: ignoring error otherwise need to properly walk state transitions
+		_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.RemediatingLabelValue, false)
+
+		firstCRName, err := r.performRemediation(ctx, event1, groupConfig)
+		assert.NoError(t, err)
+
+		// Update CR status to InProgress
+		updateRebootNodeStatus(ctx, t, firstCRName, "InProgress")
+
+		// Event 2: must wait for the in-progress CR instead of being finalized
+		decision, err := r.checkExistingCRStatus(ctx, event1.HealthEventWithStatus.HealthEvent, time.Now(), groupConfig)
+		assert.NoError(t, err)
+		assert.False(t, decision.shouldCreate, "Second event should not create a CR yet")
+		assert.True(t, decision.inProgress, "Second event must be requeued while the CR is in progress")
+		assert.Equal(t, firstCRName, decision.crName)
+
+		// Verify annotation still exists and unchanged
+		state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+		require.NoError(t, err)
+		assert.Equal(t, firstCRName, state.EquivalenceGroups["restart"].MaintenanceCR)
+
+		// Once the CR completes, a post-session event (created after the CR) must be
+		// allowed to create a new CR instead of staying stranded (issue #1536).
+		updateRebootNodeStatus(ctx, t, firstCRName, "Succeeded")
+
+		decision, err = r.checkExistingCRStatus(ctx, event1.HealthEventWithStatus.HealthEvent, time.Now(), groupConfig)
+		assert.NoError(t, err)
+		assert.True(t, decision.shouldCreate, "post-session event must be reconsidered after the CR succeeds")
+		assert.False(t, decision.inProgress)
+
+		// Cleanup
+		gvr := schema.GroupVersionResource{
+			Group:    "janitor.dgxc.nvidia.com",
+			Version:  "v1alpha1",
+			Resource: "rebootnodes",
+		}
+		_ = testDynamic.Resource(gvr).Delete(ctx, firstCRName, metav1.DeleteOptions{})
+	})
+
+	t.Run("FailedCR_CleansAnnotationAndAllowsRetry", func(t *testing.T) {
+		cleanupNodeAnnotations(ctx, t, nodeName)
+
+		remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+		assert.NoError(t, err)
+
+		stateManager := statemanager.NewStateManager(testClient)
+
+		cfg := ReconcilerConfig{
+			RemediationClient: remediationClient,
+			StateManager:      stateManager,
+			UpdateMaxRetries:  3,
+			UpdateRetryDelay:  100 * time.Millisecond,
+		}
+		r := &FaultRemediationReconciler{
+			Config:            cfg,
+			annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+		}
+
+		// Event 1: Create first CR
+		event1 := &events.HealthEventDoc{
+			ID: "test-event-id-cr-1",
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_RESTART_BM,
+			},
+		}
+		groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions, event1.HealthEvent)
+		assert.NoError(t, err)
+		// TODO: ignoring error otherwise need to properly walk state transitions
+		// TODO: also why does this return an error but also put the change through
+		_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.RemediatingLabelValue, false)
+
+		firstCRName, err := r.performRemediation(ctx, event1, groupConfig)
+		assert.NoError(t, err)
+
+		// Simulate CR failure
+		updateRebootNodeStatus(ctx, t, firstCRName, "Failed")
+
+		// Event 2: Should create new CR after cleanup
+		decision, err := r.checkExistingCRStatus(ctx, event1.HealthEventWithStatus.HealthEvent, time.Now(), groupConfig)
+		assert.NoError(t, err)
+		assert.True(t, decision.shouldCreate, "Should allow retry after CR failed")
+
+		// Verify annotation was cleaned up.
+		// Use Eventually because RemoveGroupsFromState writes to the API server but
+		// GetRemediationState reads from the informer cache, which syncs asynchronously.
+		assert.Eventually(t, func() bool {
+			state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+			if err != nil {
+				return false
+			}
+			_, exists := state.EquivalenceGroups["restart"]
+			return !exists
+		}, 5*time.Second, 100*time.Millisecond, "Failed CR should be removed from annotation")
+
+		// Event 2: Create retry CR
+		event2 := &events.HealthEventDoc{
+			ID: "test-event-id",
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_RESTART_BM,
+			},
+		}
+		groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions, event2.HealthEvent)
+		assert.NoError(t, err)
+
+		//TODO: is this a bug? if you enter remediation-succeeded it won't let you get back to remediating
+		_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+
+		secondCRName, err := r.performRemediation(ctx, event2, groupConfig)
+		assert.NoError(t, err)
+
+		// Verify new annotation
+		state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+		require.NoError(t, err)
+		assert.Contains(t, state.EquivalenceGroups, "restart")
+		assert.Equal(t, secondCRName, state.EquivalenceGroups["restart"].MaintenanceCR)
+		assert.NotEqual(t, firstCRName, secondCRName, "Second CR should have different name")
+
+		// Cleanup
+		gvr := schema.GroupVersionResource{
+			Group:    "janitor.dgxc.nvidia.com",
+			Version:  "v1alpha1",
+			Resource: "rebootnodes",
+		}
+		_ = testDynamic.Resource(gvr).Delete(ctx, firstCRName, metav1.DeleteOptions{})
+		_ = testDynamic.Resource(gvr).Delete(ctx, secondCRName, metav1.DeleteOptions{})
+	})
+
+	t.Run("CrossAction_SameGroupDeduplication", func(t *testing.T) {
+		cleanupNodeAnnotations(ctx, t, nodeName)
+
+		remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+		assert.NoError(t, err)
+
+		stateManager := statemanager.NewStateManager(testClient)
+
+		cfg := ReconcilerConfig{
+			RemediationClient: remediationClient,
+			StateManager:      stateManager,
+			UpdateMaxRetries:  3,
+			UpdateRetryDelay:  100 * time.Millisecond,
+		}
+		r := &FaultRemediationReconciler{
+			Config:            cfg,
+			annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+		}
+
+		// Event 1: RESTART_VM
+		event1 := &events.HealthEventDoc{
+			ID: "test-event-id",
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_RESTART_VM,
+			},
+		}
+		groupConfig1, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+			event1.HealthEvent)
+		assert.NoError(t, err)
+
+		// TODO: ignoring error otherwise need to properly walk state transitions
+		// TODO: also why does this return an error but also put the change through
+		_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.RemediatingLabelValue, false)
+
+		firstCRName, err := r.performRemediation(ctx, event1, groupConfig1)
+		assert.NoError(t, err)
+
+		// Set InProgress status
+		updateRebootNodeStatus(ctx, t, firstCRName, "InProgress")
+
+		// Event 2: RESTART_BM (same group)
+		event2Health := &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_RESTART_BM,
+		}
+		groupConfig2, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+			event2Health)
+		assert.NoError(t, err)
+
+		decision, err := r.checkExistingCRStatus(ctx, event2Health, time.Now(), groupConfig2)
+		assert.NoError(t, err)
+		assert.False(t, decision.shouldCreate, "RESTART_BM should be deduplicated with RESTART_VM (same group)")
+		assert.True(t, decision.inProgress, "deduplicated event must wait for the in-progress CR")
+		assert.Equal(t, firstCRName, decision.crName)
+
+		// Verify both actions map to same group
+		assert.Equal(t, groupConfig1, groupConfig2, "Both actions should be in same equivalence group")
+		assert.Equal(t, "restart", groupConfig1.EffectiveEquivalenceGroup)
+
+		// Cleanup
+		gvr := schema.GroupVersionResource{
+			Group:    "janitor.dgxc.nvidia.com",
+			Version:  "v1alpha1",
+			Resource: "rebootnodes",
+		}
+		_ = testDynamic.Resource(gvr).Delete(ctx, firstCRName, metav1.DeleteOptions{})
+	})
+}
+
+func TestEventSequenceWithAnnotations_Integration(t *testing.T) {
+	ctx := testContext
+
+	nodeName := "test-node-sequence-" + "test-node-123"
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+	assert.NoError(t, err)
+
+	stateManager := statemanager.NewStateManager(testClient)
+
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      stateManager,
+		NodeReader:        ctrlRuntimeAPIReader,
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+	}
+	r := &FaultRemediationReconciler{
+		Config:            cfg,
+		annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+	}
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	// Event 1: RESTART_BM creates CR-1
+	event1 := &events.HealthEventDoc{
+		ID: "test-event-id",
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_RESTART_BM,
+		},
+	}
+	groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event1.HealthEvent)
+	assert.NoError(t, err)
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+
+	crName1, err := r.performRemediation(ctx, event1, groupConfig)
+	assert.NoError(t, err)
+
+	// Verify annotation on actual node
+	node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, node.Annotations, annotation.AnnotationKey, "Node should have annotation after first CR")
+
+	// Event 2: RESTART_VM (same group, CR in progress) - should be skipped
+	updateRebootNodeStatus(ctx, t, crName1, "InProgress")
+
+	event2 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_RESTART_VM,
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event2)
+	assert.NoError(t, err)
+	decision, err := r.checkExistingCRStatus(ctx, event2, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, decision.shouldCreate, "RESTART_VM should be skipped (same group as RESTART_BM)")
+	assert.True(t, decision.inProgress, "RESTART_VM must wait for the in-progress CR")
+	assert.Equal(t, crName1, decision.crName)
+
+	// Verify annotation unchanged
+	state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, crName1, state.EquivalenceGroups["restart"].MaintenanceCR)
+
+	// Event 3: CR succeeds - subsequent equivalent event should be marked covered, not retried
+	updateRebootNodeStatus(ctx, t, crName1, "Succeeded")
+
+	event3 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_RESTART_BM,
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event3)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event3, time.Now().Add(-time.Minute),
+		groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, decision.shouldCreate, "RESTART_BM should be skipped (CR succeeded)")
+	assert.True(t, decision.remediated, "successful existing CR should cover equivalent event")
+	assert.False(t, decision.inProgress)
+
+	// Event 4: CR fails - annotation cleaned, retry allowed
+	updateRebootNodeStatus(ctx, t, crName1, "Failed")
+
+	event4 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_RESTART_BM,
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event4)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event4, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.True(t, decision.shouldCreate, "Should allow retry after failure")
+
+	// Verify annotation cleaned.
+	// Use Eventually because RemoveGroupsFromState writes to the API server but
+	// GetRemediationState reads from the informer cache, which syncs asynchronously.
+	assert.Eventually(t, func() bool {
+		state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		_, exists := state.EquivalenceGroups["restart"]
+		return !exists
+	}, 5*time.Second, 100*time.Millisecond, "Failed CR should clean annotation")
+
+	// Event 5: Create retry CR
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+	event5 := &events.HealthEventDoc{
+		ID: "test-event-id",
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_RESTART_BM,
+		},
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event5.HealthEvent)
+	assert.NoError(t, err)
+	crName2, err := r.performRemediation(ctx, event5, groupConfig)
+	assert.NoError(t, err)
+
+	// Verify new annotation
+	state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Contains(t, state.EquivalenceGroups, "restart")
+	assert.Equal(t, crName2, state.EquivalenceGroups["restart"].MaintenanceCR)
+
+	// Cleanup
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName1, metav1.DeleteOptions{})
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName2, metav1.DeleteOptions{})
+}
+
+func TestEventSequenceWithSupersedingGroup(t *testing.T) {
+	ctx := testContext
+
+	nodeName := "test-node-sequence-" + "test-node-123"
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	remediationClient, err := createTestRemediationClient(false, restartAndResetRemediationActions)
+	assert.NoError(t, err)
+
+	stateManager := statemanager.NewStateManager(testClient)
+
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      stateManager,
+		NodeReader:        ctrlRuntimeAPIReader,
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+	}
+	r := &FaultRemediationReconciler{
+		Config:            cfg,
+		annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+	}
+
+	rebootNodeGVR := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+	gpuResetGVR := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "gpuresets",
+	}
+
+	// Event 1: RESTART_BM in group restart creates CR-1
+	event1 := &events.HealthEventDoc{
+		ID: "test-event-id",
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_RESTART_BM,
+		},
+	}
+	groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event1.HealthEvent)
+	assert.NoError(t, err)
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+
+	crName1, err := r.performRemediation(ctx, event1, groupConfig)
+	assert.NoError(t, err)
+
+	node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Contains(t, node.Annotations, annotation.AnnotationKey, "Node should have annotation after first CR")
+
+	// Event 2: COMPONENT_RESET in group reset with superseding group restart - should be skipped
+	updateRebootNodeStatus(ctx, t, crName1, "InProgress")
+
+	event2 := model.HealthEventWithStatus{
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+			EntitiesImpacted: []*protos.Entity{
+				{
+					EntityType:  "GPU_UUID",
+					EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+				},
+			},
+		},
+	}
+
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event2.HealthEvent)
+	assert.NoError(t, err)
+	shouldSkip, err := r.shouldSkipEvent(ctx, event2, groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, shouldSkip, "Shouldn't valid health event")
+	decision, err := r.checkExistingCRStatus(ctx, event2.HealthEvent, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, decision.shouldCreate, "COMPONENT_RESET should be skipped (same group as RESTART_BM)")
+	assert.True(t, decision.inProgress, "COMPONENT_RESET must wait for the in-progress superseding CR")
+	assert.Equal(t, crName1, decision.crName)
+
+	// Verify annotation unchanged
+	state, _, err := r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, crName1, state.EquivalenceGroups["restart"].MaintenanceCR)
+	assert.Equal(t, "RESTART_BM", state.EquivalenceGroups["restart"].ActionName)
+
+	// Event 3: COMPONENT_RESET in group reset with superseding group restart should be covered after CR-1 succeeds
+	updateRebootNodeStatus(ctx, t, crName1, "Succeeded")
+
+	event3 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		EntitiesImpacted: []*protos.Entity{
+			{
+				EntityType:  "GPU_UUID",
+				EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+			},
+		},
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event3)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event3, time.Now().Add(-time.Minute),
+		groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, decision.shouldCreate, "COMPONENT_RESET should be skipped (superseding CR succeeded)")
+	assert.True(t, decision.remediated, "successful superseding CR should cover reset event")
+	assert.False(t, decision.inProgress)
+
+	// Event 4: COMPONENT_RESET in group reset with superseding group restart should be created after CR-1 fails
+	updateRebootNodeStatus(ctx, t, crName1, "Failed")
+
+	event4 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		EntitiesImpacted: []*protos.Entity{
+			{
+				EntityType:  "GPU_UUID",
+				EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+			},
+		},
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event4)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event4, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.True(t, decision.shouldCreate, "Should allow retry after failure")
+
+	// Verify annotation cleaned.
+	// Use Eventually because RemoveGroupsFromState writes to the API server but
+	// GetRemediationState reads from the informer cache, which syncs asynchronously.
+	assert.Eventually(t, func() bool {
+		state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		_, exists := state.EquivalenceGroups["restart"]
+		return !exists
+	}, 5*time.Second, 100*time.Millisecond, "Failed CR should clean annotation")
+
+	// Event 5: COMPONENT_RESET in group reset with superseding group restart should create CR-2
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+	event5 := &events.HealthEventDoc{
+		ID: "test-event-id",
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+			EntitiesImpacted: []*protos.Entity{
+				{
+					EntityType:  "GPU_UUID",
+					EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+				},
+			},
+		},
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event5.HealthEvent)
+	assert.NoError(t, err)
+	crName2, err := r.performRemediation(ctx, event5, groupConfig)
+	assert.NoError(t, err)
+
+	// Verify new annotation
+	state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, "", state.EquivalenceGroups["restart"].MaintenanceCR)
+	assert.Equal(t, crName2, state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"].MaintenanceCR)
+	assert.Equal(t, "COMPONENT_RESET", state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"].ActionName)
+
+	// Event 6: COMPONENT_RESET in group reset with the same impacted entity should not create CR-3
+	event6 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		EntitiesImpacted: []*protos.Entity{
+			{
+				EntityType:  "GPU_UUID",
+				EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+			},
+		},
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event6)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event6, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.False(t, decision.shouldCreate, "COMPONENT_RESET should be skipped (same group as previous COMPONENT_RESET)")
+	assert.True(t, decision.inProgress, "COMPONENT_RESET must wait for the in-progress reset CR")
+	assert.Equal(t, crName2, decision.crName)
+
+	// Verify annotation unchanged
+	state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, crName2, state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"].MaintenanceCR)
+
+	// Event 7: COMPONENT_RESET in group reset with the different entity should allow CR-3 creation
+	event7 := &events.HealthEventDoc{
+		ID: "test-event-id-2",
+		HealthEvent: &protos.HealthEvent{
+			NodeName:          nodeName,
+			RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+			EntitiesImpacted: []*protos.Entity{
+				{
+					EntityType:  "GPU_UUID",
+					EntityValue: "GPU-927d8f70-2051-db6c-0430-ffc457bff834",
+				},
+			},
+		},
+	}
+
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event7.HealthEvent)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event7.HealthEvent, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.True(t, decision.shouldCreate, "COMPONENT_RESET should be allowed (different group as previous COMPONENT_RESET)")
+
+	// Verify annotation unchanged
+	state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, crName2, state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"].MaintenanceCR)
+
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+	crName3, err := r.performRemediation(ctx, event7, groupConfig)
+	assert.NoError(t, err)
+
+	state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	assert.Equal(t, crName3, state.EquivalenceGroups["reset-GPU-927d8f70-2051-db6c-0430-ffc457bff834"].MaintenanceCR)
+	assert.Equal(t, crName2, state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"].MaintenanceCR)
+
+	node, err = testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, node.Labels[statemanager.NVSentinelStateLabelKey], string(statemanager.RemediationSucceededLabelValue),
+		"Node should have remediation-succeed label value")
+
+	// Event 8: COMPONENT_RESET in group reset with the same entity should allow CR-4 creation after failure
+	updateGPUResetStatus(ctx, t, crName2, "Succeeded")
+
+	event8 := &protos.HealthEvent{
+		NodeName:          nodeName,
+		RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		EntitiesImpacted: []*protos.Entity{
+			{
+				EntityType:  "GPU_UUID",
+				EntityValue: "GPU-455d8f70-2051-db6c-0430-ffc457bff834",
+			},
+		},
+	}
+
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event8)
+	assert.NoError(t, err)
+	decision, err = r.checkExistingCRStatus(ctx, event8, time.Now(), groupConfig)
+	assert.NoError(t, err)
+	assert.True(t, decision.shouldCreate, "COMPONENT_RESET should be allowed (same group as previous "+
+		"COMPONENT_RESET that completed)")
+
+	// Verify annotation removed for CR-2 but not CR-3.
+	// Use Eventually because RemoveGroupsFromState writes to the API server but
+	// GetRemediationState reads from the informer cache, which syncs asynchronously.
+	assert.Eventually(t, func() bool {
+		state, _, err = r.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		_, cr2GroupExists := state.EquivalenceGroups["reset-GPU-455d8f70-2051-db6c-0430-ffc457bff834"]
+		cr3Group, cr3GroupExists := state.EquivalenceGroups["reset-GPU-927d8f70-2051-db6c-0430-ffc457bff834"]
+		return !cr2GroupExists && cr3GroupExists && cr3Group.MaintenanceCR == crName3
+	}, 5*time.Second, 100*time.Millisecond, "Expected CR-2 group to be removed and CR-3 group to remain")
+
+	// Event 9: COMPONENT_RESET missing GPU_UUID should result in a nvsentinel-state label having value remediation-failed.
+	// Model the active fault-quarantine state that permits fault-remediation to write a terminal label.
+	activeUnsupportedEvent := &protos.HealthEvent{
+		Id:                "event-9",
+		Version:           1,
+		Agent:             "test-agent",
+		ComponentClass:    "GPU",
+		CheckName:         "test-check",
+		IsFatal:           true,
+		RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		NodeName:          nodeName,
+	}
+	node, err = testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	if node.Annotations == nil {
+		node.Annotations = make(map[string]string)
+	}
+	maps.Copy(node.Annotations, quarantineAnnotationForTest(t, activeUnsupportedEvent))
+	_, err = testClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	active, err := r.nodeHasActiveQuarantine(ctx, activeUnsupportedEvent)
+	require.NoError(t, err)
+	require.True(t, active)
+
+	_, _ = stateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName, statemanager.DrainSucceededLabelValue, false)
+	event9 := model.HealthEventWithStatus{
+		HealthEvent: activeUnsupportedEvent,
+	}
+	groupConfig, err = common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+		event9.HealthEvent)
+	assert.Error(t, err)
+	assert.Nil(t, groupConfig)
+	shouldSkip, err = r.shouldSkipEvent(ctx, event9, groupConfig)
+	assert.NoError(t, err)
+	assert.True(t, shouldSkip, "Should skip invalid health event")
+
+	node, err = testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Equal(t, node.Labels[statemanager.NVSentinelStateLabelKey], string(statemanager.RemediationFailedLabelValue),
+		"Node should have remediation-failed label value")
+
+	// Cleanup
+	_ = testDynamic.Resource(rebootNodeGVR).Delete(ctx, crName1, metav1.DeleteOptions{})
+	_ = testDynamic.Resource(gpuResetGVR).Delete(ctx, crName2, metav1.DeleteOptions{})
+	_ = testDynamic.Resource(gpuResetGVR).Delete(ctx, crName3, metav1.DeleteOptions{})
+}
+
+// TestFullReconcilerWithMockedMongoDB tests the entire reconciler flow
+func TestFullReconcilerWithMockedMongoDB_E2E(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := "test-node-full-e2e-" + "test-node-123"
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	t.Run("CompleteFlow_WithEventLoop", func(t *testing.T) {
+		mockStore.updateCalled.Store(0)
+
+		beforeReceived := getCounterValue(t, metrics.TotalEventsReceived)
+		beforeDuration := getHistogramCount(t, metrics.EventHandlingDuration)
+
+		// Event 1: Send quarantine event through channel
+		eventID1 := "test-event-id-1"
+		event1 := createQuarantineEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+		publishLiveEvent(t, event1, "test-token-1")
+
+		// Wait for CR creation
+		var crName string
+		assert.Eventually(t, func() bool {
+			state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+			if err != nil {
+				return false
+			}
+			if grp, ok := state.EquivalenceGroups["restart"]; ok {
+				crName = grp.MaintenanceCR
+				return crName != ""
+			}
+			return false
+		}, 5*time.Second, 100*time.Millisecond, "CR should be created")
+
+		// Verify annotation is actually on the node object in Kubernetes
+		node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Contains(t, node.Annotations, annotation.AnnotationKey, "Node should have remediation annotation")
+
+		// Verify annotation content
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		require.NoError(t, err)
+		assert.Contains(t, state.EquivalenceGroups, "restart", "Should have restart equivalence group")
+		assert.Equal(t, crName, state.EquivalenceGroups["restart"].MaintenanceCR, "Annotation should contain correct CR name")
+
+		// Verify CR exists in Kubernetes
+		cr, err := testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+		require.NoError(t, err, "CR should exist in Kubernetes")
+		assert.Equal(t, nodeName, cr.Object["spec"].(map[string]any)["nodeName"])
+
+		// Verify only one CR exists for this node
+		crList, err := testDynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
+		require.NoError(t, err)
+		crCount := 0
+		for _, item := range crList.Items {
+			if item.Object["spec"].(map[string]any)["nodeName"] == nodeName {
+				crCount++
+			}
+		}
+		assert.Equal(t, 1, crCount, "Only one CR should exist for the node at this point")
+
+		// The action is recorded on the event before the CR is created.
+		assertRecordedAction(t, eventID1, "RESTART_BM")
+
+		// Event 2: Set CR to InProgress, send duplicate event (different action, same group).
+		// Regression test for issue #1536: the duplicate must be requeued while the CR is
+		// in progress — not checkpointed or finalized — and automatically reconsidered
+		// once the CR reaches a terminal state.
+		updateRebootNodeStatus(ctx, t, crName, "InProgress")
+
+		// Record MongoDB update count before sending duplicate event
+		updateCountBefore := mockStore.updateCalled.Load()
+		_, markedBeforeEvent2, _, _ := mockWatcher.GetCallCounts()
+		waitingBefore := getCounterVecValue(t, metrics.EventsProcessed, metrics.CRStatusWaiting, nodeName)
+
+		eventID2 := "test-event-id-2"
+		// The event predates the CR so it belongs to the running remediation session and
+		// must be marked remediated (not produce a second CR) once the CR succeeds.
+		event2 := createQuarantineEventCreatedAt(eventID2, nodeName, protos.RecommendedAction_RESTART_VM,
+			time.Now().Add(-time.Hour))
+		publishLiveEvent(t, event2, "test-token-2")
+
+		// Wait until the event has been evaluated at least once against the in-progress CR
+		assert.Eventually(t, func() bool {
+			return getCounterVecValue(t, metrics.EventsProcessed, metrics.CRStatusWaiting, nodeName) > waitingBefore
+		}, 5*time.Second, 50*time.Millisecond, "duplicate event should wait behind the in-progress CR")
+
+		// Verify annotation is still on the node and unchanged
+		node, err = testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Contains(t, node.Annotations, annotation.AnnotationKey, "Node should still have remediation annotation")
+
+		// Verify no new CR created (deduplication) - annotation should be unchanged
+		state, _, err = reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		require.NoError(t, err)
+		assert.Equal(t, crName, state.EquivalenceGroups["restart"].MaintenanceCR, "Should still be same CR (deduplicated)")
+
+		// Verify only ONE CR exists (no duplicate CR was created)
+		crList2, err := testDynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
+		require.NoError(t, err)
+		crCount2 := 0
+		for _, item := range crList2.Items {
+			if item.Object["spec"].(map[string]any)["nodeName"] == nodeName {
+				crCount2++
+			}
+		}
+		assert.Equal(t, 1, crCount2, "Should still be only one CR (duplicate event was skipped)")
+
+		// An event covered by an existing CR records its own action.
+		assertRecordedAction(t, eventID2, "RESTART_VM")
+
+		// While waiting, the event must not be finalized: no status write, no checkpoint.
+		assert.Equal(t, updateCountBefore, mockStore.updateCalled.Load(),
+			"MongoDB update should not be called while the event waits for the in-progress CR")
+		_, markedWhileWaiting, _, _ := mockWatcher.GetCallCounts()
+		assert.Equal(t, markedBeforeEvent2, markedWhileWaiting,
+			"resume token should not advance while the event waits for the in-progress CR")
+
+		// Complete the CR: the waiting event must be reconsidered automatically and marked
+		// remediated (covered by the completed remediation session) without a new CR.
+		updateRebootNodeStatus(ctx, t, crName, "Succeeded")
+
+		assert.Eventually(t, func() bool {
+			return mockStore.updateCalled.Load() > updateCountBefore
+		}, 5*time.Second, 50*time.Millisecond,
+			"waiting event should be marked remediated after the CR succeeds")
+
+		assert.Eventually(t, func() bool {
+			_, marked, _, _ := mockWatcher.GetCallCounts()
+			return marked > markedBeforeEvent2
+		}, 5*time.Second, 50*time.Millisecond,
+			"waiting event should be checkpointed after it is resolved")
+
+		// Still exactly one CR: resolving the waiting event must not create a duplicate.
+		crList2, err = testDynamic.Resource(gvr).List(ctx, metav1.ListOptions{})
+		require.NoError(t, err)
+		crCount2 = 0
+		for _, item := range crList2.Items {
+			if item.Object["spec"].(map[string]any)["nodeName"] == nodeName {
+				crCount2++
+			}
+		}
+		assert.Equal(t, 1, crCount2, "resolved same-session event must not create a second CR")
+
+		// Event 3: Send unquarantine event
+		unquarantineEvent := createUnquarantineEvent(nodeName)
+		publishLiveEvent(t, unquarantineEvent, "test-token-3")
+
+		// Wait for annotation cleanup
+		assert.Eventually(t, func() bool {
+			state, _, err = reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+			if err != nil {
+				return false
+			}
+			_, hasRestart := state.EquivalenceGroups["restart"]
+			return !hasRestart
+		}, 5*time.Second, 100*time.Millisecond, "Annotation should be cleaned after unquarantine")
+
+		// Verify annotation was actually removed from the node object in Kubernetes
+		node, err = testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		require.NoError(t, err)
+		_, hasAnnotation := node.Annotations[annotation.AnnotationKey]
+		if hasAnnotation {
+			// Annotation might exist but should be empty or not contain "restart" group
+			state, _, err = reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+			require.NoError(t, err)
+			assert.NotContains(t, state.EquivalenceGroups, "restart", "Restart group should be removed from annotation")
+		}
+
+		// Verify MarkProcessed was called for processed events
+		_, markedCount, _, _ := mockWatcher.GetCallCounts()
+		assert.Greater(t, markedCount, 0, "MarkProcessed should be called for processed events")
+
+		afterReceived := getCounterValue(t, metrics.TotalEventsReceived)
+		afterDuration := getHistogramCount(t, metrics.EventHandlingDuration)
+		createdCount := getCounterVecValue(t, metrics.EventsProcessed, metrics.CRStatusCreated, nodeName)
+		skippedCount := getCounterVecValue(t, metrics.EventsProcessed, metrics.CRStatusSkipped, nodeName)
+		waitingCount := getCounterVecValue(t, metrics.EventsProcessed, metrics.CRStatusWaiting, nodeName)
+
+		assert.GreaterOrEqual(t, afterReceived, beforeReceived+3, "TotalEventsReceived should increment for all events")
+		assert.GreaterOrEqual(t, createdCount, float64(1), "EventsProcessed with cr_status=created should increment for CR creation")
+		assert.GreaterOrEqual(t, waitingCount, float64(1), "EventsProcessed with cr_status=waiting should increment while the duplicate event waits")
+		assert.GreaterOrEqual(t, skippedCount, float64(1), "EventsProcessed with cr_status=skipped should increment when the duplicate event is covered")
+		assert.GreaterOrEqual(t, afterDuration, beforeDuration+3, "EventHandlingDuration should record observations for all events")
+
+		// Cleanup
+		_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+	})
+
+	t.Run("UnsupportedAction_TrackedInMetrics", func(t *testing.T) {
+		remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+		assert.NoError(t, err)
+
+		cfg := ReconcilerConfig{
+			RemediationClient: remediationClient,
+			StateManager:      statemanager.NewStateManager(testClient),
+			NodeReader:        ctrlRuntimeAPIReader,
+			UpdateMaxRetries:  3,
+			UpdateRetryDelay:  100 * time.Millisecond,
+		}
+
+		reconcilerInstance := &FaultRemediationReconciler{
+			Config:            cfg,
+			annotationManager: cfg.RemediationClient.GetAnnotationManager(),
+		}
+
+		beforeUnsupported := getCounterVecValue(t, metrics.TotalUnsupportedRemediationActions, "UNKNOWN", nodeName)
+
+		healthEvent := model.HealthEventWithStatus{
+			HealthEvent: &protos.HealthEvent{
+				NodeName:          nodeName,
+				RecommendedAction: protos.RecommendedAction_UNKNOWN,
+			},
+		}
+		groupConfig, err := common.GetGroupConfigForEvent(cfg.RemediationClient.GetConfig().RemediationActions,
+			healthEvent.HealthEvent)
+		assert.NoError(t, err)
+
+		shouldSkip, err := reconcilerInstance.shouldSkipEvent(ctx, healthEvent, groupConfig)
+		assert.NoError(t, err)
+		assert.True(t, shouldSkip, "Should skip unsupported action")
+
+		afterUnsupported := getCounterVecValue(t, metrics.TotalUnsupportedRemediationActions, "UNKNOWN", nodeName)
+		assert.Equal(t, beforeUnsupported+1, afterUnsupported, "TotalUnsupportedRemediationActions should increment")
+	})
+
+}
+
+// createCustomActionQuarantineEvent creates a quarantine event with CUSTOM recommendedAction
+func createCustomActionQuarantineEvent(eventID, nodeName, customAction string) datastore.Event {
+	return datastore.Event{
+		"operationType": "update",
+		"fullDocument": map[string]any{
+			"_id": eventID,
+			"healtheventstatus": map[string]any{
+				"userpodsevictionstatus": map[string]any{
+					"status": model.StatusSucceeded,
+				},
+				"nodequarantined": model.Quarantined,
+			},
+			"healthevent": map[string]any{
+				"nodename":                nodeName,
+				"recommendedaction":       int32(protos.RecommendedAction_CUSTOM),
+				"customrecommendedaction": customAction,
+			},
+		},
+	}
+}
+
+// Helper to create quarantine event
+func createQuarantineEvent(eventID string, nodeName string, action protos.RecommendedAction) datastore.Event {
+	return datastore.Event{
+		"operationType": "update",
+		"fullDocument": map[string]any{
+			"_id": eventID,
+			"healtheventstatus": map[string]any{
+				"userpodsevictionstatus": map[string]any{
+					"status": model.StatusSucceeded,
+				},
+				"nodequarantined": model.Quarantined,
+			},
+			"healthevent": map[string]any{
+				"nodename":          nodeName,
+				"recommendedaction": int32(action),
+			},
+		},
+	}
+}
+
+// createQuarantineEventCreatedAt is createQuarantineEvent with an explicit document
+// creation time, used to position the event inside or outside a remediation session.
+func createQuarantineEventCreatedAt(
+	eventID string,
+	nodeName string,
+	action protos.RecommendedAction,
+	createdAt time.Time,
+) datastore.Event {
+	event := createQuarantineEvent(eventID, nodeName, action)
+	event["fullDocument"].(map[string]any)["createdAt"] = createdAt.UTC().Format(time.RFC3339Nano)
+
+	return event
+}
+
+// Helper to create unquarantine event
+func createUnquarantineEvent(nodeName string) datastore.Event {
+	return datastore.Event{
+		"operationType": "update",
+		"fullDocument": map[string]any{
+			"_id": "test-doc-id",
+			"healtheventstatus": map[string]any{
+				"nodequarantined": model.UnQuarantined,
+				"userpodsevictionstatus": map[string]any{
+					"status": model.StatusSucceeded,
+				},
+			},
+			"healthevent": map[string]any{
+				"nodename": nodeName,
+			},
+		},
+	}
+}
+
+// Helper to create cancelled event
+func createCancelledEvent(eventID string, nodeName string, action protos.RecommendedAction) datastore.Event {
+	return datastore.Event{
+		"operationType": "update",
+		"fullDocument": map[string]any{
+			"_id": eventID,
+			"healtheventstatus": map[string]any{
+				"nodequarantined": model.Cancelled,
+			},
+			"healthevent": map[string]any{
+				"nodename":          nodeName,
+				"recommendedaction": int32(action),
+			},
+		},
+	}
+}
+
+// TestReconciler_CancelledEventCleansAnnotation tests that a cancelled event removes the equivalence group from the annotation
+func TestReconciler_CancelledEventCleansAnnotation(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("test-cancelled-clean")
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	t.Log("Send Quarantined event to create CR and annotation")
+	eventID1 := "test-event-id-1"
+	event1 := createQuarantineEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, event1, "test-token-1")
+
+	// Wait for CR creation and annotation
+	var crName string
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName = grp.MaintenanceCR
+			return crName != ""
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "CR and annotation should be created")
+
+	t.Log("Verify annotation contains restart group")
+	state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	require.Contains(t, state.EquivalenceGroups, "restart", "Annotation should contain restart group")
+
+	t.Log("Send Cancelled event to remove group from annotation")
+	cancelledEvent := createCancelledEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, cancelledEvent, "test-token-2")
+
+	t.Log("Verify group removed from annotation")
+	require.Eventually(t, func() bool {
+		state, _, err = reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		_, hasRestart := state.EquivalenceGroups["restart"]
+		return !hasRestart
+	}, 5*time.Second, 100*time.Millisecond, "Group should be removed from annotation")
+
+	t.Log("Verify CR still exists (not deleted by cancellation)")
+	_, err = testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+	require.NoError(t, err, "CR should still exist")
+
+	// Cleanup
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// TestReconciler_CancelledEventClearsAllGroups tests that a cancelled event clears all equivalence groups
+func TestReconciler_CancelledEventClearsAllGroups(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("test-cancelled-all")
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	t.Log("Send multiple Quarantined events with different recommended actions")
+	eventID1 := "test-event-id-1"
+	event1 := createQuarantineEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, event1, "test-token-1")
+
+	// Wait for first CR
+	var crName1 string
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName1 = grp.MaintenanceCR
+			return crName1 != ""
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "First CR should be created")
+
+	t.Log("Send second event with different action (same equivalence group)")
+	eventID2 := "test-event-id-2"
+	event2 := createQuarantineEvent(eventID2, nodeName, protos.RecommendedAction_RESTART_VM)
+	publishLiveEvent(t, event2, "test-token-2")
+
+	// Allow time for second event to be processed (should be deduplicated)
+	time.Sleep(500 * time.Millisecond)
+
+	t.Log("Verify annotation has restart group")
+	state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	require.Contains(t, state.EquivalenceGroups, "restart", "Should have restart group")
+
+	t.Log("Send Cancelled event")
+	cancelledEvent := createCancelledEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, cancelledEvent, "test-token-3")
+
+	t.Log("Verify all groups cleared from annotation")
+	require.Eventually(t, func() bool {
+		state, _, err = reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		return len(state.EquivalenceGroups) == 0
+	}, 5*time.Second, 100*time.Millisecond, "All groups should be cleared")
+
+	// Cleanup
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName1, metav1.DeleteOptions{})
+}
+
+// TestReconciler_CancelledAndUnQuarantinedClearAllState tests that Cancelled followed by UnQuarantined clears all state
+func TestReconciler_CancelledAndUnQuarantinedClearAllState(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("test-cancelled-unquarantine")
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	t.Log("Send Quarantined event")
+	eventID1 := "test-event-id-1"
+	event1 := createQuarantineEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, event1, "test-token-1")
+
+	var crName string
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName = grp.MaintenanceCR
+			return crName != ""
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "CR should be created")
+
+	t.Log("Send Cancelled event")
+	cancelledEvent := createCancelledEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, cancelledEvent, "test-token-2")
+
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		return len(state.EquivalenceGroups) == 0
+	}, 5*time.Second, 100*time.Millisecond, "Groups should be cleared after Cancelled")
+
+	t.Log("Send UnQuarantined event")
+	unquarantineEvent := createUnquarantineEvent(nodeName)
+	publishLiveEvent(t, unquarantineEvent, "test-token-3")
+
+	// Allow time for processing
+	time.Sleep(500 * time.Millisecond)
+
+	t.Log("Verify complete state cleanup")
+	state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	require.Empty(t, state.EquivalenceGroups, "All state should be cleared")
+
+	// Verify no annotation on node
+	node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	_, hasAnnotation := node.Annotations[annotation.AnnotationKey]
+	require.False(t, hasAnnotation, "Annotation should be removed after complete cleanup")
+
+	// Cleanup
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// Helper functions
+
+func updateGPUResetStatus(ctx context.Context, t *testing.T, crName, status string) {
+	t.Helper()
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "gpuresets",
+	}
+
+	// Get the CR
+	cr, err := testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to get GPUReset CR %s: %v", crName, err)
+		return
+	}
+
+	// Update status based on the provided status string
+	conditions := []any{}
+	switch status {
+	case "Succeeded":
+		conditions = append(conditions, map[string]any{
+			"type":               "Complete",
+			"status":             "True",
+			"reason":             "GPUResetSucceeded",
+			"message":            "GPU reset successfully",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		cr.Object["status"] = map[string]any{
+			"conditions":     conditions,
+			"startTime":      time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			"completionTime": time.Now().Format(time.RFC3339),
+		}
+	}
+
+	// Update the CR status using UpdateStatus
+	_, err = testDynamic.Resource(gvr).UpdateStatus(ctx, cr, metav1.UpdateOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to update GPUReset CR status: %v", err)
+	}
+}
+
+// updateRebootNodeStatus updates the status of a RebootNode CR for testing
+func updateRebootNodeStatus(ctx context.Context, t *testing.T, crName, status string) {
+	t.Helper()
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	// Get the CR
+	cr, err := testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to get RebootNode CR %s: %v", crName, err)
+		return
+	}
+
+	// Update status based on the provided status string
+	conditions := []any{}
+	switch status {
+	case "Succeeded":
+		conditions = append(conditions, map[string]any{
+			"type":               "SignalSent",
+			"status":             "True",
+			"reason":             "SignalSent",
+			"message":            "Reboot signal sent successfully",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		conditions = append(conditions, map[string]any{
+			"type":               "NodeReady",
+			"status":             "True",
+			"reason":             "NodeReady",
+			"message":            "Node is ready after reboot",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		cr.Object["status"] = map[string]any{
+			"conditions":     conditions,
+			"startTime":      time.Now().Add(-5 * time.Minute).Format(time.RFC3339),
+			"completionTime": time.Now().Format(time.RFC3339),
+		}
+	case "InProgress":
+		conditions = append(conditions, map[string]any{
+			"type":               "SignalSent",
+			"status":             "True",
+			"reason":             "SignalSent",
+			"message":            "Reboot signal sent",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		conditions = append(conditions, map[string]any{
+			"type":               "NodeReady",
+			"status":             "Unknown",
+			"reason":             "InProgress",
+			"message":            "Waiting for node to become ready",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		cr.Object["status"] = map[string]any{
+			"conditions": conditions,
+			"startTime":  time.Now().Add(-1 * time.Minute).Format(time.RFC3339),
+		}
+	case "Failed":
+		conditions = append(conditions, map[string]any{
+			"type":               "SignalSent",
+			"status":             "True",
+			"reason":             "SignalSent",
+			"message":            "Reboot signal sent",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		conditions = append(conditions, map[string]any{
+			"type":               "NodeReady",
+			"status":             "False",
+			"reason":             "Failed",
+			"message":            "Node failed to reach ready state",
+			"lastTransitionTime": time.Now().Format(time.RFC3339),
+		})
+		cr.Object["status"] = map[string]any{
+			"conditions":     conditions,
+			"startTime":      time.Now().Add(-2 * time.Minute).Format(time.RFC3339),
+			"completionTime": time.Now().Format(time.RFC3339),
+		}
+	}
+
+	// Update the CR status using UpdateStatus
+	_, err = testDynamic.Resource(gvr).UpdateStatus(ctx, cr, metav1.UpdateOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to update RebootNode CR status: %v", err)
+	}
+}
+
+func cleanupNodeAnnotations(ctx context.Context, t *testing.T, nodeName string) {
+	node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to get node for cleanup: %v", err)
+		return
+	}
+
+	if node.Annotations == nil {
+		return
+	}
+
+	delete(node.Annotations, annotation.AnnotationKey)
+	_, err = testClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		t.Logf("Warning: Failed to clean node annotations: %v", err)
+	}
+}
+
+// TestMetrics_CRGenerationDuration tests that CR generation duration metric is recorded
+func TestMetrics_CRGenerationDuration(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("test-cr-duration")
+
+	nodeLabels := map[string]string{
+		"test":                               "label",
+		statemanager.NVSentinelStateLabelKey: string(statemanager.DrainSucceededLabelValue),
+	}
+	createTestNode(ctx, nodeName, nil, nodeLabels)
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	beforeDuration := getHistogramCount(t, metrics.CRGenerationDuration)
+
+	t.Log("Sending quarantine event with DrainFinishTimestamp set to 5 seconds ago")
+	eventID1 := "test-event-id-1"
+	event1 := createQuarantineEvent(eventID1, nodeName, protos.RecommendedAction_RESTART_BM)
+
+	drainFinishTime := time.Now().Add(-5 * time.Second)
+	if fullDoc, ok := event1["fullDocument"].(map[string]any); ok {
+		if status, ok := fullDoc["healtheventstatus"].(map[string]any); ok {
+			status["drainfinishtimestamp"] = timestamppb.New(drainFinishTime)
+		}
+	}
+
+	publishLiveEvent(t, event1, "test-token-1")
+
+	var crName string
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName = grp.MaintenanceCR
+			return crName != ""
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "CR should be created")
+
+	t.Log("Verifying CRGenerationDuration metric was recorded")
+	require.Eventually(t, func() bool {
+		afterDuration := getHistogramCount(t, metrics.CRGenerationDuration)
+		return afterDuration > beforeDuration
+	}, 10*time.Second, 500*time.Millisecond, "CRGenerationDuration metric should be recorded")
+
+	afterDuration := getHistogramCount(t, metrics.CRGenerationDuration)
+	assert.GreaterOrEqual(t, afterDuration, beforeDuration+1,
+		"CRGenerationDuration histogram should record at least one observation")
+	t.Log("CRGenerationDuration metric recorded successfully")
+
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// TestMetrics_ProcessingErrors tests error tracking
+func TestMetrics_ProcessingErrors(t *testing.T) {
+	beforeError := getCounterVecValue(t, metrics.ProcessingErrors, "unmarshal_doc_error", "unknown")
+
+	invalidEventToken := &datastore.EventWithToken{
+		Event: map[string]any{
+			"fullDocument": "invalid-data",
+		},
+		ResumeToken: []byte("test-token"),
+	}
+	watcher := NewMockChangeStreamWatcher()
+
+	r := &FaultRemediationReconciler{
+		Watcher: watcher,
+	}
+
+	r.reconcileEvent(testContext, invalidEventToken)
+
+	afterError := getCounterVecValue(t, metrics.ProcessingErrors, "unmarshal_doc_error", "unknown")
+	assert.Greater(t, afterError, beforeError, "ProcessingErrors should increment for unmarshal error")
+}
+
+// Helper functions for reading Prometheus metrics
+
+func getCounterValue(t *testing.T, counter prometheus.Counter) float64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	err := counter.Write(metric)
+	require.NoError(t, err)
+	return metric.Counter.GetValue()
+}
+
+func getCounterVecValue(t *testing.T, counterVec *prometheus.CounterVec, labelValues ...string) float64 {
+	t.Helper()
+	counter, err := counterVec.GetMetricWithLabelValues(labelValues...)
+	require.NoError(t, err)
+	metric := &dto.Metric{}
+	err = counter.Write(metric)
+	require.NoError(t, err)
+	return metric.Counter.GetValue()
+}
+
+func getHistogramCount(t *testing.T, histogram prometheus.Histogram) uint64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	err := histogram.Write(metric)
+	require.NoError(t, err)
+	return metric.Histogram.GetSampleCount()
+}
+
+// --- HandleColdStart E2E tests ---
+
+func makeColdStartHealthEvent(
+	eventID, nodeName string, quarantineStatus model.Status, drainStatus model.Status,
+	action protos.RecommendedAction, createdAt time.Time,
+) datastore.HealthEventWithStatus {
+	return datastore.HealthEventWithStatus{
+		CreatedAt: createdAt,
+		RawEvent: datastore.Event{
+			"_id": eventID,
+			"healtheventstatus": map[string]any{
+				"nodequarantined": string(quarantineStatus),
+				"userpodsevictionstatus": map[string]any{
+					"status": string(drainStatus),
+				},
+			},
+			"healthevent": map[string]any{
+				"nodename":          nodeName,
+				"recommendedaction": int32(action),
+			},
+		},
+	}
+}
+
+// TestHandleColdStart_RemediationFlow tests the full cold start remediation flow:
+//  1. A node was quarantined and drained while FR was down
+//  2. HandleColdStart enqueues the missed event into the controller workqueue
+//  3. Controller-runtime processes it and FR creates a maintenance CR
+func TestHandleColdStart_RemediationFlow(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("cold-start-remediation")
+
+	createTestNode(ctx, nodeName, nil, map[string]string{
+		statemanager.NVSentinelStateLabelKey: string(statemanager.DrainSucceededLabelValue),
+	})
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	defer func() {
+		cleanupNodeAnnotations(ctx, t, nodeName)
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+		mockStore.FindHealthEventsByQueryFn = nil
+		mockStore.FindHealthEventsByQueryBatchedFn = nil
+	}()
+
+	missedEvent := makeColdStartHealthEvent(
+		"cold-start-event-1", nodeName,
+		model.Quarantined, model.StatusSucceeded,
+		protos.RecommendedAction_RESTART_BM, time.Now(),
+	)
+	mockStore.FindHealthEventsByQueryBatchedFn = func(
+		_ context.Context,
+		_ datastore.QueryBuilder,
+		_ int,
+		fn func([]datastore.HealthEventWithStatus) error,
+	) error {
+		return fn([]datastore.HealthEventWithStatus{missedEvent})
+	}
+	mockStore.FindHealthEventsByQueryFn = func(
+		_ context.Context,
+		_ datastore.QueryBuilder,
+	) ([]datastore.HealthEventWithStatus, error) {
+		return []datastore.HealthEventWithStatus{missedEvent}, nil
+	}
+
+	t.Log("Calling HandleColdStart to enqueue missed event")
+	reconciler.HandleColdStart(ctx)
+
+	t.Log("Verifying remediation state was set on the node")
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+
+		grp, ok := state.EquivalenceGroups["restart"]
+		if !ok {
+			return false
+		}
+
+		return grp.MaintenanceCR != ""
+	}, 5*time.Second, 100*time.Millisecond, "Cold start should create a maintenance CR")
+
+	state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+
+	crName := state.EquivalenceGroups["restart"].MaintenanceCR
+	t.Logf("Maintenance CR created via cold start: %s", crName)
+
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// TestHandleColdStart_CancellationFlow tests that cold start processes cancellation events:
+//  1. A node was quarantined and FR created a CR for it
+//  2. While FR was down, the event was cancelled
+//  3. HandleColdStart picks up the cancellation and clears remediation state
+func TestHandleColdStart_CancellationFlow(t *testing.T) {
+	mockStore.updateCalled.Store(0)
+
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("cold-start-cancellation")
+	createTestNode(ctx, nodeName, nil, map[string]string{
+		statemanager.NVSentinelStateLabelKey: string(statemanager.DrainSucceededLabelValue),
+	})
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+		mockStore.FindHealthEventsByQueryFn = nil
+		mockStore.FindHealthEventsByQueryBatchedFn = nil
+	}()
+
+	// Step 1: Send a quarantine event through the normal change stream path
+	t.Log("Step 1: Processing quarantine event via change stream")
+	eventID := "cold-start-cancel-event-1"
+	quarantineEvent := createQuarantineEvent(eventID, nodeName, protos.RecommendedAction_RESTART_BM)
+	publishLiveEvent(t, quarantineEvent, "cold-start-token-1")
+
+	var crName string
+	require.Eventually(t, func() bool {
+		state, _, err := reconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName = grp.MaintenanceCR
+			return crName != ""
+		}
+
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "CR should be created via normal path")
+
+	t.Logf("CR created: %s", crName)
+
+	// Step 2: Simulate FR going down and a cancellation happening while it's down
+	t.Log("Step 2: Simulating cold start with a missed cancellation event")
+	cancelledEvent := makeColdStartHealthEvent(
+		eventID, nodeName,
+		model.Cancelled, model.StatusSucceeded,
+		protos.RecommendedAction_RESTART_BM, time.Now(),
+	)
+	mockStore.FindHealthEventsByQueryBatchedFn = func(
+		_ context.Context,
+		_ datastore.QueryBuilder,
+		_ int,
+		fn func([]datastore.HealthEventWithStatus) error,
+	) error {
+		return fn([]datastore.HealthEventWithStatus{cancelledEvent})
+	}
+	mockStore.FindHealthEventsByQueryFn = func(
+		_ context.Context,
+		_ datastore.QueryBuilder,
+	) ([]datastore.HealthEventWithStatus, error) {
+		return []datastore.HealthEventWithStatus{cancelledEvent}, nil
+	}
+
+	t.Log("Step 3: Calling HandleColdStart to enqueue missed cancellation")
+	reconciler.HandleColdStart(ctx)
+
+	// Step 4: Verify remediation state was cleared (async via workqueue)
+	t.Log("Step 4: Verifying remediation state was cleared")
+	require.Eventually(t, func() bool {
+		node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+
+		_, hasAnnotation := node.Annotations[annotation.AnnotationKey]
+
+		return !hasAnnotation
+	}, 5*time.Second, 100*time.Millisecond,
+		"Cold start should clear remediation annotation for cancelled events")
+
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// TestCancellationEvent_WritesCompletionMarker verifies that handleCancellationEvent writes
+// faultRemediated=true to the health event store, making cold start self-terminating for
+// cancellation events.
+func TestCancellationEvent_WritesCompletionMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	nodeName := testutils.GenerateTestNodeName("test-cancel-marker")
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	cleanupNodeAnnotations(ctx, t, nodeName)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+	require.NoError(t, err)
+
+	var capturedStatuses []datastore.HealthEventStatus
+	var capturedIDs []string
+	var mu sync.Mutex
+
+	localStore := &MockHealthEventStore{}
+	localStore.UpdateHealthEventStatusFn = func(ctx context.Context, id string, status datastore.HealthEventStatus) error {
+		mu.Lock()
+		capturedIDs = append(capturedIDs, id)
+		capturedStatuses = append(capturedStatuses, status)
+		mu.Unlock()
+		return nil
+	}
+
+	localWatcher := NewMockChangeStreamWatcher()
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      statemanager.NewStateManager(testClient),
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+	}
+	localReconciler := NewFaultRemediationReconciler(nil, localWatcher, localStore, cfg, false)
+
+	// Pre-set the node state to match what fault-quarantine + node-drainer would have done.
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.QuarantinedLabelValue, false)
+	require.NoError(t, err)
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.DrainingLabelValue, false)
+	require.NoError(t, err)
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.DrainSucceededLabelValue, false)
+	require.NoError(t, err)
+
+	// Step 1: Send a quarantine event to establish remediation state
+	t.Log("Step 1: Processing quarantine event to create CR and annotation")
+	eventID := "cancel-marker-event-1"
+	quarantineEvent := createQuarantineEvent(eventID, nodeName, protos.RecommendedAction_RESTART_BM)
+	quarantineEventToken := datastore.EventWithToken{
+		Event:       map[string]any(quarantineEvent),
+		ResumeToken: []byte("cancel-marker-token-1"),
+	}
+	_, err = localReconciler.reconcileEvent(ctx, &quarantineEventToken)
+	require.NoError(t, err)
+
+	var crName string
+	require.Eventually(t, func() bool {
+		state, _, err := localReconciler.annotationManager.GetRemediationState(ctx, nodeName)
+		if err != nil {
+			return false
+		}
+		if grp, ok := state.EquivalenceGroups["restart"]; ok {
+			crName = grp.MaintenanceCR
+			return crName != ""
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "CR and annotation should be created")
+
+	mu.Lock()
+	capturedIDs = nil
+	capturedStatuses = nil
+	mu.Unlock()
+
+	// Step 2: Send the cancellation event and capture only the cancellation store updates.
+	t.Log("Step 2: Sending cancellation event and capturing store updates")
+	cancelledEvent := createCancelledEvent(eventID, nodeName, protos.RecommendedAction_RESTART_BM)
+	cancelledEventToken := datastore.EventWithToken{
+		Event:       map[string]any(cancelledEvent),
+		ResumeToken: []byte("cancel-marker-token-2"),
+	}
+	_, err = localReconciler.reconcileEvent(ctx, &cancelledEventToken)
+	require.NoError(t, err)
+
+	// Step 3: Wait for remediation state to be cleared (proves cancellation was processed)
+	require.Eventually(t, func() bool {
+		node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		_, hasAnnotation := node.Annotations[annotation.AnnotationKey]
+		return !hasAnnotation
+	}, 5*time.Second, 100*time.Millisecond, "Remediation annotation should be cleared")
+
+	// Step 4: Verify that UpdateHealthEventStatus was called with FaultRemediated=true
+	t.Log("Step 4: Verifying completion marker was written")
+	mu.Lock()
+	defer mu.Unlock()
+
+	require.NotEmpty(t, capturedStatuses, "UpdateHealthEventStatus should have been called for cancellation")
+
+	var foundCompletionMarker bool
+	for i, status := range capturedStatuses {
+		if capturedIDs[i] == eventID && status.FaultRemediated != nil && *status.FaultRemediated {
+			foundCompletionMarker = true
+			t.Logf("Completion marker written for event ID: %s (FaultRemediated=true)", capturedIDs[i])
+			assert.NotNil(t, status.LastRemediationTimestamp,
+				"LastRemediationTimestamp should be set when FaultRemediated=true")
+			break
+		}
+	}
+	require.True(t, foundCompletionMarker,
+		"handleCancellationEvent must write FaultRemediated=true for the cancelled event")
+
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// TestColdStartCancellationQueryRequiresCompletionMarker verifies that the cold start
+// cancellation query includes the same completion gate as the remediation query leg.
+// Without this faultremediated==nil predicate, every historical cancellation can replay
+// on every restart.
+func TestColdStartCancellationQueryRequiresCompletionMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testContext, 30*time.Second)
+	defer cancel()
+
+	var capturedQuery map[string]any
+	coldStartCallCount := 0
+
+	localStore := &MockHealthEventStore{}
+	localStore.FindHealthEventsByQueryBatchedFn = func(
+		_ context.Context,
+		builder datastore.QueryBuilder,
+		_ int,
+		_ func([]datastore.HealthEventWithStatus) error,
+	) error {
+		coldStartCallCount++
+		capturedQuery = builder.ToMongo()
+
+		return nil
+	}
+
+	remediationClient, err := createTestRemediationClient(false, restartRemediationActions)
+	require.NoError(t, err)
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      statemanager.NewStateManager(testClient),
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+	}
+	localReconciler := NewFaultRemediationReconciler(nil, NewMockChangeStreamWatcher(), localStore, cfg, false)
+
+	localReconciler.HandleColdStart(ctx)
+
+	assert.Equal(t, 1, coldStartCallCount,
+		"Cold start should query the store exactly once")
+	require.NotNil(t, capturedQuery, "Cold start query should be captured")
+	require.True(t, coldStartCancellationQueryHasCompletionGate(capturedQuery),
+		"Cold start cancellation query must include faultremediated==nil gate")
+}
+
+func coldStartCancellationQueryHasCompletionGate(q map[string]any) bool {
+	orConditions, ok := q["$or"].([]any)
+	if !ok {
+		return false
+	}
+
+	for _, rawCondition := range orConditions {
+		condition, ok := rawCondition.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if isCancellationQueryLeg(condition) && hasFaultRemediatedNilGate(condition) {
+			return true
+		}
+
+		andConditions, ok := condition["$and"].([]any)
+		if !ok {
+			continue
+		}
+
+		hasCancellationFilter := false
+		hasCompletionGate := false
+		for _, rawAndCondition := range andConditions {
+			andCondition, ok := rawAndCondition.(map[string]any)
+			if !ok {
+				continue
+			}
+			hasCancellationFilter = hasCancellationFilter || isCancellationQueryLeg(andCondition)
+			hasCompletionGate = hasCompletionGate || hasFaultRemediatedNilGate(andCondition)
+		}
+		if hasCancellationFilter && hasCompletionGate {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isCancellationQueryLeg(condition map[string]any) bool {
+	nodeQuarantined, ok := condition["healtheventstatus.nodequarantined"].(map[string]any)
+	if !ok {
+		return false
+	}
+
+	values, ok := nodeQuarantined["$in"].([]any)
+	if !ok {
+		return false
+	}
+
+	foundUnquarantined := false
+	foundCancelled := false
+	for _, value := range values {
+		switch value {
+		case string(model.UnQuarantined):
+			foundUnquarantined = true
+		case string(model.Cancelled):
+			foundCancelled = true
+		}
+	}
+
+	return foundUnquarantined && foundCancelled
+}
+
+func hasFaultRemediatedNilGate(condition map[string]any) bool {
+	value, ok := condition["healtheventstatus.faultremediated"]
+	return ok && value == nil
+}
+
+// TestCustomAction_E2E tests the full reconciler flow with a custom remediation action.
+// Exercises the complete path: raw MongoDB event → Reconcile → GetEffectiveActionName
+// → template rendering → CR creation.
+func TestCustomAction_E2E(t *testing.T) {
+	ctx, cancel := context.WithTimeout(testContext, 15*time.Second)
+	defer cancel()
+
+	nodeName := "test-node-custom-action-e2e"
+	createTestNode(ctx, nodeName, nil, map[string]string{"test": "label"})
+	defer func() {
+		_ = testClient.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{})
+	}()
+
+	customRemediationActions := map[string]config.MaintenanceResource{
+		"REPLACE_DISK": {
+			ApiGroup:              "janitor.dgxc.nvidia.com",
+			Version:               "v1alpha1",
+			Kind:                  "RebootNode",
+			TemplateFileName:      "custom-action-template.yaml",
+			CompleteConditionType: "NodeReady",
+			EquivalenceGroup:      "disk-replace",
+		},
+	}
+
+	remediationClient, err := createTestRemediationClient(false, customRemediationActions)
+	require.NoError(t, err)
+
+	customMockStore := &MockHealthEventStore{}
+	customMockStore.UpdateHealthEventStatusFn = func(ctx context.Context, id string, status datastore.HealthEventStatus) error {
+		return nil
+	}
+
+	customWatcher := NewMockChangeStreamWatcher()
+
+	cfg := ReconcilerConfig{
+		RemediationClient: remediationClient,
+		StateManager:      statemanager.NewStateManager(testClient),
+		UpdateMaxRetries:  3,
+		UpdateRetryDelay:  100 * time.Millisecond,
+	}
+
+	customReconciler := NewFaultRemediationReconciler(nil, customWatcher, customMockStore, cfg, false)
+
+	gvr := schema.GroupVersionResource{
+		Group:    "janitor.dgxc.nvidia.com",
+		Version:  "v1alpha1",
+		Resource: "rebootnodes",
+	}
+
+	// Pre-set the node state to match what fault-quarantine + node-drainer would have done
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.QuarantinedLabelValue, false)
+	require.NoError(t, err)
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.DrainingLabelValue, false)
+	require.NoError(t, err)
+	_, err = cfg.StateManager.UpdateNVSentinelStateNodeLabel(ctx, nodeName,
+		statemanager.DrainSucceededLabelValue, false)
+	require.NoError(t, err)
+
+	eventID := "custom-action-e2e-event-1"
+	rawEvent := createCustomActionQuarantineEvent(eventID, nodeName, "REPLACE_DISK")
+	eventToken := datastore.EventWithToken{
+		Event:       map[string]any(rawEvent),
+		ResumeToken: []byte("custom-token-1"),
+	}
+
+	_, err = customReconciler.reconcileEvent(ctx, &eventToken)
+	require.NoError(t, err)
+
+	state, _, err := customReconciler.annotationManager.GetRemediationState(ctx, nodeName)
+	require.NoError(t, err)
+	require.Contains(t, state.EquivalenceGroups, "disk-replace",
+		"Should have disk-replace equivalence group")
+
+	crName := state.EquivalenceGroups["disk-replace"].MaintenanceCR
+	assert.Contains(t, crName, "custom-maintenance-",
+		"CR name should use the custom template prefix")
+
+	cr, err := testDynamic.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+	require.NoError(t, err, "Custom action CR should exist in Kubernetes")
+	assert.Equal(t, nodeName, cr.Object["spec"].(map[string]any)["nodeName"])
+
+	labels := cr.GetLabels()
+	assert.Equal(t, "true", labels["nvsentinel.nvidia.com/custom-action"],
+		"CR should have custom-action label from template")
+
+	node, err := testClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Contains(t, node.Annotations, annotation.AnnotationKey,
+		"Node should have remediation annotation")
+
+	_, markedCount, _, _ := customWatcher.GetCallCounts()
+	assert.Equal(t, 1, markedCount, "MarkProcessed should be called once")
+
+	_ = testDynamic.Resource(gvr).Delete(ctx, crName, metav1.DeleteOptions{})
+}
+
+// assertRecordedAction checks the remediation decision recorded for the event.
+func assertRecordedAction(t *testing.T, eventID, action string) {
+	t.Helper()
+
+	recorded, ok := mockStore.recordedDecisions.Load(eventID)
+	require.True(t, ok, "a remediation decision should be recorded for event %s", eventID)
+	assert.Equal(t, datastore.RemediationDecision{Action: action}, recorded)
+}

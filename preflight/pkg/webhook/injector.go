@@ -1,0 +1,1313 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package webhook
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/nvidia/nvsentinel/preflight/pkg/config"
+	"github.com/nvidia/nvsentinel/preflight/pkg/gang"
+	"github.com/nvidia/nvsentinel/preflight/pkg/gang/types"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+var supportedHostPathTypes = map[string]corev1.HostPathType{
+	string(corev1.HostPathDirectory):         corev1.HostPathDirectory,
+	string(corev1.HostPathDirectoryOrCreate): corev1.HostPathDirectoryOrCreate,
+	string(corev1.HostPathFile):              corev1.HostPathFile,
+	string(corev1.HostPathFileOrCreate):      corev1.HostPathFileOrCreate,
+	string(corev1.HostPathSocket):            corev1.HostPathSocket,
+	string(corev1.HostPathCharDev):           corev1.HostPathCharDev,
+	string(corev1.HostPathBlockDev):          corev1.HostPathBlockDev,
+}
+
+const (
+	// patchOpAdd is the JSON Patch (RFC 6902) "add" operation.
+	patchOpAdd = "add"
+
+	nvsentinelSocketVolumeName = "nvsentinel-socket"
+	// connectorTokenVolumeName holds a projected ServiceAccount token for the
+	// platform-connector audience, minted against the workload pod's own
+	// ServiceAccount (every pod has one, so no coordination with the workload
+	// is needed).
+	connectorTokenVolumeName = "nvsentinel-connector-token"
+	// HealthPublishCAConfigMapName names the per namespace ConfigMap copy of
+	// the deployment platform connector CA bundle and the volume that mounts
+	// it. The controller keeps the copy current; the checks read it to verify
+	// the server in direct mode.
+	HealthPublishCAConfigMapName = "nvsentinel-platform-connector-ca"
+	// healthPublishCAMountPath is where that copy is mounted in the checks.
+	healthPublishCAMountPath = "/etc/nvsentinel/platform-connector-deployment-ca"
+	// HealthPublishCAKey is the ConfigMap key and file name of the bundle.
+	HealthPublishCAKey = "ca.crt"
+	// healthPublisherLabel marks pods the deployment platform connector's
+	// NetworkPolicy lets through. Injected pods carry it in direct mode.
+	healthPublisherLabel      = "nvsentinel.nvidia.com/health-publisher"
+	healthPublisherLabelValue = "true"
+	// dshmVolumeName is the name for the shared memory volume needed by NCCL
+	dshmVolumeName = "dshm"
+	// ncclTopoVolumeName is the name for the NCCL topology ConfigMap volume
+	ncclTopoVolumeName = "nccl-topo"
+
+	// PreflightChecksAnnotation is the pod annotation listing which preflight
+	// checks to run. Value is a comma-separated list of init container names.
+	// When absent, all containers with defaultEnabled (or omitted) are injected.
+	PreflightChecksAnnotation = "nvsentinel.nvidia.com/preflight-checks"
+)
+
+type PatchOperation struct {
+	Op    string `json:"op"`
+	Path  string `json:"path"`
+	Value any    `json:"value,omitempty"`
+}
+
+type Injector struct {
+	cfg      *config.Config
+	resolver *gang.DiscovererResolver
+	// draReader reads ResourceClaims and ResourceClaimTemplates to detect
+	// pods that get their GPUs through DRA. Nil turns DRA detection off.
+	draReader client.Reader
+}
+
+// NewInjector constructs an Injector from the preflight config, the
+// namespace-aware gang discoverer resolver used to resolve a pod's gang
+// discoverer at injection time, and the reader used for DRA GPU detection.
+func NewInjector(cfg *config.Config, resolver *gang.DiscovererResolver, draReader client.Reader) *Injector {
+	return &Injector{
+		cfg:       cfg,
+		resolver:  resolver,
+		draReader: draReader,
+	}
+}
+
+// GangContext contains gang information extracted during injection.
+// This is returned so the controller can register the peer.
+type GangContext struct {
+	GangID        string
+	ConfigMapName string
+	// OwnerReference points the gang ConfigMap at its scheduler owner for Kubernetes GC.
+	OwnerReference *metav1.OwnerReference
+	// CheckNames is a comma-separated list of injected check container
+	// names. Annotation order when annotation is present, chart order
+	// when using defaults.
+	CheckNames string
+}
+
+// ParseCheckNames splits a comma-separated annotation value into a list of
+// container names. Returns an error if any name appears more than once.
+// Exported so the gang controller can use the same parsing.
+func ParseCheckNames(csv string) ([]string, error) {
+	seen := make(map[string]bool)
+
+	var names []string
+
+	for part := range strings.SplitSeq(csv, ",") {
+		name := strings.TrimSpace(part)
+		if name == "" {
+			continue
+		}
+
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate check name %q in annotation %s",
+				name, PreflightChecksAnnotation)
+		}
+
+		seen[name] = true
+		names = append(names, name)
+	}
+
+	return names, nil
+}
+
+func configuredNames(specs []config.InitContainerSpec) []string {
+	names := make([]string, len(specs))
+	for i, s := range specs {
+		names[i] = s.Name
+	}
+
+	return names
+}
+
+// gangContextForPod resolves the gang discoverer for the pod's namespace and
+// extracts gang context when the pod belongs to a gang. Returns nil when gang
+// coordination is disabled, no discoverer applies, or the pod is not a gang
+// member.
+func (i *Injector) gangContextForPod(ctx context.Context, pod *corev1.Pod) *GangContext {
+	if !i.cfg.GangCoordination.Enabled {
+		return nil
+	}
+
+	discoverer := i.resolver.For(pod.Namespace)
+	if discoverer == nil {
+		return nil
+	}
+
+	if admissionDiscoverer, ok := discoverer.(types.AdmissionGangDiscoverer); ok {
+		if admitted := admittedPodFrom(ctx, pod.Namespace); admitted != nil {
+			return admissionGangContext(ctx, pod, admitted, admissionDiscoverer, discoverer.Name())
+		}
+	}
+
+	if !discoverer.CanHandle(pod) {
+		slog.Debug("Pod not handled by gang discoverer",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"discoverer", discoverer.Name())
+
+		return nil
+	}
+
+	gangID := discoverer.ExtractGangID(pod)
+	if gangID == "" {
+		return nil
+	}
+
+	var ownerReference *metav1.OwnerReference
+
+	if ownerResolver, ok := discoverer.(types.GangOwnerResolver); ok {
+		var err error
+
+		ownerReference, err = ownerResolver.OwnerReference(ctx, pod)
+		if err != nil {
+			logOwnerReferenceError(pod, gangID, discoverer.Name(), err)
+		}
+	}
+
+	return newGangContext(pod, gangID, ownerReference, discoverer.Name())
+}
+
+// admissionGangContext resolves the gang from the pod JSON in the admission
+// request. See types.AdmissionGangDiscoverer for why the decoded Pod is not
+// enough.
+func admissionGangContext(
+	ctx context.Context,
+	pod *corev1.Pod,
+	admitted *unstructured.Unstructured,
+	discoverer types.AdmissionGangDiscoverer,
+	discovererName string,
+) *GangContext {
+	gangID, ownerReference, err := discoverer.AdmissionGang(ctx, admitted)
+	if gangID == "" {
+		slog.Debug("Pod not handled by gang discoverer",
+			"pod", pod.Name,
+			"namespace", pod.Namespace,
+			"discoverer", discovererName)
+
+		return nil
+	}
+
+	if err != nil {
+		logOwnerReferenceError(pod, gangID, discovererName, err)
+	}
+
+	return newGangContext(pod, gangID, ownerReference, discovererName)
+}
+
+func newGangContext(
+	pod *corev1.Pod,
+	gangID string,
+	ownerReference *metav1.OwnerReference,
+	discovererName string,
+) *GangContext {
+	gangCtx := &GangContext{
+		GangID:         gangID,
+		ConfigMapName:  gang.ConfigMapName(gangID),
+		OwnerReference: ownerReference,
+	}
+
+	slog.Info("Pod is part of a gang",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"gangID", gangID,
+		"configMap", gangCtx.ConfigMapName,
+		"discoverer", discovererName)
+
+	return gangCtx
+}
+
+func logOwnerReferenceError(pod *corev1.Pod, gangID, discovererName string, err error) {
+	slog.Warn("Failed to resolve gang owner reference",
+		"pod", pod.Name,
+		"namespace", pod.Namespace,
+		"gangID", gangID,
+		"discoverer", discovererName,
+		"error", err)
+}
+
+func (i *Injector) InjectInitContainers(ctx context.Context, pod *corev1.Pod) ([]PatchOperation, *GangContext, error) {
+	maxResources, draGPU, isGPUPod := i.gpuPodResources(ctx, pod)
+	if !isGPUPod {
+		slog.Debug("Pod does not request GPU/network resources, skipping injection")
+		return nil, nil, nil
+	}
+
+	// Refuse before injecting anything: the checks about to be added would read
+	// their credential out of a volume the workload supplied.
+	if err := i.ValidateConnectorTokenVolume(pod); err != nil {
+		return nil, nil, err
+	}
+
+	if err := i.ValidateHealthPublishCAVolume(pod); err != nil {
+		return nil, nil, err
+	}
+
+	// Check if pod is part of a gang
+	gangCtx := i.gangContextForPod(ctx, pod)
+
+	selected, err := i.selectInitContainers(pod)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	initContainers := i.buildInitContainers(pod, maxResources, gangCtx, selected)
+
+	// The checks see the pod's DRA GPUs only through its claims, so a DRA GPU
+	// pod always gets them, whatever the gang mirroring setting says.
+	if draGPU {
+		for idx := range initContainers {
+			mirrorResourceClaims(&initContainers[idx], pod.Spec.ResourceClaims)
+		}
+	}
+
+	// Compute check names for gang validation.
+	if gangCtx != nil {
+		names := make([]string, len(initContainers))
+		for idx, c := range initContainers {
+			names[idx] = c.Name
+		}
+
+		gangCtx.CheckNames = strings.Join(names, ",")
+	}
+
+	if len(initContainers) == 0 {
+		// No init containers to inject, but still return gangCtx
+		// so the controller can track gang membership
+		return nil, gangCtx, nil
+	}
+
+	patches := i.patchInitContainers(pod, initContainers)
+	patches = append(patches, i.injectVolumes(pod, gangCtx)...)
+	patches = append(patches, i.injectImagePullSecrets(pod)...)
+	patches = append(patches, i.injectHealthPublisherLabel(pod)...)
+
+	return patches, gangCtx, nil
+}
+
+// patchInitContainers builds JSON Patch operations to add preflight init
+// containers to the pod. When no existing init containers are present,
+// the array is created. Otherwise placement is controlled by config.
+func (i *Injector) patchInitContainers(pod *corev1.Pod, initContainers []corev1.Container) []PatchOperation {
+	if len(pod.Spec.InitContainers) == 0 {
+		return []PatchOperation{{
+			Op:    patchOpAdd,
+			Path:  "/spec/initContainers",
+			Value: initContainers,
+		}}
+	}
+
+	patches := make([]PatchOperation, 0, len(initContainers))
+
+	for idx, c := range initContainers {
+		path := "/spec/initContainers/-"
+		if i.cfg.InitContainerPlacement == config.PlacementPrepend {
+			path = fmt.Sprintf("/spec/initContainers/%d", idx)
+		}
+
+		patches = append(patches, PatchOperation{
+			Op:    patchOpAdd,
+			Path:  path,
+			Value: c,
+		})
+	}
+
+	return patches
+}
+
+// gpuPodResources decides whether the pod is a GPU pod and returns the
+// resources the checks copy from it. The device plugin path is checked first
+// and makes no API calls. draGPU is true when the pod gets its GPUs only
+// through DRA resource claims.
+func (i *Injector) gpuPodResources(
+	ctx context.Context,
+	pod *corev1.Pod,
+) (maxResources corev1.ResourceList, draGPU bool, isGPUPod bool) {
+	if resources := i.findMaxResources(pod); len(resources) > 0 {
+		return resources, false, true
+	}
+
+	if !i.requestsDRAGPU(ctx, pod) {
+		return nil, false, false
+	}
+
+	// A DRA GPU pod still gets the network extended resources it requests.
+	return i.collectMaxResources(pod), true, true
+}
+
+// findMaxResources scans all containers and returns the maximum quantity
+// for each GPU and network resource. Returns empty map if no GPU resources found.
+func (i *Injector) findMaxResources(pod *corev1.Pod) corev1.ResourceList {
+	maxResources := i.collectMaxResources(pod)
+
+	if !i.hasGPUResources(maxResources) {
+		return nil
+	}
+
+	return maxResources
+}
+
+// collectMaxResources scans all containers and returns the maximum quantity
+// for each GPU and network extended resource they request.
+func (i *Injector) collectMaxResources(pod *corev1.Pod) corev1.ResourceList {
+	maxResources := make(corev1.ResourceList)
+
+	allResourceNames := append([]string{}, i.cfg.GPUResourceNames...)
+	allResourceNames = append(allResourceNames, i.cfg.NetworkResourceNames...)
+
+	for _, container := range pod.Spec.Containers {
+		for _, name := range allResourceNames {
+			resName := corev1.ResourceName(name)
+
+			i.updateMax(maxResources, resName, container.Resources.Limits[resName])
+			i.updateMax(maxResources, resName, container.Resources.Requests[resName])
+		}
+	}
+
+	return maxResources
+}
+
+// hasGPUResources returns true if maxResources contains at least one
+// non-zero GPU resource.
+func (i *Injector) hasGPUResources(maxResources corev1.ResourceList) bool {
+	for _, name := range i.cfg.GPUResourceNames {
+		if qty, ok := maxResources[corev1.ResourceName(name)]; ok && !qty.IsZero() {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (i *Injector) updateMax(resources corev1.ResourceList, name corev1.ResourceName, qty resource.Quantity) {
+	if qty.IsZero() {
+		return
+	}
+
+	if current, exists := resources[name]; !exists || qty.Cmp(current) > 0 {
+		resources[name] = qty
+	}
+}
+
+// selectInitContainers returns the subset of configured init containers to
+// inject based on the pod's preflight-checks annotation or defaultEnabled.
+func (i *Injector) selectInitContainers(pod *corev1.Pod) ([]config.InitContainerSpec, error) {
+	ann, ok := pod.Annotations[PreflightChecksAnnotation]
+	if !ok {
+		// No annotation — use defaultEnabled.
+		var result []config.InitContainerSpec
+
+		for _, spec := range i.cfg.InitContainers {
+			if spec.IsDefaultEnabled() {
+				result = append(result, spec)
+			} else {
+				slog.Debug("Init container disabled by default", "container", spec.Name)
+			}
+		}
+
+		return result, nil
+	}
+
+	// Annotation present — only inject named containers.
+	// ParseCheckNames normalizes: split, trim; rejects duplicates.
+	// An empty or whitespace/comma-only annotation yields an empty list,
+	// which disables all checks.
+	requested, err := ParseCheckNames(ann)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(requested) == 0 {
+		return nil, nil
+	}
+
+	configuredByName := make(map[string]config.InitContainerSpec, len(i.cfg.InitContainers))
+
+	for _, spec := range i.cfg.InitContainers {
+		configuredByName[spec.Name] = spec
+	}
+
+	// Walk annotation order so init container execution order matches
+	// what the user specified.
+	var result []config.InitContainerSpec
+
+	var unknown []string
+
+	for _, name := range requested {
+		spec, exists := configuredByName[name]
+		if !exists {
+			unknown = append(unknown, name)
+
+			continue
+		}
+
+		result = append(result, spec)
+	}
+
+	if len(unknown) > 0 {
+		return nil, fmt.Errorf(
+			"annotation %s references unknown checks: %s (configured: %s)",
+			PreflightChecksAnnotation,
+			strings.Join(unknown, ", "),
+			strings.Join(configuredNames(i.cfg.InitContainers), ", "))
+	}
+
+	return result, nil
+}
+
+func (i *Injector) buildInitContainers(
+	pod *corev1.Pod,
+	maxResources corev1.ResourceList,
+	gangCtx *GangContext,
+	selected []config.InitContainerSpec,
+) []corev1.Container {
+	var initContainers []corev1.Container
+
+	// Determine whether to mirror pod-level DRA claims to init containers.
+	mirrorClaims := i.cfg.GangCoordination.MirrorResourceClaims != nil &&
+		*i.cfg.GangCoordination.MirrorResourceClaims
+
+	// Collect env vars and volume mounts from main containers that match
+	// configured patterns. This allows init containers to inherit fabric-
+	// specific NCCL config from the user's training container.
+	userEnvVars := i.collectMatchingEnvVars(pod.Spec.Containers)
+	userVolumeMounts := i.collectMatchingVolumeMounts(pod.Spec.Containers)
+
+	for _, tmpl := range selected {
+		container := tmpl.DeepCopy()
+
+		if container.Resources.Requests == nil {
+			container.Resources.Requests = make(corev1.ResourceList)
+		}
+
+		if container.Resources.Limits == nil {
+			container.Resources.Limits = make(corev1.ResourceList)
+		}
+
+		for name, qty := range maxResources {
+			container.Resources.Requests[name] = qty
+			container.Resources.Limits[name] = qty
+		}
+
+		if _, ok := container.Resources.Requests[corev1.ResourceCPU]; !ok {
+			container.Resources.Requests[corev1.ResourceCPU] = resource.MustParse("100m")
+		}
+
+		if _, ok := container.Resources.Requests[corev1.ResourceMemory]; !ok {
+			container.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("500Mi")
+		}
+
+		i.injectCommonEnv(container)
+		i.injectHealthPublishEnv(container)
+		i.injectConnectorTokenMount(container)
+		i.injectHealthPublishCAMount(container)
+		i.injectGangEnv(container, gangCtx)
+		i.inheritUserConfig(container, tmpl, userEnvVars, userVolumeMounts)
+
+		if gangCtx != nil {
+			i.injectGangMounts(container, mirrorClaims, pod.Spec.ResourceClaims)
+		}
+
+		initContainers = append(initContainers, *container)
+	}
+
+	return initContainers
+}
+
+func (i *Injector) inheritUserConfig(
+	container *corev1.Container,
+	tmpl config.InitContainerSpec,
+	userEnvVars []corev1.EnvVar,
+	userVolumeMounts []corev1.VolumeMount,
+) {
+	// Inherited env remains lower precedence than the init container's own env
+	// vars; mergeEnvVars only adds missing names.
+	if tmpl.InheritsUserEnv() {
+		i.mergeEnvVars(container, userEnvVars)
+	}
+
+	if tmpl.InheritsUserVolumeMounts() {
+		i.mergeVolumeMounts(container, userVolumeMounts)
+	}
+}
+
+// injectGangMounts adds gang-related volume mounts and DRA resource claims
+// to an init container.
+func (i *Injector) injectGangMounts(
+	container *corev1.Container,
+	mirrorClaims bool,
+	podResourceClaims []corev1.PodResourceClaim,
+) {
+	// Gang ConfigMap and /dev/shm mounts are always needed for gang members.
+	container.VolumeMounts = append(container.VolumeMounts,
+		corev1.VolumeMount{
+			Name:      types.GangConfigVolumeName,
+			MountPath: i.cfg.GangCoordination.ConfigMapMountPath,
+			ReadOnly:  true,
+		},
+		// NCCL requires a larger shared memory segment than the default 64MB.
+		corev1.VolumeMount{
+			Name:      dshmVolumeName,
+			MountPath: "/dev/shm",
+		},
+	)
+
+	// Add NCCL topology ConfigMap mount if configured.
+	if i.cfg.GangCoordination.NCCLTopoConfigMap != "" {
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      ncclTopoVolumeName,
+			MountPath: "/etc/nccl",
+			ReadOnly:  true,
+		})
+	}
+
+	i.appendExtraHostPathMounts(container)
+	i.appendExtraVolumeMounts(container)
+
+	if mirrorClaims {
+		mirrorResourceClaims(container, podResourceClaims)
+	}
+}
+
+// mirrorResourceClaims adds every pod-level DRA resource claim to the
+// container's resources.claims. This ensures init containers get the same
+// device access as main containers: GPUs, RDMA NICs, IMEX channels (GB200
+// MNNVL), etc. A claim the container already has is skipped, because the API
+// server rejects a pod that lists a claim twice.
+func mirrorResourceClaims(container *corev1.Container, podResourceClaims []corev1.PodResourceClaim) {
+	for _, podClaim := range podResourceClaims {
+		hasClaim := slices.ContainsFunc(container.Resources.Claims, func(c corev1.ResourceClaim) bool {
+			return c.Name == podClaim.Name
+		})
+		if hasClaim {
+			continue
+		}
+
+		container.Resources.Claims = append(container.Resources.Claims, corev1.ResourceClaim{
+			Name: podClaim.Name,
+		})
+	}
+}
+
+// appendExtraHostPathMounts appends configured extra hostPath mounts to the container.
+func (i *Injector) appendExtraHostPathMounts(container *corev1.Container) {
+	for _, m := range i.cfg.GangCoordination.ExtraHostPathMounts {
+		if m.Name == "" || m.MountPath == "" {
+			continue
+		}
+
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      m.Name,
+			MountPath: m.MountPath,
+			ReadOnly:  boolDefault(m.ReadOnly, true),
+		})
+	}
+}
+
+// appendExtraVolumeMounts appends configured extra volume mounts (for pre-existing
+// pod volumes such as GCP TCPXO plugin volumes) to the container.
+func (i *Injector) appendExtraVolumeMounts(container *corev1.Container) {
+	for _, m := range i.cfg.GangCoordination.ExtraVolumeMounts {
+		if m.Name == "" || m.MountPath == "" {
+			continue
+		}
+
+		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+			Name:      m.Name,
+			MountPath: m.MountPath,
+			ReadOnly:  boolDefault(m.ReadOnly, true),
+		})
+	}
+}
+
+// injectCommonEnv injects environment variables common to all preflight init containers.
+// These include NODE_NAME, PLATFORM_CONNECTOR_SOCKET, and PROCESSING_STRATEGY which are
+// needed by any preflight check that publishes health events.
+func (i *Injector) injectCommonEnv(container *corev1.Container) {
+	envVars := []corev1.EnvVar{
+		{
+			Name: "NODE_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "spec.nodeName",
+				},
+			},
+		},
+	}
+
+	if i.cfg.ConnectorSocket != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "PLATFORM_CONNECTOR_SOCKET",
+			Value: i.cfg.ConnectorSocket,
+		})
+	}
+
+	if i.cfg.ProcessingStrategy != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "PROCESSING_STRATEGY",
+			Value: i.cfg.ProcessingStrategy,
+		})
+	}
+
+	if i.cfg.ConnectorTokenAudience != "" {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "PLATFORM_CONNECTOR_TOKEN_PATH",
+			Value: i.connectorTokenMountPath() + "/token",
+		})
+	}
+
+	i.mergeEnvVars(container, envVars)
+}
+
+// healthPublishCAConfigured reports whether direct mode verifies the server with the CA copy.
+func (i *Injector) healthPublishCAConfigured() bool {
+	return i.cfg.HealthPublishCAFile != ""
+}
+
+// injectHealthPublishEnv points the check at the deployment platform connector
+// when a target is configured. The token is the same projected token the
+// socket path uses, so the path comes from the connector token settings.
+// Chart env still wins because mergeEnvVars only adds missing names.
+func (i *Injector) injectHealthPublishEnv(container *corev1.Container) {
+	if i.cfg.HealthPublishTarget == "" {
+		return
+	}
+
+	envVars := []corev1.EnvVar{
+		{
+			Name:  "HEALTH_PUBLISH_TARGET",
+			Value: i.cfg.HealthPublishTarget,
+		},
+		{
+			Name:  "HEALTH_PUBLISH_TOKEN_PATH",
+			Value: i.connectorTokenMountPath() + "/token",
+		},
+	}
+
+	if i.healthPublishCAConfigured() {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HEALTH_PUBLISH_TLS_CA_FILE",
+			Value: healthPublishCAMountPath + "/" + HealthPublishCAKey,
+		})
+	} else {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HEALTH_PUBLISH_INSECURE",
+			Value: "true",
+		})
+	}
+
+	i.mergeEnvVars(container, envVars)
+}
+
+// injectHealthPublishCAMount attaches the CA ConfigMap copy to a check
+// container. It runs right after injectConnectorTokenMount so an inherited
+// user mount at the same path is skipped by mergeVolumeMounts. The matching
+// pod-level volume is added by injectVolumes.
+func (i *Injector) injectHealthPublishCAMount(container *corev1.Container) {
+	if !i.healthPublishCAConfigured() {
+		return
+	}
+
+	for _, m := range container.VolumeMounts {
+		if m.Name == HealthPublishCAConfigMapName {
+			return
+		}
+	}
+
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+		Name:      HealthPublishCAConfigMapName,
+		MountPath: healthPublishCAMountPath,
+		ReadOnly:  true,
+	})
+}
+
+// healthPublishCAVolume is the ConfigMap volume this webhook injects for the
+// CA bundle copy. It is not optional: a check without the bundle cannot
+// verify the server, and admission is the right place to surface that.
+func (i *Injector) healthPublishCAVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: HealthPublishCAConfigMapName,
+		ConfigMap: &corev1.ConfigMapVolumeSource{
+			Name: HealthPublishCAConfigMapName,
+			Items: []corev1.KeyToPath{{
+				Key:  HealthPublishCAKey,
+				Path: HealthPublishCAKey,
+			}},
+		},
+	}
+}
+
+// ValidateHealthPublishCAVolume reports an error when the pod already carries
+// a volume by the injected CA volume's name that is not the ConfigMap
+// projection this webhook would have added. A foreign volume there would make
+// the check trust whatever server the workload chose, so the pod is refused
+// at admission, the same way ValidateConnectorTokenVolume refuses a foreign
+// token volume.
+func (i *Injector) ValidateHealthPublishCAVolume(pod *corev1.Pod) error {
+	if !i.healthPublishCAConfigured() {
+		return nil
+	}
+
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name != HealthPublishCAConfigMapName {
+			continue
+		}
+
+		if !isOurHealthPublishCAVolume(vol) {
+			return fmt.Errorf(
+				"pod declares a volume named %q that is not the CA ConfigMap projection "+
+					"preflight injects; rename it, because injected checks read the "+
+					"platform connector CA bundle from that volume",
+				HealthPublishCAConfigMapName)
+		}
+	}
+
+	return nil
+}
+
+// isOurHealthPublishCAVolume reports whether an existing pod volume is exactly
+// the ConfigMap projection this webhook would have injected: the CA ConfigMap,
+// only the ca.crt key at the ca.crt path, and not optional.
+func isOurHealthPublishCAVolume(vol corev1.Volume) bool {
+	cm := vol.ConfigMap
+	if cm == nil || cm.Name != HealthPublishCAConfigMapName || len(cm.Items) != 1 {
+		return false
+	}
+
+	if cm.Optional != nil && *cm.Optional {
+		return false
+	}
+
+	return cm.Items[0].Key == HealthPublishCAKey && cm.Items[0].Path == HealthPublishCAKey
+}
+
+// injectHealthPublisherLabel adds the label the deployment platform
+// connector's NetworkPolicy selects, so the injected checks can reach it. The
+// slash in the label key is escaped as "~1" for the JSON pointer. A JSON Patch
+// add on an existing member replaces its value, so a stale value is fixed too.
+func (i *Injector) injectHealthPublisherLabel(pod *corev1.Pod) []PatchOperation {
+	if i.cfg.HealthPublishTarget == "" {
+		return nil
+	}
+
+	if len(pod.Labels) == 0 {
+		return []PatchOperation{{
+			Op:    patchOpAdd,
+			Path:  "/metadata/labels",
+			Value: map[string]string{healthPublisherLabel: healthPublisherLabelValue},
+		}}
+	}
+
+	return []PatchOperation{{
+		Op:    patchOpAdd,
+		Path:  "/metadata/labels/" + strings.ReplaceAll(healthPublisherLabel, "/", "~1"),
+		Value: healthPublisherLabelValue,
+	}}
+}
+
+// connectorTokenMountPath is where the projected token is mounted in injected
+// check containers.
+//
+// No fallback: config validation makes the three connector-token settings
+// atomic, so whenever an audience is set — the only condition under which the
+// token is injected at all — this is set too. A built-in default here would
+// mount the credential at a path the chart never agreed to, which the check
+// then fails to read.
+func (i *Injector) connectorTokenMountPath() string {
+	return i.cfg.ConnectorTokenMountPath
+}
+
+// connectorTokenExpirationSeconds is the projected token's lifetime. Set
+// alongside the audience and mount path, for the same reason.
+func (i *Injector) connectorTokenExpirationSeconds() int64 {
+	return i.cfg.ConnectorTokenExpirationSeconds
+}
+
+// injectConnectorTokenMount attaches the projected connector-token volume to a
+// check container. The matching pod-level volume is added by injectVolumes.
+func (i *Injector) injectConnectorTokenMount(container *corev1.Container) {
+	if i.cfg.ConnectorTokenAudience == "" {
+		return
+	}
+
+	for _, m := range container.VolumeMounts {
+		if m.Name == connectorTokenVolumeName {
+			return
+		}
+	}
+
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+		Name:      connectorTokenVolumeName,
+		MountPath: i.connectorTokenMountPath(),
+		ReadOnly:  true,
+	})
+}
+
+// connectorTokenVolume is the projected token volume this webhook injects.
+func (i *Injector) connectorTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: connectorTokenVolumeName,
+		Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{
+				ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+					Audience:          i.cfg.ConnectorTokenAudience,
+					ExpirationSeconds: new(i.connectorTokenExpirationSeconds()),
+					Path:              "token",
+				},
+			}},
+		},
+	}
+}
+
+// ValidateConnectorTokenVolume reports an error when the pod already carries a
+// volume by the injected token's name that is not the projection this webhook
+// would have added. Callers reject such a pod at admission rather than let an
+// injected check read a credential the workload supplied.
+func (i *Injector) ValidateConnectorTokenVolume(pod *corev1.Pod) error {
+	if i.cfg.ConnectorTokenAudience == "" {
+		return nil
+	}
+
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Name != connectorTokenVolumeName {
+			continue
+		}
+
+		if !isOurConnectorTokenVolume(vol, i.cfg.ConnectorTokenAudience, i.connectorTokenExpirationSeconds()) {
+			return fmt.Errorf(
+				"pod declares a volume named %q that is not the projected "+
+					"ServiceAccount token preflight injects; rename it, because injected "+
+					"checks read their platform-connector credential from that volume",
+				connectorTokenVolumeName)
+		}
+	}
+
+	return nil
+}
+
+// isOurConnectorTokenVolume reports whether an existing pod volume is exactly
+// the projection this webhook would have injected.
+//
+// A volume is matched by name, and a name is all a workload needs to supply its
+// own. Injected checks read a credential out of that volume, so accepting one
+// the workload controls means reading a credential the workload chose. The
+// substitution is bounded — any token still has to pass TokenReview, and its
+// node claim still pins it to this node — but a check must not silently read a
+// credential from a source it did not get from us.
+func isOurConnectorTokenVolume(vol corev1.Volume, audience string, expirationSeconds int64) bool {
+	if vol.Projected == nil || len(vol.Projected.Sources) != 1 {
+		return false
+	}
+
+	sat := vol.Projected.Sources[0].ServiceAccountToken
+	if sat == nil {
+		return false
+	}
+
+	return sat.Audience == audience &&
+		sat.Path == "token" &&
+		sat.ExpirationSeconds != nil &&
+		*sat.ExpirationSeconds == expirationSeconds
+}
+
+func (i *Injector) injectVolumes(pod *corev1.Pod, gangCtx *GangContext) []PatchOperation {
+	var patches []PatchOperation
+
+	existingVolumes := make(map[string]bool)
+	for _, vol := range pod.Spec.Volumes {
+		existingVolumes[vol.Name] = true
+	}
+
+	volumesToAdd := i.collectPublishVolumes(existingVolumes)
+
+	if gangCtx != nil {
+		volumesToAdd = append(volumesToAdd, i.collectGangVolumes(gangCtx, existingVolumes)...)
+	}
+
+	if len(volumesToAdd) == 0 {
+		return patches
+	}
+
+	if len(pod.Spec.Volumes) == 0 {
+		patches = append(patches, PatchOperation{
+			Op:    patchOpAdd,
+			Path:  "/spec/volumes",
+			Value: volumesToAdd,
+		})
+	} else {
+		for _, vol := range volumesToAdd {
+			patches = append(patches, PatchOperation{
+				Op:    patchOpAdd,
+				Path:  "/spec/volumes/-",
+				Value: vol,
+			})
+		}
+	}
+
+	return patches
+}
+
+// collectPublishVolumes gathers the volumes every injected check publishes
+// through (socket, projected token, CA ConfigMap copy) that are not already
+// present in the pod.
+func (i *Injector) collectPublishVolumes(existingVolumes map[string]bool) []corev1.Volume {
+	var volumes []corev1.Volume
+
+	if i.cfg.ConnectorSocket != "" && !existingVolumes[nvsentinelSocketVolumeName] {
+		// Platform-connector mounts /var/run/nvsentinel (host) -> /var/run (container)
+		// and creates socket at /var/run/nvsentinel.sock inside its container.
+		// This is the same hostPath used by gpu-health-monitor.
+		hostPathType := corev1.HostPathDirectoryOrCreate
+
+		volumes = append(volumes, corev1.Volume{
+			Name: nvsentinelSocketVolumeName,
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: "/var/run/nvsentinel",
+				Type: &hostPathType,
+			},
+		})
+	}
+
+	if i.cfg.ConnectorTokenAudience != "" && !existingVolumes[connectorTokenVolumeName] {
+		volumes = append(volumes, i.connectorTokenVolume())
+	}
+
+	if i.healthPublishCAConfigured() && !existingVolumes[HealthPublishCAConfigMapName] {
+		volumes = append(volumes, i.healthPublishCAVolume())
+	}
+
+	return volumes
+}
+
+// injectImagePullSecrets builds JSON Patch operations to add configured
+// imagePullSecrets to the pod. Secrets already present on the pod are skipped.
+func (i *Injector) injectImagePullSecrets(pod *corev1.Pod) []PatchOperation {
+	if len(i.cfg.ImagePullSecrets) == 0 {
+		return nil
+	}
+
+	existing := make(map[string]bool, len(pod.Spec.ImagePullSecrets))
+	for _, s := range pod.Spec.ImagePullSecrets {
+		existing[s.Name] = true
+	}
+
+	var toAdd []corev1.LocalObjectReference
+
+	for _, s := range i.cfg.ImagePullSecrets {
+		if !existing[s.Name] {
+			toAdd = append(toAdd, s)
+			existing[s.Name] = true
+		}
+	}
+
+	if len(toAdd) == 0 {
+		return nil
+	}
+
+	if len(pod.Spec.ImagePullSecrets) == 0 {
+		return []PatchOperation{{
+			Op:    patchOpAdd,
+			Path:  "/spec/imagePullSecrets",
+			Value: toAdd,
+		}}
+	}
+
+	patches := make([]PatchOperation, 0, len(toAdd))
+	for _, s := range toAdd {
+		patches = append(patches, PatchOperation{
+			Op:    patchOpAdd,
+			Path:  "/spec/imagePullSecrets/-",
+			Value: s,
+		})
+	}
+
+	return patches
+}
+
+// collectGangVolumes gathers all gang-related volumes (ConfigMap, shared memory,
+// NCCL topology, extra hostPath) that are not already present in the pod.
+func (i *Injector) collectGangVolumes(
+	gangCtx *GangContext,
+	existingVolumes map[string]bool,
+) []corev1.Volume {
+	var volumes []corev1.Volume
+
+	// ConfigMap is optional because it may not exist yet when the pod is created.
+	// The controller creates it when it discovers the gang.
+	// Init containers poll the mounted path until peers are registered.
+	if !existingVolumes[types.GangConfigVolumeName] {
+		optional := true
+
+		volumes = append(volumes, corev1.Volume{
+			Name: types.GangConfigVolumeName,
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				Name:     gangCtx.ConfigMapName,
+				Optional: &optional,
+			},
+		})
+	}
+
+	// Add shared memory volume for NCCL multi-GPU communication.
+	// NCCL requires a larger /dev/shm than the default 64MB container limit.
+	// Using emptyDir with Memory medium provides RAM-backed storage.
+	// Cap at 64Gi to prevent unbounded RAM consumption on the node.
+	if !existingVolumes[dshmVolumeName] {
+		dshmSizeLimit := resource.MustParse("64Gi")
+		volumes = append(volumes, corev1.Volume{
+			Name: dshmVolumeName,
+			EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium:    corev1.StorageMediumMemory,
+				SizeLimit: &dshmSizeLimit,
+			},
+		})
+	}
+
+	// Add NCCL topology ConfigMap volume if configured.
+	// Required for Azure NDv4/v5 - NCCL needs this to map GPUs to IB NICs.
+	// The ConfigMap is auto-created by the gang controller in the pod's namespace
+	// when ncclTopoData is configured, or must exist if set explicitly.
+	if i.cfg.GangCoordination.NCCLTopoConfigMap != "" && !existingVolumes[ncclTopoVolumeName] {
+		optional := true
+
+		volumes = append(volumes, corev1.Volume{
+			Name: ncclTopoVolumeName,
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				Name:     i.cfg.GangCoordination.NCCLTopoConfigMap,
+				Optional: &optional,
+			},
+		})
+	}
+
+	volumes = append(volumes, i.collectExtraHostPathVolumes(existingVolumes)...)
+
+	return volumes
+}
+
+// collectExtraHostPathVolumes builds volumes for configured extra hostPath mounts
+// that are not already present in the pod.
+func (i *Injector) collectExtraHostPathVolumes(existingVolumes map[string]bool) []corev1.Volume {
+	var volumes []corev1.Volume
+
+	for _, m := range i.cfg.GangCoordination.ExtraHostPathMounts {
+		if m.Name == "" || m.HostPath == "" || existingVolumes[m.Name] {
+			continue
+		}
+
+		hostPathType, ok := parseHostPathType(m.HostPathType)
+		if !ok {
+			slog.Warn("Ignoring unsupported hostPathType in extraHostPathMount",
+				"name", m.Name,
+				"hostPathType", m.HostPathType)
+
+			continue
+		}
+
+		volumes = append(volumes, corev1.Volume{
+			Name: m.Name,
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: m.HostPath,
+				Type: hostPathType,
+			},
+		})
+	}
+
+	return volumes
+}
+
+func parseHostPathType(hostPathType string) (*corev1.HostPathType, bool) {
+	if hostPathType == "" {
+		return nil, true
+	}
+
+	t, ok := supportedHostPathTypes[hostPathType]
+	if !ok {
+		return nil, false
+	}
+
+	return &t, true
+}
+
+// injectGangEnv injects gang-related environment variables for multi-node checks.
+func (i *Injector) injectGangEnv(container *corev1.Container, gangCtx *GangContext) {
+	if gangCtx == nil {
+		return
+	}
+
+	slog.Info("Injecting gang environment variables", "gangID", gangCtx.GangID, "configMap", gangCtx.ConfigMapName)
+
+	envVars := []corev1.EnvVar{
+		{
+			Name:  "GANG_ID",
+			Value: gangCtx.GangID,
+		},
+		{
+			Name:  "GANG_CONFIG_DIR",
+			Value: i.cfg.GangCoordination.ConfigMapMountPath,
+		},
+		{
+			Name:  "GANG_TIMEOUT_SECONDS",
+			Value: strconv.Itoa(int(i.cfg.GangCoordination.TimeoutDuration.Seconds())),
+		},
+		{
+			Name:  "MASTER_PORT",
+			Value: strconv.Itoa(i.cfg.GangCoordination.MasterPort),
+		},
+		{
+			Name: "POD_NAME",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "metadata.name",
+				},
+			},
+		},
+		{
+			Name: "POD_IP",
+			ValueFrom: &corev1.EnvVarSource{
+				FieldRef: &corev1.ObjectFieldSelector{
+					FieldPath: "status.podIP",
+				},
+			},
+		},
+	}
+
+	i.mergeEnvVars(container, envVars)
+}
+
+// mergeEnvVars merges the provided env vars into the container.
+// User-defined env vars (already present in container) take precedence.
+func (i *Injector) mergeEnvVars(container *corev1.Container, envVars []corev1.EnvVar) {
+	existingEnvNames := make(map[string]bool)
+	for _, env := range container.Env {
+		existingEnvNames[env.Name] = true
+	}
+
+	for _, env := range envVars {
+		if !existingEnvNames[env.Name] {
+			container.Env = append(container.Env, env)
+		}
+	}
+}
+
+// collectMatchingEnvVars scans all containers for env vars whose names match
+// any of the configured ncclEnvPatterns. Returns a deduplicated list (first
+// occurrence wins if multiple containers set the same var).
+func (i *Injector) collectMatchingEnvVars(containers []corev1.Container) []corev1.EnvVar {
+	if len(i.cfg.NCCLEnvPatterns) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+
+	var result []corev1.EnvVar
+
+	for _, c := range containers {
+		for _, env := range c.Env {
+			if seen[env.Name] {
+				continue
+			}
+
+			if matchesAnyPattern(env.Name, i.cfg.NCCLEnvPatterns) {
+				result = append(result, env)
+				seen[env.Name] = true
+			}
+		}
+	}
+
+	return result
+}
+
+// collectMatchingVolumeMounts scans all containers for volume mounts whose
+// names match any of the configured volumeMountPatterns. Returns a deduplicated
+// list (first occurrence wins).
+func (i *Injector) collectMatchingVolumeMounts(containers []corev1.Container) []corev1.VolumeMount {
+	if len(i.cfg.VolumeMountPatterns) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+
+	var result []corev1.VolumeMount
+
+	for _, c := range containers {
+		for _, vm := range c.VolumeMounts {
+			if seen[vm.Name] {
+				continue
+			}
+
+			if matchesAnyPattern(vm.Name, i.cfg.VolumeMountPatterns) {
+				result = append(result, vm)
+				seen[vm.Name] = true
+			}
+		}
+	}
+
+	return result
+}
+
+// mergeVolumeMounts adds volume mounts to a container, skipping any whose
+// name or mountPath already exists.
+func (i *Injector) mergeVolumeMounts(container *corev1.Container, mounts []corev1.VolumeMount) {
+	existingNames := make(map[string]bool)
+	existingPaths := make(map[string]bool)
+
+	for _, vm := range container.VolumeMounts {
+		existingNames[vm.Name] = true
+		existingPaths[vm.MountPath] = true
+	}
+
+	for _, vm := range mounts {
+		if !existingNames[vm.Name] && !existingPaths[vm.MountPath] {
+			container.VolumeMounts = append(container.VolumeMounts, vm)
+		}
+	}
+}
+
+// matchesAnyPattern returns true if name matches any of the glob patterns.
+func matchesAnyPattern(name string, patterns []string) bool {
+	for _, pattern := range patterns {
+		if matched, _ := filepath.Match(pattern, name); matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+// boolDefault returns *ptr if non-nil, or def otherwise.
+func boolDefault(ptr *bool, def bool) bool {
+	if ptr != nil {
+		return *ptr
+	}
+
+	return def
+}

@@ -1,0 +1,22 @@
+module github.com/nvidia/nvsentinel/tests/scale-tests/event-generator
+
+go 1.27.3
+
+require (
+	github.com/nvidia/nvsentinel/data-models v0.0.0
+	google.golang.org/grpc v1.85.0
+	google.golang.org/protobuf v1.36.12
+)
+
+require (
+	github.com/yandex/protoc-gen-crd v1.1.0 // indirect
+	golang.org/x/net v0.62.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
+)
+
+// Use local data-models from same repo
+// Pinned to commit ee6c06bb87e28f34dfffe0a999eaf7fb4366eb5b (November 21, 2025)
+// If data-models API changes, update this code and re-pin to new commit
+replace github.com/nvidia/nvsentinel/data-models => ../../../data-models

@@ -1,0 +1,213 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import os
+import signal
+import sys
+from importlib.metadata import version, PackageNotFoundError
+
+from .config import Config
+from .diag import DCGMDiagnostic, DiagnosticStatusError
+from .errors import resolve_recommended_action
+from .health import HealthReporter
+from .logger import setup_logging
+from .protos import health_event_pb2 as pb
+
+
+def get_version() -> str:
+    try:
+        return version("dcgm-diag")
+    except PackageNotFoundError:
+        return "dev"
+
+
+def main() -> None:
+    log_level = os.getenv("LOG_LEVEL", "info")
+    setup_logging("preflight-dcgm-diag", get_version(), log_level)
+    log = logging.getLogger(__name__)
+
+    try:
+        cfg = Config.from_env()
+    except ValueError as e:
+        log.error("Configuration error", extra={"error": str(e)})
+        sys.exit(1)
+
+    log.info(
+        "Starting preflight dcgm-diag check",
+        extra={
+            "diag_level": cfg.diag_level,
+            "processing_strategy": pb.ProcessingStrategy.Name(cfg.processing_strategy),
+            "status_retry_max_attempts": cfg.status_retry_max_attempts,
+            "status_retry_interval_seconds": cfg.status_retry_interval_seconds,
+            "publish_target": cfg.publish.target if cfg.publish else None,
+        },
+    )
+
+    reporter = HealthReporter(
+        socket_path=cfg.connector_socket,
+        node_name=cfg.node_name,
+        processing_strategy=cfg.processing_strategy,
+        token_path=cfg.token_path,
+        publish=cfg.publish,
+    )
+
+    diag = DCGMDiagnostic(
+        hostengine_addr=cfg.hostengine_addr,
+        status_retry_max_attempts=cfg.status_retry_max_attempts,
+        status_retry_interval_seconds=cfg.status_retry_interval_seconds,
+    )
+    _install_shutdown_handlers(diag)
+    store_only = cfg.processing_strategy == pb.ProcessingStrategy.STORE_ONLY
+
+    exit_code = _run_diagnostic(cfg, reporter, diag)
+
+    if exit_code != 0 and store_only:
+        log.warning("Check failed (STORE_ONLY — not blocking pod)")
+        sys.exit(0)
+    sys.exit(exit_code)
+
+
+def _install_shutdown_handlers(diag: DCGMDiagnostic) -> None:
+    log = logging.getLogger(__name__)
+
+    def handle_shutdown(signum, _frame) -> None:
+        signal_name = signal.Signals(signum).name
+        log.warning("Received shutdown signal; stopping DCGM diagnostic", extra={"signal": signal_name})
+        diag.stop_diagnostic()
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
+
+def _run_diagnostic(cfg: Config, reporter: HealthReporter, diag: DCGMDiagnostic) -> int:
+    log = logging.getLogger(__name__)
+
+    try:
+        results = diag.run(cfg.diag_level)
+    except DiagnosticStatusError as e:
+        log.warning(
+            "DCGM diagnostic could not complete due to a DCGM status error",
+            extra={"dcgm_status": e.status_name, "error": str(e)},
+        )
+        try:
+            reporter.send_event(
+                gpu_uuid="",
+                is_healthy=False,
+                is_fatal=False,
+                message=str(e),
+                error_code_name=e.status_name,
+                recommended_action=pb.RecommendedAction.NONE,
+            )
+        except Exception as send_err:  # noqa: BLE001
+            log.error(
+                "Failed to send health event",
+                extra={
+                    "error": str(send_err),
+                    "gpu_uuid": "",
+                    "is_healthy": False,
+                    "is_fatal": False,
+                },
+            )
+        return 0
+    except Exception as e:
+        log.error("DCGM diagnostic failed", extra={"error": str(e)})
+        # is_fatal=True: sets node condition for visibility, even though this may be
+        # an infrastructure issue (DCGM unavailable) rather than a confirmed GPU failure.
+        try:
+            reporter.send_event(gpu_uuid="", is_healthy=False, is_fatal=True, message=str(e))
+        except Exception as send_err:  # noqa: BLE001
+            log.error(
+                "Failed to send health event",
+                extra={
+                    "error": str(send_err),
+                    "gpu_uuid": "",
+                    "is_healthy": False,
+                    "is_fatal": True,
+                },
+            )
+        return 1
+
+    failures = [r for r in results if r.status == "fail"]
+    warnings = [r for r in results if r.status == "warn"]
+    passes = [r for r in results if r.status == "pass"]
+
+    log.info(
+        "Diagnostic summary",
+        extra={
+            "passed": len(passes),
+            "failed": len(failures),
+            "warned": len(warnings),
+            "skipped": len(results) - len(passes) - len(failures) - len(warnings),
+            "total": len(results),
+        },
+    )
+
+    # Send one event per test result with specific test name
+    has_fatal_failure = False
+    for r in results:
+        if r.status not in ("pass", "warn", "fail"):
+            continue
+
+        is_pass = r.status == "pass"
+        error_code = r.error_code if not is_pass else 0
+        recommended_action = resolve_recommended_action(is_pass, error_code)
+
+        # A failure is fatal only when it has an actionable remediation; failures with
+        # recommended action NONE (e.g. DCGM_FR_XID_ERROR) are reported but do not block.
+        is_fatal = r.status == "fail" and recommended_action != pb.RecommendedAction.NONE
+        has_fatal_failure = has_fatal_failure or is_fatal
+
+        message = "Test passed" if is_pass else r.error_message
+
+        log.log(
+            logging.INFO if is_pass else (logging.ERROR if is_fatal else logging.WARNING),
+            f"Test {r.status}",
+            extra={"gpu": r.gpu_uuid, "test": r.test_name, "error_code": r.error_code, "detail": message},
+        )
+        try:
+            reporter.send_event(
+                gpu_uuid=r.gpu_uuid,
+                is_healthy=is_pass,
+                is_fatal=is_fatal,
+                message=message,
+                error_code=error_code,
+                test_name=r.test_name,
+            )
+        except Exception as send_err:  # noqa: BLE001
+            log.error(
+                "Failed to send health event",
+                extra={
+                    "error": str(send_err),
+                    "gpu_uuid": r.gpu_uuid,
+                    "test": r.test_name,
+                    "is_healthy": is_pass,
+                    "is_fatal": is_fatal,
+                },
+            )
+
+    if has_fatal_failure:
+        log.error("DCGM diagnostic check failed")
+        return 1
+
+    if failures:
+        log.warning("DCGM diagnostic reported non-fatal failures (no actionable remediation)")
+
+    log.info("DCGM diagnostic check passed")
+    return 0
+
+
+if __name__ == "__main__":
+    main()

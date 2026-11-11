@@ -1,0 +1,2076 @@
+// Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// nolint:wsl,gocognit,cyclop,gocyclo,nestif // Business logic migrated from old code
+package controller
+
+import (
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"maps"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+
+	"log/slog"
+
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/validation"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/distributedlock"
+	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
+	"github.com/nvidia/nvsentinel/janitor/api/v1alpha1"
+	"github.com/nvidia/nvsentinel/janitor/pkg/config"
+	"github.com/nvidia/nvsentinel/janitor/pkg/gpuservices"
+	"github.com/nvidia/nvsentinel/janitor/pkg/metrics"
+)
+
+const (
+	// gpuResetFinalizer is the name of the finalizer added to GPUReset objects.
+	gpuResetFinalizer = "janitor.dgxc.nvidia.com/finalizer"
+	// jobOwnerKey is used to index Jobs by their owner (the GPUReset resource).
+	jobOwnerKey = "metadata.controller"
+	// gpuResetsEnvVar is the name of the environment variable set in the GPU reset Job
+	// containing a comma-separated list of GPU UUIDs and/or PCI Bus IDs to reset.
+	gpuResetsEnvVar = "NVIDIA_GPU_RESETS"
+	// jobNameSuffix is the static string appended to the GPUReset name to form the Job's name.
+	jobNameSuffix = "-reset-job"
+	// podNameSuffixLength is the 6-character suffix (e.g., "-abc12") added by K8s to a Job's name to create its Pods.
+	podNameSuffixLength = 6
+	// maxJobNameBaseLength calculates the maximum allowed length for the base name (derived from the GPUReset name)
+	// to ensure the final name for Pods created by the Job does not exceed the 63-character limit.
+	maxJobNameBaseLength = validation.DNS1123LabelMaxLength - len(jobNameSuffix) - 1 - 8 - podNameSuffixLength
+)
+
+// checkPodsTerminatedFn is a function signature used for checking if managed service pods have terminated.
+type checkPodsTerminatedFn func(ctx context.Context, nodeName string, apps []gpuservices.AppSpec) (bool, error)
+
+// checkPodsReadyFn is a function signature used for checking if managed service pods are ready after restoration.
+type checkPodsReadyFn func(ctx context.Context, nodeName string, apps []gpuservices.AppSpec) (bool, error)
+
+// runningAppsFn is a function signature used for finding the managed services that have a pod on a node.
+type runningAppsFn func(
+	ctx context.Context, nodeName string, apps []gpuservices.AppSpec,
+) ([]gpuservices.AppSpec, error)
+
+// GPUResetReconciler reconciles a GPUReset object
+type GPUResetReconciler struct {
+	client.Client
+	// APIReader reads from the API server without the cache. The GPU client pods can be in any namespace, and the
+	// pod cache holds only the pods of the service manager namespace.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
+	// FieldIndexer enables client-side field indexing, allowing for  mocking in tests.
+	FieldIndexer client.FieldIndexer
+	// Config holds controller-specific configuration.
+	Config *config.GPUResetControllerConfig
+	// serviceManager is the configuration for the managed GPU services that should be torn down and restored during
+	// the reset workflow.
+	serviceManager gpuservices.Manager
+	// checkPodsTerminatedFn is a function pointer for checking pod termination status, allowing for mocking in tests.
+	checkPodsTerminatedFn checkPodsTerminatedFn
+	// checkPodsReadyFn is a function pointer for checking pod readiness status, allowing for mocking in tests.
+	checkPodsReadyFn checkPodsReadyFn
+	// runningAppsFn is a function pointer for finding the managed services that run on a node, allowing for mocking
+	// in tests.
+	runningAppsFn runningAppsFn
+	// NodeLock provides node-level locking across Janitor controllers
+	NodeLock      distributedlock.NodeLock
+	LockNamespace string
+	// resetSessionSpans holds one long-lived "reset_session" span per CR, keyed by CR name.
+	// Started on the first reconcile, ended on completion/failure/deletion.
+	resetSessionSpans sync.Map
+}
+
+// +kubebuilder:rbac:groups=janitor.dgxc.nvidia.com,resources=gpuresets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=janitor.dgxc.nvidia.com,resources=gpuresets/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=janitor.dgxc.nvidia.com,resources=gpuresets/finalizers,verbs=update
+
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get
+// +kubebuilder:rbac:groups="coordination.k8s.io",resources=leases,verbs=get;list;watch;create;delete
+
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;delete;patch
+
+func (r *GPUResetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var gpuReset v1alpha1.GPUReset
+	if err := r.Get(ctx, req.NamespacedName, &gpuReset); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, fmt.Errorf("failed to get GPUReset %s: %w", req.NamespacedName, err)
+	}
+
+	crKey := gpuReset.Name
+	annotations := gpuReset.GetAnnotations()
+	traceID := annotations[tracing.TraceIDAnnotationKey]
+	spanID := annotations[tracing.SpanIDAnnotationKey]
+
+	reconcileDelete := !gpuReset.DeletionTimestamp.IsZero()
+	completedReconciling := gpuReset.Status.CompletionTime != nil
+	// A reset that failed after stopping services still owes the node its labels: only the janitor writes them
+	// back. Keep the lock and the restoration going until they are written; held labels are waited on, never
+	// overwritten.
+	restorePending := restorationPending(&gpuReset)
+
+	if !completedReconciling || reconcileDelete || restorePending {
+		// Start or retrieve the long-lived session span that covers the entire GPU reset lifecycle.
+		// Per-reconcile spans are created as children of this session span.
+		sessionCtx, _ := r.startResetSessionIfNeeded(ctx, crKey, traceID, spanID)
+
+		ctx, span := tracing.StartSpan(sessionCtx, "janitor.gpureset.reconcile")
+		defer span.End()
+
+		locked := r.NodeLock.LockNode(ctx, &gpuReset, gpuReset.Spec.NodeName)
+		if !locked {
+			if !reconcileDelete {
+				holder, active, err := activeSameKindHolder(
+					ctx, r.Client, r.NodeLock, gpuReset.Spec.NodeName, "GPUReset",
+				)
+				if err != nil {
+					slog.WarnContext(ctx, "Unable to inspect node lock holder; will retry",
+						"node", gpuReset.Spec.NodeName, "error", err)
+				} else if active {
+					holderGPUReset, ok := holder.(*v1alpha1.GPUReset)
+					if ok && gpuUUIDsOverlap(gpuReset.Spec.Selector, holderGPUReset.Spec.Selector) {
+						return r.reconcileTerminalFailure(
+							ctx,
+							&gpuReset,
+							v1alpha1.ReasonGPUAlreadyUnderMaintenance,
+							fmt.Sprintf("GPUReset/%s is active for this node", holderGPUReset.Name),
+						)
+					}
+				}
+			}
+
+			return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+		}
+
+		// We need to lock the current node because reconcileDelete executes FinalizerRestoringServices which can conflict
+		// with TearingDownServices from active GPUResets which currently have the node lock.
+		// Note that the current CR will be removed after reconcileDelete removes the finalizer, and we'll exit above
+		// with a no-op when the GPUReset is not found. We do not need to explicitly call CheckUnlock because
+		// garbage collection will ensure that the lease lock is deleted. This also prevents us from needing to handle
+		// failures related to CheckUnlock failing when the current GPUReset is removed from API.
+		if reconcileDelete {
+			result, err := r.reconcileDelete(ctx, &gpuReset)
+			if err == nil && result.RequeueAfter == 0 {
+				r.endResetSession(crKey)
+			}
+
+			return result, err
+		}
+
+		var (
+			result ctrl.Result
+			err    error
+		)
+
+		if completedReconciling {
+			result, err = r.restoreServices(ctx, &gpuReset)
+		} else {
+			result, err = r.reconcileHelper(ctx, &gpuReset)
+		}
+		// We will always re-queue the object and check if Unlock is needed on the next reconcile rather than
+		// re-fetch the object or require reconcileHelper to specify it completed reconciling. If the controller
+		// forces a re-queue by returning an error or setting a RequeueAfter, we will respect that re-queue behavior,
+		// else we will manually set RequeueAfter. As a result, if the controller doesn't force a re-queue or forces
+		// a re-queue by setting Requeue, we will set RequeueAfter. Setting Requeue to true is deprecated
+		// and can lead to long reconcile times so we will enforce that RequeueAfter is used.
+		if err != nil || result.RequeueAfter > 0 {
+			return result, err
+		}
+
+		return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+	}
+
+	// Defensive cleanup: if reconciling completed but the session span was not ended,
+	// end it now (e.g. completion was set but session wasn't cleaned up).
+	r.endResetSession(crKey)
+
+	retryUnlock := r.NodeLock.CheckUnlock(ctx, &gpuReset, gpuReset.Spec.NodeName)
+	if retryUnlock {
+		return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// startResetSessionIfNeeded creates or retrieves the long-lived "janitor.gpureset.reset_session" span
+// for a given GPUReset CR. On the first call it creates the span and stores it; subsequent calls
+// return the existing span. The returned context carries the session span as the active span
+// so that child spans (per-reconcile) are nested under it.
+func (r *GPUResetReconciler) startResetSessionIfNeeded(ctx context.Context,
+	crKey, traceID, spanID string,
+) (context.Context, trace.Span) {
+	if existing, ok := r.resetSessionSpans.Load(crKey); ok {
+		span := existing.(trace.Span) //nolint:errcheck,forcetypeassert // value is always trace.Span
+		return trace.ContextWithSpan(ctx, span), span
+	}
+
+	_, span := tracing.StartSpanWithLinkFromTraceContext(ctx, traceID, spanID, "janitor.gpureset.reset_session")
+
+	r.resetSessionSpans.Store(crKey, span)
+
+	return trace.ContextWithSpan(ctx, span), span
+}
+
+// endResetSession ends the long-lived session span for a GPUReset CR and sets final outcome attributes.
+func (r *GPUResetReconciler) endResetSession(crKey string) {
+	val, ok := r.resetSessionSpans.LoadAndDelete(crKey)
+	if !ok {
+		return
+	}
+
+	span, _ := val.(trace.Span) //nolint:errcheck,forcetypeassert // value is always trace.Span
+	if span == nil {
+		return
+	}
+
+	span.End()
+}
+
+func (r *GPUResetReconciler) reconcileHelper(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	if len(gr.Status.Conditions) == 0 {
+		return r.initialize(ctx, gr)
+	}
+
+	if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.Ready)) {
+		return r.isReady(ctx, gr)
+	}
+
+	if recorded, err := r.ensureManagedServicesRecord(ctx, gr); err != nil {
+		return ctrl.Result{}, err
+	} else if recorded {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ServicesTornDown)) {
+		return r.tearDownServices(ctx, gr)
+	}
+
+	if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ResetJobCreated)) {
+		return r.createJob(ctx, gr)
+	}
+
+	if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ResetJobCompleted)) {
+		return r.checkJobStatus(ctx, gr)
+	}
+
+	if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ServicesRestored)) {
+		return r.restoreServices(ctx, gr)
+	}
+
+	return r.reconcileCompletion(ctx, gr)
+}
+
+// SetupWithManager sets up the controller with the Manager. It configures watches
+// for GPUResets and owned Jobs, and adds field indexers for efficient lookups
+// of GPUResets by node name and Jobs by their controlling owner.
+func (r *GPUResetReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if !r.Config.Enabled {
+		slog.Info("GPUReset controller is disabled; skipping registration")
+
+		return nil
+	}
+
+	gpuServiceManager, err := gpuservices.NewManager(r.Config.ServiceManager.Name, r.Config.ServiceManager.Spec)
+	if err != nil {
+		return fmt.Errorf("failed to construct GPU service manager: %w", err)
+	}
+
+	// The teardown also stops the GPU client pods outside the service manager. It changes the GPU clients node
+	// label only on a node where the label is "true" and a GPU client pod runs.
+	r.serviceManager = gpuservices.WithGPUClients(gpuServiceManager)
+
+	if r.Config.ResolvedJobTemplate == nil {
+		return fmt.Errorf("failed to get valid reset job template")
+	}
+
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+	// Assign the manager's field indexer, which can be overridden in tests.
+	r.FieldIndexer = mgr.GetFieldIndexer()
+	// Set concrete implementations for checking pod status, which can be overridden in tests.
+	r.checkPodsTerminatedFn = r.checkPodsTerminated
+	r.checkPodsReadyFn = r.checkPodsReady
+	r.runningAppsFn = r.runningApps
+
+	// Initialize NodeLock for distributed locking across maintenance operations
+	r.NodeLock = distributedlock.NewNodeLock(
+		mgr.GetClient(), mgr.GetScheme(), r.LockNamespace, metrics.JanitorLockMetrics{},
+	)
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&v1alpha1.GPUReset{}).
+		// Trigger a reconciliation for the owning GPUReset resource whenever a Job owned by a GPUReset resource
+		// changes state.
+		Owns(&batchv1.Job{}).
+		Named("gpureset").
+		Complete(r)
+}
+
+// initialize prepares a new GPUReset resource for reconciliation. It adds the finalizer,
+// records the start time, and sets the initial 'Ready' condition to Pending.
+//
+// It also increments the total requests metric.
+func (r *GPUResetReconciler) initialize(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	isNewRequest := gr.Status.StartTime == nil
+	updatedGR := gr.DeepCopy()
+
+	if !controllerutil.ContainsFinalizer(updatedGR, gpuResetFinalizer) {
+		controllerutil.AddFinalizer(updatedGR, gpuResetFinalizer)
+
+		if err := r.Update(ctx, updatedGR); err != nil {
+			span := tracing.SpanFromContext(ctx)
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "add_finalizer_failed"),
+				attribute.String("janitor.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to add finalizer to %s: %w", gr.Name, err)
+		}
+	}
+
+	if isNewRequest {
+		now := metav1.Now()
+		updatedGR.Status.StartTime = &now
+	}
+
+	if meta.FindStatusCondition(updatedGR.Status.Conditions, string(v1alpha1.Ready)) == nil {
+		updatedGR.Status.Phase = v1alpha1.ResetPending
+		pendingCond := NewCondition(v1alpha1.Ready, metav1.ConditionFalse, v1alpha1.ReasonResetPending,
+			"GPU reset pending")
+		meta.SetStatusCondition(&updatedGR.Status.Conditions, pendingCond)
+	}
+
+	if err := r.updateStatus(ctx, gr, updatedGR.Status); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to initialize status for GPUReset %s: %w", gr.Name, err)
+	}
+
+	if isNewRequest {
+		metrics.GPUResetRequestsTotal.WithLabelValues(gr.Spec.NodeName).Inc()
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// reconcileDelete handles the finalization logic for a GPUReset resource,
+// ensuring managed services are restored before the resource is fully deleted.
+func (r *GPUResetReconciler) reconcileDelete(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "janitor.gpureset.reconcileDelete")
+	defer span.End()
+
+	nodeName := gr.Spec.NodeName
+	managerName := r.serviceManager.Name
+
+	if controllerutil.ContainsFinalizer(gr, gpuResetFinalizer) {
+		if recorded, err := r.ensureManagedServicesRecord(ctx, gr); err != nil {
+			return ctrl.Result{}, err
+		} else if recorded {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+
+		if running, err := r.resetJobRunning(ctx, gr); err != nil {
+			return ctrl.Result{}, err
+		} else if running {
+			log.V(1).Info("Waiting for the reset job to finish before restoring managed services", "job",
+				gr.Status.JobRef.Name, "namespace", gr.Status.JobRef.Namespace, "node", nodeName)
+
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+
+		if len(r.managedApps(ctx, gr)) == 0 {
+			log.V(1).Info("No managed services were stopped, skipping service restoration", "manager",
+				managerName, "node", nodeName)
+			controllerutil.RemoveFinalizer(gr, gpuResetFinalizer)
+
+			if err := r.Update(ctx, gr); err != nil {
+				span.SetAttributes(
+					attribute.String("janitor.error.type", "finalizer_removal_failed"),
+					attribute.String("janitor.error.message", err.Error()),
+				)
+				tracing.RecordError(span, err)
+
+				return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from %s: %w", gr.Name, err)
+			}
+
+			return ctrl.Result{}, nil
+		}
+
+		if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.Terminating)) {
+			log.Info("Running finalizer to restore managed services before deletion", "manager", managerName, "node",
+				nodeName)
+
+			if err := r.updateCondition(ctx, gr, v1alpha1.Terminating, metav1.ConditionTrue,
+				v1alpha1.ReasonFinalizerRestoringServices, "Restoring managed services before deletion"); err != nil {
+				span.SetAttributes(
+					attribute.String("janitor.error.type", "terminating_condition_update_failed"),
+					attribute.String("janitor.error.message", err.Error()),
+				)
+				tracing.RecordError(span, err)
+
+				return ctrl.Result{}, err
+			}
+
+			// The status write above leaves gr stale; the finalizer removal below updates the object, so let the
+			// next reconcile continue from a fresh read.
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+
+		if res, err := r.restoreServices(ctx, gr); err != nil || res.RequeueAfter > 0 {
+			log.V(1).Info("Waiting for managed service restoration to complete before removing finalizer", "manager",
+				managerName, "node", nodeName)
+
+			if err != nil {
+				span.SetAttributes(
+					attribute.String("janitor.error.type", "finalizer_service_restore_failed"),
+					attribute.String("janitor.error.message", err.Error()),
+				)
+				tracing.RecordError(span, err)
+			}
+
+			return res, err
+		}
+
+		log.Info("Managed service restoration complete, removing finalizer", "manager", managerName, "node", nodeName)
+		controllerutil.RemoveFinalizer(gr, gpuResetFinalizer)
+
+		if err := r.Update(ctx, gr); err != nil {
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "finalizer_removal_failed"),
+				attribute.String("janitor.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to remove finalizer from %s: %w", gr.Name, err)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// resetJobRunning reports whether the reset Job referenced by the GPUReset status is still running. Restoring the
+// managed services while `nvidia-smi --gpu-reset` is in flight would re-attach DCGM (and the DRA kubelet plugin) to
+// GPUs under reset, so deletion waits for the Job. Killing the Job would not help: the function-level reset runs in
+// the driver and does not stop with the pod. The wait is bounded by the GPUReset timeout for templates without an
+// activeDeadlineSeconds; after that the restoration proceeds and the overlap is logged.
+func (r *GPUResetReconciler) resetJobRunning(ctx context.Context, gr *v1alpha1.GPUReset) (bool, error) {
+	if gr.Status.JobRef == nil || meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ResetJobCompleted)) {
+		return false, nil
+	}
+
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: gr.Status.JobRef.Namespace, Name: gr.Status.JobRef.Name},
+		job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("failed to get Job %s/%s: %w", gr.Status.JobRef.Namespace, gr.Status.JobRef.Name, err)
+	}
+
+	if job.Status.Succeeded > 0 || jobConditionTrue(job, batchv1.JobComplete) || jobConditionTrue(job, batchv1.JobFailed) {
+		return false, nil
+	}
+
+	if gr.Status.StartTime != nil && time.Since(gr.Status.StartTime.Time) > r.Config.Timeout {
+		log.FromContext(ctx).Error(nil, "Reset job still running past the GPUReset timeout; restoring managed "+
+			"services anyway", "job", job.Name, "namespace", job.Namespace, "timeout", r.Config.Timeout)
+
+		return false, nil
+	}
+
+	return true, nil
+}
+
+// jobConditionTrue reports whether the Job carries the given condition. Pod counts are not terminal: a failed Pod is
+// retried until backoffLimit, and the Failed condition is set only once every Pod of the Job has stopped.
+func jobConditionTrue(job *batchv1.Job, condType batchv1.JobConditionType) bool {
+	for _, cond := range job.Status.Conditions {
+		if cond.Type == condType && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isReady records that the GPUReset may proceed after the reconciler has
+// acquired the node-level lease.
+func (r *GPUResetReconciler) isReady(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	nodeName := gr.Spec.NodeName
+
+	if err := r.updateCondition(ctx, gr, v1alpha1.Ready, metav1.ConditionTrue, v1alpha1.ReasonReadyForReset,
+		"Node ready for GPU reset"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update GPUReset %s: %w", gr.Name, err)
+	}
+	// update metrics: enforce the absolute state (Active=1)
+	metrics.GPUResetActiveRequests.WithLabelValues(nodeName).Set(1.0)
+
+	return ctrl.Result{}, nil
+}
+
+// tearDownServices disables the managed services. It disables them by setting node labels
+// to their disabled state and waits for the associated pods to terminate before proceeding.
+func (r *GPUResetReconciler) tearDownServices(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "janitor.gpureset.tearDownServices")
+	defer span.End()
+
+	managerName := r.serviceManager.Name
+
+	if len(r.serviceManager.Spec.Apps) == 0 {
+		log.V(1).Info("GPU services manager has no apps specified, skipping service teardown", "manager", managerName,
+			"node", gr.Spec.NodeName)
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesTornDown, metav1.ConditionTrue, v1alpha1.ReasonSkipped,
+			"No services manager configured, or has no managed services specified"); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	currentCond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ServicesTornDown))
+	if currentCond == nil {
+		return r.startTearDown(ctx, gr)
+	}
+
+	teardownTimeout := r.serviceManager.Spec.TeardownTimeout
+
+	timeSinceInProgress := 0 * time.Minute
+	if currentCond.Reason == string(v1alpha1.ReasonTearingDownServices) {
+		timeSinceInProgress = time.Since(currentCond.LastTransitionTime.Time)
+	}
+
+	if timeSinceInProgress > teardownTimeout {
+		log.Error(nil, "Managed service teardown timeout exceeded", "manager", managerName, "timeout", teardownTimeout)
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "teardown_timeout"),
+			attribute.String("janitor.error.message", fmt.Sprintf("teardown timeout %v exceeded", teardownTimeout)),
+		)
+		tracing.RecordError(span, errors.New("teardown timeout exceeded"))
+
+		return r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonServiceTeardownTimeoutExceeded,
+			fmt.Sprintf("Failed to teardown %s managed services within the timeout period", managerName))
+	}
+
+	node, err := r.getNode(ctx, gr.Spec.NodeName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "node_not_found"),
+				attribute.String("janitor.error.message", "target node for GPU reset was not found"),
+			)
+			tracing.RecordError(span, err)
+
+			return r.reconcileTerminalFailure(ctx, gr, v1alpha1.NodeNotFound, "Target node for GPU reset was not found")
+		}
+
+		// Likely transient, errors during node retrieval
+		log.V(1).Info("Failed to get node for service teardown", "node", gr.Spec.NodeName)
+
+		return ctrl.Result{}, fmt.Errorf("failed to get node %s for service teardown: %w", gr.Spec.NodeName, err)
+	}
+
+	nodeToUpdate := node.DeepCopy()
+	nodeUpdated := false
+
+	apps := r.managedApps(ctx, gr)
+
+	// The teardown timeout above bounds this wait.
+	if held := heldLabels(apps, node.Labels); len(held) > 0 {
+		log.Info("Waiting for node labels held by another controller before disabling managed services",
+			"node", node.Name, "manager", managerName, "nodeLabels", held, "recheck_after", 3*time.Second)
+
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	// Set node labels to disable managed services
+	for _, app := range apps {
+		if value, exists := nodeToUpdate.Labels[app.NodeLabel]; !exists || value != app.DisabledValue {
+			log.V(1).Info("Setting node label to disable managed services", "node", node.Name, "manager", managerName,
+				"label", app.NodeLabel, "value", app.DisabledValue)
+
+			if nodeToUpdate.Labels == nil {
+				nodeToUpdate.Labels = make(map[string]string)
+			}
+
+			nodeToUpdate.Labels[app.NodeLabel] = app.DisabledValue
+			nodeUpdated = true
+		}
+	}
+
+	if nodeUpdated {
+		// The optimistic lock makes the patch fail if the node changed after the held-label check above, so a
+		// label another controller took in the meantime is never overwritten. The next reconcile re-reads the node.
+		patch := client.MergeFromWithOptions(node, client.MergeFromWithOptimisticLock{})
+		if err := r.Patch(ctx, nodeToUpdate, patch); err != nil {
+			if apierrors.IsConflict(err) {
+				log.Info("Node changed since it was read, retrying", "node", node.Name)
+
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "node_update_failed"),
+				attribute.String("janitor.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to patch node %s to disable %s managed services: %w",
+				node.Name, managerName, err)
+		}
+
+		log.Info("Managed services disabled", "node", node.Name, "manager", managerName)
+
+		return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+	}
+
+	// Wait for pods to terminate
+	podsAreGone, err := r.checkPodsTerminatedFn(ctx, gr.Spec.NodeName, apps)
+	if err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "pod_termination_check_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to check pod termination status for node %s: %w",
+			gr.Spec.NodeName, err)
+	}
+
+	if !podsAreGone {
+		log.V(1).Info("Waiting for managed service pods to be terminated", "node", gr.Spec.NodeName, "manager",
+			managerName, "recheck_after", 3*time.Second)
+
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	if currentCond.Status != metav1.ConditionTrue {
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesTornDown, metav1.ConditionTrue,
+			v1alpha1.ReasonServiceTeardownSucceeded, fmt.Sprintf("%s managed services have been removed",
+				managerName)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	log.Info("Teardown of managed service pods complete", "node", gr.Spec.NodeName, "manager", managerName)
+
+	return ctrl.Result{}, nil
+}
+
+// startTearDown finds the managed services that have a pod on the node and records them in the status, in the
+// same status update that starts the teardown. Only these services are stopped and later restored. The node labels
+// of other services do not change. When no managed service pod runs on the node, the teardown is skipped.
+func (r *GPUResetReconciler) startTearDown(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+	managerName := r.serviceManager.Name
+
+	grWithServices := gr.DeepCopy()
+
+	if grWithServices.Status.ManagedServices == nil {
+		// A missing node has no pods. Check the node first, so that the reset fails instead of skipping the teardown.
+		node, err := r.getNode(ctx, gr.Spec.NodeName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.reconcileTerminalFailure(ctx, gr, v1alpha1.NodeNotFound,
+					"Target node for GPU reset was not found")
+			}
+
+			return ctrl.Result{}, fmt.Errorf("failed to get node %s for service teardown: %w", gr.Spec.NodeName, err)
+		}
+
+		running, err := r.runningAppsFn(ctx, gr.Spec.NodeName, teardownCandidates(r.serviceManager.Spec.Apps, node.Labels))
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to find %s managed services on node %s: %w",
+				managerName, gr.Spec.NodeName, err)
+		}
+
+		if res, wait, err := r.waitForHeldLabels(ctx, gr, node.Labels, "the teardown",
+			v1alpha1.ReasonServiceTeardownTimeoutExceeded); wait {
+			return res, err
+		}
+
+		nodeLabels := make([]string, 0, len(running))
+		for _, app := range running {
+			nodeLabels = append(nodeLabels, app.NodeLabel)
+		}
+
+		grWithServices.Status.ManagedServices = &v1alpha1.ManagedServicesStatus{NodeLabels: nodeLabels}
+
+		log.Info("Found managed services on node", "node", gr.Spec.NodeName, "manager", managerName,
+			"nodeLabels", nodeLabels)
+	}
+
+	if len(r.managedApps(ctx, grWithServices)) == 0 {
+		return ctrl.Result{}, r.updateCondition(ctx, grWithServices, v1alpha1.ServicesTornDown, metav1.ConditionTrue,
+			v1alpha1.ReasonSkipped, "No managed service pods run on the node")
+	}
+
+	return ctrl.Result{}, r.updateCondition(ctx, grWithServices, v1alpha1.ServicesTornDown, metav1.ConditionFalse,
+		v1alpha1.ReasonTearingDownServices, fmt.Sprintf("Removing %s managed services", managerName))
+}
+
+// teardownCandidates returns the apps that the teardown can stop on the node. The GPU clients are a candidate only
+// when their node label holds the enabled value. GPU Operator versions before 26.7, and GPUCluster mode, do not set
+// the label. The restore sets a stopped app's label to the enabled value, so it must not stop the GPU clients when
+// the label is absent: it would add a label that was not there. A label that holds the disabled value has no client
+// pods to stop.
+func teardownCandidates(apps []gpuservices.AppSpec, nodeLabels map[string]string) []gpuservices.AppSpec {
+	candidates := make([]gpuservices.AppSpec, 0, len(apps))
+
+	for _, app := range apps {
+		if app.IsGPUClients() && nodeLabels[app.NodeLabel] != app.EnabledValue {
+			continue
+		}
+
+		candidates = append(candidates, app)
+	}
+
+	return candidates
+}
+
+// withoutGPUClients returns the apps without the GPU clients.
+func withoutGPUClients(apps []gpuservices.AppSpec) []gpuservices.AppSpec {
+	operands := make([]gpuservices.AppSpec, 0, len(apps))
+
+	for _, app := range apps {
+		if !app.IsGPUClients() {
+			operands = append(operands, app)
+		}
+	}
+
+	return operands
+}
+
+// managedApps returns the managed services that the controller stops and restores for the GPUReset: the ones
+// recorded in the status when the teardown started. The record is authoritative for the rest of the reset. A
+// GPUReset without a record has stopped nothing yet; ensureManagedServicesRecord fills in the record for a
+// GPUReset torn down by a janitor version that kept none before any of this function's callers run.
+func (r *GPUResetReconciler) managedApps(ctx context.Context, gr *v1alpha1.GPUReset) []gpuservices.AppSpec {
+	if gr.Status.ManagedServices == nil {
+		return nil
+	}
+
+	configured := r.serviceManager.Spec.Apps
+	recorded := sets.New(gr.Status.ManagedServices.NodeLabels...)
+	apps := make([]gpuservices.AppSpec, 0, recorded.Len())
+
+	for _, app := range configured {
+		if recorded.Has(app.NodeLabel) {
+			apps = append(apps, app)
+			recorded.Delete(app.NodeLabel)
+		}
+	}
+
+	if recorded.Len() > 0 {
+		slog.WarnContext(ctx, "GPUReset records managed services that are not configured; ignoring them",
+			"gpureset", gr.Name, "node", gr.Spec.NodeName, "nodeLabels", sets.List(recorded))
+	}
+
+	return apps
+}
+
+// waitForHeldLabels requeues while any configured operand label is held by another controller, bounded by the
+// GPUReset timeout. Every configured operand is checked, not only the ones with a pod on the node: a driver upgrade
+// holds the labels of all operands and removes their pods, and the reset must not run against a driver that is
+// being reloaded. wait is true when the caller must return res and err.
+func (r *GPUResetReconciler) waitForHeldLabels(
+	ctx context.Context,
+	gr *v1alpha1.GPUReset,
+	nodeLabels map[string]string,
+	step string,
+	reason v1alpha1.GPUResetReason,
+) (ctrl.Result, bool, error) {
+	log := log.FromContext(ctx)
+
+	held := heldLabels(r.serviceManager.Spec.Apps, nodeLabels)
+	if len(held) == 0 {
+		return ctrl.Result{}, false, nil
+	}
+
+	if gr.Status.StartTime != nil && time.Since(gr.Status.StartTime.Time) > r.Config.Timeout {
+		res, err := r.reconcileTerminalFailure(ctx, gr, reason,
+			fmt.Sprintf("Node labels %v stayed held by another controller for the GPUReset timeout", held))
+
+		return res, true, err
+	}
+
+	log.Info("Waiting for node labels held by another controller before "+step, "node",
+		gr.Spec.NodeName, "manager", r.serviceManager.Name, "nodeLabels", held, "recheck_after", 3*time.Second)
+
+	return ctrl.Result{RequeueAfter: 3 * time.Second}, true, nil
+}
+
+// restorationPending reports whether managed services were stopped and their restoration has not ended: the
+// record holds labels and the ServicesRestored condition is absent or still in progress.
+func restorationPending(gr *v1alpha1.GPUReset) bool {
+	if gr.Status.ManagedServices == nil || len(gr.Status.ManagedServices.NodeLabels) == 0 {
+		return false
+	}
+
+	cond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ServicesRestored))
+
+	return cond == nil || (cond.Status != metav1.ConditionTrue && cond.Reason == string(v1alpha1.ReasonRestoringServices))
+}
+
+// heldLabels returns the node labels of the apps that hold a value the janitor does not own: neither the enabled
+// nor the disabled value. The GPU Operator upgrade controller sets paused-for-driver-upgrade on them during a driver
+// upgrade. An absent label is not held.
+func heldLabels(apps []gpuservices.AppSpec, nodeLabels map[string]string) []string {
+	var held []string
+
+	for _, app := range apps {
+		if value, ok := nodeLabels[app.NodeLabel]; ok && value != app.EnabledValue && value != app.DisabledValue {
+			held = append(held, app.NodeLabel)
+		}
+	}
+
+	return held
+}
+
+// ensureManagedServicesRecord gives a GPUReset that a janitor version without the record tore down the record it
+// is missing, once, so that every later step works from a stable set exactly like a GPUReset started by this
+// version. It returns true when it wrote the record; the caller requeues and lets the next reconcile proceed.
+//
+// The set is taken from the node at the moment this version first sees the GPUReset. If the teardown has not
+// finished yet (the older janitor set the condition but may not have patched the node), the operand pods are
+// still there and the normal pod-based detection applies. If the teardown has finished, the pods are gone and
+// the node labels are the evidence: every configured service whose label holds its disabled value was stopped.
+// Reading the labels on every pass instead would not be stable, because the restore flips them back.
+func (r *GPUResetReconciler) ensureManagedServicesRecord(ctx context.Context, gr *v1alpha1.GPUReset) (bool, error) {
+	if gr.Status.ManagedServices != nil {
+		return false, nil
+	}
+
+	tornDown := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ServicesTornDown))
+	if tornDown == nil {
+		return false, nil
+	}
+
+	log := log.FromContext(ctx)
+	// A janitor version without the record did not stop the GPU clients.
+	configured := withoutGPUClients(r.serviceManager.Spec.Apps)
+	nodeLabels := make([]string, 0, len(configured))
+
+	node, err := r.getNode(ctx, gr.Spec.NodeName)
+
+	switch {
+	case apierrors.IsNotFound(err):
+		// Node is gone: nothing can be restored on it, record an empty set.
+	case err != nil:
+		return false, fmt.Errorf("failed to get node %s to record its managed services: %w", gr.Spec.NodeName, err)
+	case tornDown.Status != metav1.ConditionTrue:
+		running, err := r.runningAppsFn(ctx, gr.Spec.NodeName, configured)
+		if err != nil {
+			return false, fmt.Errorf("failed to find %s managed services on node %s: %w",
+				r.serviceManager.Name, gr.Spec.NodeName, err)
+		}
+
+		for _, app := range running {
+			nodeLabels = append(nodeLabels, app.NodeLabel)
+		}
+	default:
+		for _, app := range configured {
+			if value, ok := node.Labels[app.NodeLabel]; ok && value == app.DisabledValue {
+				nodeLabels = append(nodeLabels, app.NodeLabel)
+			}
+		}
+	}
+
+	updatedGR := gr.DeepCopy()
+	updatedGR.Status.ManagedServices = &v1alpha1.ManagedServicesStatus{NodeLabels: nodeLabels}
+
+	if err := r.updateStatus(ctx, gr, updatedGR.Status); err != nil {
+		return false, fmt.Errorf("failed to record managed services for GPUReset %s: %w", gr.Name, err)
+	}
+
+	log.Info("Recorded the managed services of a GPUReset that was torn down without a record",
+		"node", gr.Spec.NodeName, "manager", r.serviceManager.Name, "nodeLabels", nodeLabels)
+
+	return true, nil
+}
+
+// createJob ensures the GPU reset Job is claimed in the status. It first sets
+// the .Status.JobRef field. On subsequent reconciles, it delegates to
+// getOrCreateJob to ensure the Job resource exists.
+func (r *GPUResetReconciler) createJob(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "create_job")
+	defer span.End()
+
+	jobName := r.expectedJobName(gr)
+	jobNamespace := r.Config.ResolvedJobTemplate.Namespace
+
+	if gr.Status.JobRef != nil {
+		if gr.Status.JobRef.Name != jobName {
+			return r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonInternalError,
+				fmt.Sprintf("JobRef name %s does not match expected name %s", gr.Status.JobRef.Name, jobName))
+		}
+
+		return r.getOrCreateJob(ctx, gr)
+	}
+
+	log.V(1).Info("Attempting to claim GPU reset job", "job", jobName, "namespace", jobNamespace)
+
+	updatedGR := gr.DeepCopy()
+	updatedGR.Status.JobRef = &corev1.ObjectReference{Kind: "Job", Name: jobName, Namespace: jobNamespace}
+	updatedGR.Status.Phase = v1alpha1.ResetInProgress
+
+	if meta.FindStatusCondition(updatedGR.Status.Conditions, string(v1alpha1.ResetJobCreated)) == nil {
+		jobCreatedCond := NewCondition(v1alpha1.ResetJobCreated, metav1.ConditionFalse, v1alpha1.ReasonCreatingResetJob,
+			"Claiming GPU reset job")
+		meta.SetStatusCondition(&updatedGR.Status.Conditions, jobCreatedCond)
+	}
+
+	if err := r.Status().Patch(ctx, updatedGR, client.MergeFrom(gr)); err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "status_patch_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to patch GPUReset %s status: %w", gr.Name, err)
+	}
+
+	log.V(1).Info("Successfully claimed GPU reset job", "job", jobName, "namespace", jobNamespace)
+
+	return ctrl.Result{}, nil
+}
+
+// checkJobStatus monitors the created Job for completion (Succeeded or Failed).
+func (r *GPUResetReconciler) checkJobStatus(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "janitor.gpureset.checkJobStatus")
+	defer span.End()
+
+	currentCond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ResetJobCompleted))
+	if currentCond == nil {
+		if err := r.updateCondition(ctx, gr, v1alpha1.ResetJobCompleted, metav1.ConditionFalse,
+			v1alpha1.ReasonResetJobRunning, "GPU reset in progress"); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if gr.Status.JobRef == nil {
+		log.Info("Job reference not found in status, unable to check status", "job", r.expectedJobName(gr), "namespace",
+			r.Config.ResolvedJobTemplate.Namespace)
+
+		return r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonInternalError, "Job reference is missing")
+	}
+
+	jobNamespace := gr.Status.JobRef.Namespace
+	jobName := gr.Status.JobRef.Name
+
+	job := &batchv1.Job{}
+
+	err := r.Get(ctx, client.ObjectKey{Namespace: jobNamespace, Name: jobName}, job)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			log.Error(err, "GPU reset job not found, it may have been deleted", "job", jobName, "namespace", jobNamespace)
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "reset_job_not_found"),
+				attribute.String("janitor.error.message", "Job for GPU reset was not found"),
+			)
+			tracing.RecordError(span, err)
+
+			return r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonResetJobNotFound, "Job for GPU reset was not found")
+		}
+
+		return ctrl.Result{}, fmt.Errorf("failed to get Job %s/%s: %w", jobNamespace, jobName, err)
+	}
+
+	if job.Status.Succeeded > 0 {
+		log.V(1).Info("GPU reset job completed successfully", "job", job.Name, "namespace", job.Namespace)
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ResetJobCompleted, metav1.ConditionTrue,
+			v1alpha1.ReasonResetJobSucceeded, "GPU(s) reset successfully"); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if jobConditionTrue(job, batchv1.JobFailed) {
+		log.Info("GPU reset job failed", "job", job.Name, "namespace", job.Namespace)
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "reset_job_failed"),
+			attribute.String("janitor.error.message", "GPU reset job failed"),
+		)
+		tracing.RecordError(span, errors.New("GPU reset job failed"))
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ResetJobCompleted, metav1.ConditionTrue,
+			v1alpha1.ReasonResetJobFailed, "GPU reset failed"); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	log.V(1).Info("Waiting for GPU reset job to complete", "job", job.Name, "namespace", job.Namespace)
+
+	return ctrl.Result{}, nil
+}
+
+// restoreServices re-enables the managed services. It enables them by setting node labels
+// to their enabled state and waits for the associated pods to become ready.
+func (r *GPUResetReconciler) restoreServices(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "janitor.gpureset.restoreServices")
+	defer span.End()
+
+	nodeName := gr.Spec.NodeName
+	managerName := r.serviceManager.Name
+	nodeExists := true
+
+	node, err := r.getNode(ctx, nodeName)
+	if err != nil {
+		// The restoreServices logic is called during GPUReset reconciling and during GPUReset CR deletion. In both
+		// cases, if the corresponding node doesn't exist, we will consider ServicesRestored as successful with reason
+		// skipped.
+		if !apierrors.IsNotFound(err) {
+			log.V(1).Info("Failed to get node for service restoration, will retry", "node", nodeName, "error", err)
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "get_node_failed"),
+				attribute.String("janitor.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to get node %s for service restoration: %w", nodeName, err)
+		}
+
+		nodeExists = false
+	}
+
+	apps := r.managedApps(ctx, gr)
+
+	if len(apps) == 0 || !nodeExists {
+		if len(apps) == 0 {
+			log.V(1).Info("No managed services were stopped, skipping service restoration", "manager",
+				managerName, "node", nodeName)
+		}
+
+		if !nodeExists {
+			log.V(1).Info("Node no longer exists, skipping service restoration", "node", nodeName)
+		}
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesRestored, metav1.ConditionTrue, v1alpha1.ReasonSkipped,
+			"No services manager configured, or has no managed services specified"); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	currentCond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ServicesRestored))
+	if currentCond == nil {
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesRestored, metav1.ConditionFalse,
+			v1alpha1.ReasonRestoringServices, fmt.Sprintf("Re-deploying %s managed services", managerName)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Restoration has only started. Callers, in particular the deletion finalizer, treat a result
+		// without RequeueAfter as "restoration complete", so ask for a requeue like every other
+		// in-progress return of this function.
+		return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+	}
+
+	// Only the deletion finalizer reaches this point with a finished restoration. There is nothing left to do,
+	// and the pods must not be waited for again.
+	if currentCond.Status == metav1.ConditionTrue {
+		return ctrl.Result{}, nil
+	}
+
+	restoreTimeout := r.serviceManager.Spec.RestoreTimeout
+
+	timeSinceInProgress := 0 * time.Minute
+	if currentCond.Reason == string(v1alpha1.ReasonRestoringServices) {
+		timeSinceInProgress = time.Since(currentCond.LastTransitionTime.Time)
+	}
+
+	// Once the reset has failed, the restoration is no longer bounded: the labels must still go back, and a
+	// label held by another controller is waited on. The pods are not waited for any more.
+	// After the early return above, a completed GPUReset reaching this point is a failed reset whose restoration
+	// is unfinished; the phase cannot be used, it reads Terminating during deletion.
+	failed := gr.Status.CompletionTime != nil
+
+	if timeSinceInProgress > restoreTimeout && !failed {
+		log.Error(nil, "Managed service restoration timeout exceeded", "manager", managerName, "timeout", restoreTimeout)
+
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "restore_timeout"),
+			attribute.String("janitor.error.message", fmt.Sprintf("restore timeout %v exceeded", restoreTimeout)),
+		)
+		tracing.RecordError(span, errors.New("restore timeout exceeded"))
+
+		if res, err := r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonRestoreTimeoutExceeded,
+			fmt.Sprintf("failed to restore %s managed services within the timeout period", managerName)); err != nil {
+			return res, err
+		}
+
+		// The labels are still owed. The next reconcile continues the restoration without the timeout.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	// The restore timeout above bounds this wait. After the failure, one more GPUReset timeout bounds it: a label
+	// that is never released must not hold the node lock forever, so the janitor gives up on it, leaves it as it
+	// is, and still restores the labels it owns.
+	held := heldLabels(apps, node.Labels)
+	givenUp := len(held) > 0 && failed && time.Since(gr.Status.CompletionTime.Time) > r.Config.Timeout
+
+	if len(held) > 0 && !givenUp {
+		log.Info("Waiting for node labels held by another controller before re-enabling managed services",
+			"node", node.Name, "manager", managerName, "nodeLabels", held, "recheck_after", 3*time.Second)
+
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
+
+	nodeToUpdate := node.DeepCopy()
+	nodeUpdated := false
+	heldSet := sets.New(held...)
+
+	// Set node labels back to enabled value to restore services
+	for _, app := range apps {
+		if heldSet.Has(app.NodeLabel) {
+			continue
+		}
+
+		if value, exists := nodeToUpdate.Labels[app.NodeLabel]; !exists || value != app.EnabledValue {
+			log.V(1).Info("Setting node label to enable managed service", "node", node.Name, "manager", managerName,
+				"label", app.NodeLabel, "value", app.EnabledValue)
+
+			if nodeToUpdate.Labels == nil {
+				nodeToUpdate.Labels = make(map[string]string)
+			}
+
+			nodeToUpdate.Labels[app.NodeLabel] = app.EnabledValue
+			nodeUpdated = true
+		}
+	}
+
+	if nodeUpdated {
+		// The optimistic lock makes the patch fail if the node changed after the held-label check above, so a
+		// label another controller took in the meantime is never overwritten. The next reconcile re-reads the node.
+		patch := client.MergeFromWithOptions(node, client.MergeFromWithOptimisticLock{})
+		if err := r.Patch(ctx, nodeToUpdate, patch); err != nil {
+			if apierrors.IsConflict(err) {
+				log.Info("Node changed since it was read, retrying", "node", node.Name)
+
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+
+			span.SetAttributes(
+				attribute.String("janitor.error.type", "node_update_failed"),
+				attribute.String("janitor.error.message", err.Error()),
+			)
+			tracing.RecordError(span, err)
+
+			return ctrl.Result{}, fmt.Errorf("failed to patch node %s to re-enable %s managed services: %w",
+				node.Name, managerName, err)
+		}
+
+		log.Info("Managed services re-enabled", "node", node.Name, "manager", managerName)
+
+		return ctrl.Result{RequeueAfter: time.Second * 2}, nil
+	}
+
+	if givenUp {
+		log.Error(nil, "Giving up on node labels held by another controller; they were not restored",
+			"node", node.Name, "manager", managerName, "nodeLabels", held)
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesRestored, metav1.ConditionFalse,
+			v1alpha1.ReasonRestoreTimeoutExceeded, fmt.Sprintf("Node labels %v are held by another controller "+
+				"and were not restored", held)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	if failed {
+		// The labels are back. Record it under the reason the reset failed with, so the condition ends the pending
+		// restoration without claiming the pods are Ready.
+		reason := v1alpha1.ReasonRestoreTimeoutExceeded
+		if complete := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.Complete)); complete != nil {
+			reason = v1alpha1.GPUResetReason(complete.Reason)
+		}
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesRestored, metav1.ConditionFalse, reason,
+			fmt.Sprintf("%s managed service node labels restored after the reset failed; pods not waited for",
+				managerName)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// Wait for pods to become ready
+	podsReady, err := r.checkPodsReadyFn(ctx, node.Name, apps)
+	if err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "pod_readiness_check_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to check %s managed service pods readiness for node %s: %w",
+			managerName, node.Name, err)
+	}
+
+	if !podsReady {
+		log.V(1).Info("Waiting for managed service pods to become Ready", "node", node.Name, "manager", managerName,
+			"recheck_after", 2*time.Second)
+
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	if currentCond.Status != metav1.ConditionTrue {
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesRestored, metav1.ConditionTrue,
+			v1alpha1.ReasonServiceRestoreSucceeded, fmt.Sprintf("%s managed services are Ready", managerName)); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+// reconcileCompletion updates the GPUReset status to a completed state
+// and sets the CompletionTime.
+//
+// It also records all success-related metrics (duration, completion total, active count).
+func (r *GPUResetReconciler) reconcileCompletion(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	nodeName := gr.Spec.NodeName
+
+	jobFinishedCond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.ResetJobCompleted))
+	if jobFinishedCond.Reason == string(v1alpha1.ReasonResetJobFailed) {
+		log.Info("GPU reset failed", "node", nodeName)
+		return r.reconcileTerminalFailure(ctx, gr, v1alpha1.ReasonResetJobFailed, jobFinishedCond.Message)
+	}
+
+	log.Info("GPU reset successful", "node", nodeName)
+
+	updatedGR := gr.DeepCopy()
+	now := metav1.Now()
+	updatedGR.Status.CompletionTime = &now
+	updatedGR.Status.Phase = v1alpha1.ResetSucceeded
+
+	succeededCond := NewCondition(v1alpha1.Complete, metav1.ConditionTrue, v1alpha1.ReasonGPUResetSucceeded,
+		jobFinishedCond.Message)
+	meta.SetStatusCondition(&updatedGR.Status.Conditions, succeededCond)
+
+	if err := r.updateStatus(ctx, gr, updatedGR.Status); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to set final status for GPUReset %s: %w", gr.Name, err)
+	}
+
+	// update metrics: enforce the absolute state (Active=0)
+	metrics.GPUResetActiveRequests.WithLabelValues(nodeName).Set(0)
+	metrics.GPUResetRequestsCompletedTotal.WithLabelValues(nodeName, "success").Inc()
+
+	if gr.Status.StartTime != nil {
+		duration := updatedGR.Status.CompletionTime.Sub(gr.Status.StartTime.Time)
+		metrics.GPUResetDurationSeconds.WithLabelValues(nodeName, "success").Observe(duration.Seconds())
+	}
+
+	r.endResetSession(gr.Name)
+
+	return ctrl.Result{}, nil
+}
+
+// expectedJobName returns a valid and deterministic name for a Job. It ensures
+// the name does not exceed 63 characters to avoid issues with derived Pod names.
+func (r *GPUResetReconciler) expectedJobName(gr *v1alpha1.GPUReset) string {
+	baseName := gr.Name
+
+	if len(baseName)+len(jobNameSuffix) <= validation.DNS1123LabelMaxLength {
+		return baseName + jobNameSuffix
+	}
+
+	if len(baseName) > maxJobNameBaseLength {
+		baseName = strings.TrimRight(baseName[0:maxJobNameBaseLength], ".")
+	}
+
+	hash := sha256.Sum256([]byte(gr.Name))
+	shortHash := fmt.Sprintf("%x", hash)[:8]
+
+	return fmt.Sprintf("%s-%s%s", baseName, shortHash, jobNameSuffix)
+}
+
+// getOrCreateJob ensures the GPU reset job exists for the given GPUReset.
+// It first checks if the job already exists. If not, it runs a pre-flight drift check
+// to ensure managed services are still torn down before creating a Job responsible for performing the reset.
+func (r *GPUResetReconciler) getOrCreateJob(ctx context.Context, gr *v1alpha1.GPUReset) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "get_or_create_job")
+	defer span.End()
+
+	jobName := r.expectedJobName(gr)
+
+	job, err := r.getJob(ctx, gr)
+	if err != nil {
+		tracing.RecordError(span, err)
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "failed_to_get_job"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+
+		return ctrl.Result{}, fmt.Errorf("failed to get job %s/%s for GPUReset %s: %w",
+			r.Config.ResolvedJobTemplate.Namespace, jobName, gr.Name, err)
+	}
+
+	if job != nil {
+		if !meta.IsStatusConditionTrue(gr.Status.Conditions, string(v1alpha1.ResetJobCreated)) {
+			if err := r.updateCondition(ctx, gr, v1alpha1.ResetJobCreated, metav1.ConditionTrue,
+				v1alpha1.ReasonResetJobCreationSucceeded, "GPU reset job created"); err != nil {
+				return ctrl.Result{}, err
+			}
+
+			return ctrl.Result{}, nil
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	// Job NOT found. Create it.
+
+	nodeName := gr.Spec.NodeName
+	managerName := r.serviceManager.Name
+
+	// A driver upgrade that started after the teardown holds the labels of the operands the reset did not stop.
+	// The reset must not run against a driver that is being reloaded.
+	node, err := r.getNode(ctx, nodeName)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to get node %s before creating the reset job: %w", nodeName, err)
+	}
+
+	if res, wait, err := r.waitForHeldLabels(ctx, gr, node.Labels, "creating the reset job",
+		v1alpha1.ReasonResetJobCreationFailed); wait {
+		return res, err
+	}
+
+	// Drift check: verify managed service pods are NOT running
+
+	apps := r.managedApps(ctx, gr)
+
+	podsAreGone, err := r.checkPodsTerminatedFn(ctx, nodeName, apps)
+	if err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "check_terminated_pods_error"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to run %s managed service drift check on node %s: %w",
+			managerName, nodeName, err)
+	}
+
+	if !podsAreGone {
+		log.Info("Drift detected: managed service pods are still running, re-initiating teardown.", "node",
+			nodeName, "manager", managerName)
+
+		if err := r.updateCondition(ctx, gr, v1alpha1.ServicesTornDown,
+			metav1.ConditionFalse, v1alpha1.ReasonTearingDownServices,
+			fmt.Sprintf("Drift detected: %s managed service pods are still running", managerName)); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	gpuResetJob, err := r.newGpuResetJob(ctx, gr)
+	if err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "failed_to_construct_job"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to construct job %s/%s for GPUReset %s: %w",
+			r.Config.ResolvedJobTemplate.Namespace, jobName, gr.Name, err)
+	}
+
+	if err := r.Create(ctx, gpuResetJob); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			log.V(1).Info("GPU reset job already exists", "job", gpuResetJob.Name, "namespace", gpuResetJob.Namespace)
+			return ctrl.Result{}, nil
+		}
+
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "job_creation_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return ctrl.Result{}, fmt.Errorf("failed to create job %s/%s for GPUReset %s: %w", gpuResetJob.Namespace,
+			gpuResetJob.Name, gr.Name, err)
+	}
+
+	log.V(1).Info("GPU reset job submitted for creation", "job", gpuResetJob.Name, "namespace", gpuResetJob.Namespace)
+
+	if err := r.updateCondition(ctx, gr, v1alpha1.ResetJobCreated, metav1.ConditionTrue,
+		v1alpha1.ReasonResetJobCreationSucceeded, "GPU reset job created"); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	span.SetAttributes(
+		attribute.String("janitor.reset_job.name", jobName),
+	)
+
+	return ctrl.Result{}, nil
+}
+
+// getJob retrieves the GPU reset job owned by the given GPUReset.
+// An error is returned if a job with the expected name exists but has a different owner.
+func (r *GPUResetReconciler) getJob(ctx context.Context, gr *v1alpha1.GPUReset) (*batchv1.Job, error) {
+	jobName := r.expectedJobName(gr)
+
+	job := &batchv1.Job{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: r.Config.ResolvedJobTemplate.Namespace, Name: jobName},
+		job); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to get job %s/%s: %w", r.Config.ResolvedJobTemplate.Namespace, jobName, err)
+	}
+
+	if metav1.IsControlledBy(job, gr) {
+		return job, nil
+	}
+
+	return nil, fmt.Errorf("unexpected error: job %s/%s exists but owned by %s, expected %s", job.Namespace,
+		job.Name, metav1.GetControllerOf(job), gr.Name)
+}
+
+// newGpuResetJob constructs the Kubernetes Job object responsible for performing the GPU reset.
+func (r *GPUResetReconciler) newGpuResetJob(ctx context.Context, gr *v1alpha1.GPUReset) (*batchv1.Job, error) {
+	log := log.FromContext(ctx)
+
+	jobName := r.expectedJobName(gr)
+	jobNamespace := r.Config.ResolvedJobTemplate.Namespace
+	log.V(1).Info("Constructing new GPU reset job", "job", jobName, "namespace", jobNamespace)
+
+	jobMeta := *r.Config.ResolvedJobTemplate.ObjectMeta.DeepCopy()
+	jobMeta.Name = jobName
+	jobMeta.Namespace = jobNamespace
+
+	if jobMeta.Labels == nil {
+		jobMeta.Labels = make(map[string]string)
+	}
+
+	if len(gr.Name) <= validation.DNS1123LabelMaxLength {
+		jobMeta.Labels["gpureset-name"] = gr.Name
+		jobMeta.Labels[jobOwnerKey] = gr.Name
+	}
+
+	jobSpec := *r.Config.ResolvedJobTemplate.Spec.DeepCopy()
+
+	log.V(1).Info("Setting NodeName", "job", jobName, "namespace", jobNamespace, "node", gr.Spec.NodeName)
+	jobSpec.Template.Spec.NodeName = gr.Spec.NodeName
+
+	if jobSpec.Template.Spec.RestartPolicy == "" {
+		log.V(1).Info("RestartPolicy not found, setting to 'OnFailure'", "job", jobName, "namespace", jobNamespace)
+
+		jobSpec.Template.Spec.RestartPolicy = corev1.RestartPolicyOnFailure
+	}
+
+	var gpuIDs []string
+	if gr.Spec.Selector != nil {
+		gpuIDs = append(gpuIDs, gr.Spec.Selector.UUIDs...)
+		gpuIDs = append(gpuIDs, gr.Spec.Selector.PCIBusIDs...)
+	}
+
+	gpuIDString := ""
+	if len(gpuIDs) > 0 {
+		gpuIDString = strings.Join(gpuIDs, ",")
+	}
+
+	gpuResetEnvVar := corev1.EnvVar{
+		Name:  gpuResetsEnvVar,
+		Value: gpuIDString,
+	}
+
+	// Init containers get the GPU IDs too, so a step that a jobTemplatePatch runs before the reset knows which GPUs
+	// are reset.
+	setContainersEnvVar(ctx, jobSpec.Template.Spec.InitContainers, gpuResetEnvVar, jobName, jobNamespace)
+	setContainersEnvVar(ctx, jobSpec.Template.Spec.Containers, gpuResetEnvVar, jobName, jobNamespace)
+
+	job := &batchv1.Job{
+		ObjectMeta: jobMeta,
+		Spec:       jobSpec,
+	}
+
+	if err := ctrl.SetControllerReference(gr, job, r.Scheme); err != nil {
+		return nil, fmt.Errorf("failed to set controller reference on job %s/%s: %w", jobNamespace, jobName, err)
+	}
+
+	return job, nil
+}
+
+// setContainersEnvVar sets envVar in each container.
+//
+// If a container already has variables with that name, it overwrites all of them: the kubelet uses the last one, so
+// a leftover duplicate would pass a stale value. Otherwise it adds envVar at the start of the list, because a $(NAME)
+// reference in another variable works only if NAME is defined earlier.
+func setContainersEnvVar(ctx context.Context, containers []corev1.Container, envVar corev1.EnvVar, jobName,
+	jobNamespace string) {
+	log := log.FromContext(ctx)
+
+	for i := range containers {
+		container := &containers[i]
+		replaced := false
+
+		for j := range container.Env {
+			if container.Env[j].Name != envVar.Name {
+				continue
+			}
+
+			log.V(1).Info("Overriding existing environment variable", "env_var", envVar.Name, "job", jobName,
+				"namespace", jobNamespace, "container", container.Name, "new_value", envVar.Value, "old_value",
+				container.Env[j].Value)
+			container.Env[j] = envVar
+			replaced = true
+		}
+
+		if !replaced {
+			log.V(1).Info("Adding environment variable", "env_var", envVar.Name, "job", jobName, "namespace",
+				jobNamespace, "container", container.Name, "value", envVar.Value)
+			container.Env = append([]corev1.EnvVar{envVar}, container.Env...)
+		}
+	}
+}
+
+// checkPodsTerminated verifies that all pods belonging to the given managed services
+// have been successfully terminated on the target node.
+func (r *GPUResetReconciler) checkPodsTerminated(
+	ctx context.Context,
+	nodeName string,
+	apps []gpuservices.AppSpec,
+) (bool, error) {
+	log := log.FromContext(ctx)
+	managerName := r.serviceManager.Name
+
+	for _, app := range apps {
+		pods, selector, err := r.listAppPods(ctx, nodeName, app)
+		if err != nil {
+			return false, fmt.Errorf("failed to list %s pods for termination check for node %s: %w",
+				managerName, nodeName, err)
+		}
+
+		if len(pods.Items) > 0 {
+			if app.IsGPUClients() {
+				// The DaemonSet controller removes its pods when the label changes. Other pods stay until someone
+				// deletes them, so name them: the teardown times out on them.
+				log.Info("GPU client pods still running on node", "node", nodeName, "pods", podNames(pods.Items))
+			} else {
+				log.V(1).Info("Managed service pod still running on node", "node", nodeName, "manager", managerName,
+					"count", len(pods.Items), "selector", selector)
+			}
+
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// podNames returns the namespace/name of each pod.
+func podNames(pods []corev1.Pod) []string {
+	names := make([]string, 0, len(pods))
+	for i := range pods {
+		names = append(names, pods[i].Namespace+"/"+pods[i].Name)
+	}
+
+	return names
+}
+
+// checkPodsReady verifies that all pods belonging to the given managed services
+// have been successfully re-deployed and are in a Ready state on the target node.
+func (r *GPUResetReconciler) checkPodsReady(
+	ctx context.Context,
+	nodeName string,
+	apps []gpuservices.AppSpec,
+) (bool, error) {
+	log := log.FromContext(ctx)
+	managerName := r.serviceManager.Name
+
+	for _, app := range apps {
+		// The GPU client pods belong to other teams, and a pod that no DaemonSet owns does not come back. The
+		// restore gives their node label back and does not wait for them.
+		if app.IsGPUClients() {
+			continue
+		}
+
+		pods, selector, err := r.listAppPods(ctx, nodeName, app)
+		if err != nil {
+			return false, fmt.Errorf("failed to list %s managed service pods for ready check for node %s: %w",
+				managerName, nodeName, err)
+		}
+
+		if len(pods.Items) == 0 {
+			log.V(1).Info("Waiting for managed service pod to be created", "node", nodeName, "manager", managerName,
+				"selector", selector)
+
+			return false, nil
+		}
+
+		// Check if at least one pod is ready for the given app selector
+		for _, pod := range pods.Items {
+			isReady := false
+
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+
+			if !isReady {
+				log.V(1).Info("Waiting for managed service pod to become Ready", "node", nodeName,
+					"manager", managerName, "pod", pod.Name, "phase", pod.Status.Phase)
+
+				return false, nil
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// runningApps returns the managed services that have at least one pod on the target node, in any phase.
+func (r *GPUResetReconciler) runningApps(
+	ctx context.Context,
+	nodeName string,
+	apps []gpuservices.AppSpec,
+) ([]gpuservices.AppSpec, error) {
+	running := make([]gpuservices.AppSpec, 0, len(apps))
+
+	for _, app := range apps {
+		pods, _, err := r.listAppPods(ctx, nodeName, app)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list %s managed service pods for node %s: %w",
+				r.serviceManager.Name, nodeName, err)
+		}
+
+		if len(pods.Items) > 0 {
+			running = append(running, app)
+		}
+	}
+
+	return running, nil
+}
+
+// listAppPods lists the pods of one managed service on the target node. It also returns the label selector it used.
+func (r *GPUResetReconciler) listAppPods(
+	ctx context.Context,
+	nodeName string,
+	app gpuservices.AppSpec,
+) (*corev1.PodList, map[string]string, error) {
+	if app.IsGPUClients() {
+		pods, err := r.listGPUClientPods(ctx, nodeName)
+
+		return pods, nil, err
+	}
+
+	selector := make(map[string]string)
+	maps.Copy(selector, r.serviceManager.Spec.ManagerSelector)
+	maps.Copy(selector, app.AppSelector)
+
+	pods := &corev1.PodList{}
+	if err := r.List(ctx, pods,
+		client.InNamespace(r.serviceManager.Spec.Namespace),
+		client.MatchingLabels(selector),
+		client.MatchingFields{"spec.nodeName": nodeName},
+	); err != nil {
+		return nil, selector, fmt.Errorf("failed to list pods with selector %v: %w", selector, err)
+	}
+
+	return pods, selector, nil
+}
+
+// listGPUClientPods lists the GPU client pods on the target node: the pods in any namespace that select the GPU
+// clients node label and have not finished. It reads from the API server, because the pod cache holds only the pods
+// of the service manager namespace. The spec.nodeName field selector limits the request to the pods of one node.
+func (r *GPUResetReconciler) listGPUClientPods(ctx context.Context, nodeName string) (*corev1.PodList, error) {
+	nodePods := &corev1.PodList{}
+	if err := r.APIReader.List(ctx, nodePods, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
+		return nil, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
+	}
+
+	clients := &corev1.PodList{}
+	// templates holds the pod template of each DaemonSet that this call reads, or nil for a DaemonSet that is gone.
+	templates := make(map[types.NamespacedName]*corev1.PodSpec)
+
+	for i := range nodePods.Items {
+		pod := &nodePods.Items[i]
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+
+		isClient, err := r.isGPUClientPod(ctx, pod, templates)
+		if err != nil {
+			return nil, err
+		}
+
+		if isClient {
+			clients.Items = append(clients.Items, *pod)
+		}
+	}
+
+	return clients, nil
+}
+
+// isGPUClientPod reports whether the pod, or the pod template of the DaemonSet that controls it, selects the GPU
+// clients node label. The DaemonSet controller replaces the required node affinity of each DaemonSet pod with a term
+// on the node name, so a DaemonSet that selects the label only in its required node affinity, as the NVSentinel
+// metadata collector does, shows the label only in its pod template. The nodeSelector stays on the pod.
+func (r *GPUResetReconciler) isGPUClientPod(
+	ctx context.Context,
+	pod *corev1.Pod,
+	templates map[types.NamespacedName]*corev1.PodSpec,
+) (bool, error) {
+	if selectsNodeLabel(&pod.Spec, gpuservices.GPUClientsNodeLabel) {
+		return true, nil
+	}
+
+	owner := metav1.GetControllerOf(pod)
+	if owner == nil || owner.Kind != "DaemonSet" || owner.APIVersion != appsv1.SchemeGroupVersion.String() {
+		return false, nil
+	}
+
+	key := types.NamespacedName{Namespace: pod.Namespace, Name: owner.Name}
+
+	template, read := templates[key]
+	if !read {
+		daemonSet := &appsv1.DaemonSet{}
+
+		err := r.APIReader.Get(ctx, key, daemonSet)
+
+		switch {
+		case apierrors.IsNotFound(err):
+			// The garbage collector deletes the pods of a deleted DaemonSet. Only the pod spec counts.
+		case err != nil:
+			return false, fmt.Errorf("failed to get DaemonSet %s of pod %s: %w", key, pod.Name, err)
+		case daemonSet.UID == owner.UID:
+			template = &daemonSet.Spec.Template.Spec
+		}
+
+		templates[key] = template
+	}
+
+	return template != nil && selectsNodeLabel(template, gpuservices.GPUClientsNodeLabel), nil
+}
+
+// selectsNodeLabel reports whether the pod spec selects the node label in its nodeSelector or in a term of its
+// required node affinity. The GPU Operator driver manager looks only at the nodeSelector. The required node affinity
+// is also checked, because the NVSentinel metadata collector selects the GPU clients label there.
+func selectsNodeLabel(spec *corev1.PodSpec, label string) bool {
+	if _, ok := spec.NodeSelector[label]; ok {
+		return true
+	}
+
+	if spec.Affinity == nil || spec.Affinity.NodeAffinity == nil ||
+		spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return false
+	}
+
+	for _, term := range spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms {
+		for _, expr := range term.MatchExpressions {
+			if expr.Key == label {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// reconcileTerminalFailure updates the GPUReset status to a terminal failed state
+// and sets the CompletionTime.
+//
+// It also records all failure-related metrics, ensuring to decrement the 'pending' count
+// or reset the 'active' gauge to zero.
+func (r *GPUResetReconciler) reconcileTerminalFailure(
+	ctx context.Context,
+	gr *v1alpha1.GPUReset,
+	reason v1alpha1.GPUResetReason,
+	message string,
+) (ctrl.Result, error) {
+	log := log.FromContext(ctx)
+
+	nodeName := gr.Spec.NodeName
+
+	log.Error(errors.New(message), "terminal failure", "node", nodeName, "reason", reason)
+
+	ctx, span := tracing.StartSpan(ctx, "janitor.gpureset.reconcileTerminalFailure")
+	defer span.End()
+
+	attrs := []attribute.KeyValue{
+		attribute.String("janitor.gpureset.failure_reason", string(reason)),
+		attribute.String("janitor.gpureset.failure_message", message),
+	}
+
+	if gr.Status.StartTime != nil {
+		attrs = append(attrs, attribute.Float64("janitor.gpureset.duration_seconds",
+			time.Since(gr.Status.StartTime.Time).Seconds()))
+	}
+
+	span.SetAttributes(attrs...)
+	tracing.RecordError(span, errors.New(message))
+
+	updatedGR := gr.DeepCopy()
+
+	if updatedGR.Status.CompletionTime == nil {
+		now := metav1.Now()
+		updatedGR.Status.CompletionTime = &now
+		updatedGR.Status.Phase = v1alpha1.ResetFailed
+
+		completeCond := NewCondition(v1alpha1.Complete, metav1.ConditionTrue, reason, message)
+		meta.SetStatusCondition(&updatedGR.Status.Conditions, completeCond)
+
+		if err := r.updateStatus(ctx, gr, updatedGR.Status); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to set terminal failure status for GPUReset %s: %w",
+				gr.Name, err)
+		}
+
+		// update metrics
+		readyCond := meta.FindStatusCondition(gr.Status.Conditions, string(v1alpha1.Ready))
+		if readyCond != nil && readyCond.Status == metav1.ConditionTrue {
+			// update metrics: enforce the absolute state (Active=0)
+			metrics.GPUResetActiveRequests.WithLabelValues(nodeName).Set(0)
+		}
+
+		metrics.GPUResetRequestsCompletedTotal.WithLabelValues(nodeName, "failure").Inc()
+		metrics.GPUResetFailureReasonsTotal.WithLabelValues(nodeName, string(reason)).Inc()
+
+		if gr.Status.StartTime != nil {
+			duration := updatedGR.Status.CompletionTime.Sub(gr.Status.StartTime.Time)
+			metrics.GPUResetDurationSeconds.WithLabelValues(nodeName, "failure").Observe(duration.Seconds())
+		}
+	}
+
+	r.endResetSession(gr.Name)
+
+	return ctrl.Result{}, nil
+}
+
+// reconcilePhase maps a detailed GPUResetReason to its high-level GPUResetPhase.
+func reconcilePhase(reason v1alpha1.GPUResetReason) v1alpha1.GPUResetPhase {
+	switch reason {
+	// Pending
+	case v1alpha1.ReasonResetPending:
+		return v1alpha1.ResetPending
+	case v1alpha1.ReasonReadyForReset:
+		return v1alpha1.ResetPending
+	case v1alpha1.ReasonResourceContention:
+		return v1alpha1.ResetPending
+
+	// InProgress
+	case v1alpha1.ReasonSkipped:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonTearingDownServices:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonServiceTeardownSucceeded:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonCreatingResetJob:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonResetInProgress:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonResetJobRunning:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonRestoringServices:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonFinalizerRestoringServices:
+		return v1alpha1.ResetTerminating
+	case v1alpha1.ReasonServiceRestoreSucceeded:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonResetJobCreationSucceeded:
+		return v1alpha1.ResetInProgress
+	case v1alpha1.ReasonResetJobSucceeded:
+		return v1alpha1.ResetInProgress
+
+	// Completed - Succeeded
+	case v1alpha1.ReasonGPUResetSucceeded:
+		return v1alpha1.ResetSucceeded
+
+	// Completed - Failed
+	case v1alpha1.NodeNotFound:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonInvalidConfig:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonServiceTeardownTimeoutExceeded:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonResetJobCreationFailed:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonResetJobNotFound:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonResetJobFailed:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonServiceRestoreFailed:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonRestoreTimeoutExceeded:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonInternalError:
+		return v1alpha1.ResetFailed
+	case v1alpha1.ReasonGPUAlreadyUnderMaintenance:
+		return v1alpha1.ResetFailed
+	default:
+		return v1alpha1.ResetUnknown
+	}
+}
+
+// updateCondition updates the status condition of the GPUReset object and triggers a status patch.
+func (r *GPUResetReconciler) updateCondition(
+	ctx context.Context,
+	gr *v1alpha1.GPUReset,
+	condType v1alpha1.GPUResetConditionType,
+	status metav1.ConditionStatus,
+	reason v1alpha1.GPUResetReason,
+	message string,
+) error {
+	ctx, span := tracing.StartSpan(ctx, "update_condition")
+	defer span.End()
+
+	updatedGR := gr.DeepCopy()
+	newCond := NewCondition(condType, status, reason, message)
+	meta.SetStatusCondition(&updatedGR.Status.Conditions, newCond)
+
+	updatedGR.Status.Phase = reconcilePhase(reason)
+
+	if err := r.updateStatus(ctx, gr, updatedGR.Status); err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "condition_update_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return fmt.Errorf("failed to update GPUReset %s condition %s: %w", gr.Name, condType, err)
+	}
+
+	return nil
+}
+
+// updateStatus performs a status-only patch on the GPUReset resource if the status has changed.
+func (r *GPUResetReconciler) updateStatus(
+	ctx context.Context,
+	gr *v1alpha1.GPUReset,
+	newStatus v1alpha1.GPUResetStatus,
+) error {
+	log := log.FromContext(ctx)
+
+	ctx, span := tracing.StartSpan(ctx, "update_status")
+	defer span.End()
+
+	grName := gr.Name
+
+	var latest v1alpha1.GPUReset
+	if err := r.Get(ctx, client.ObjectKey{Name: grName, Namespace: gr.Namespace}, &latest); err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "status_refresh_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return fmt.Errorf("failed to get latest GPUReset %s for status update: %w", grName, err)
+	}
+
+	updated := latest.DeepCopy()
+	updated.Status = newStatus
+
+	// Avoid unnecessary status updates
+	if reflect.DeepEqual(latest.Status, updated.Status) {
+		return nil
+	}
+
+	oldPhase := latest.Status.Phase
+	newPhase := newStatus.Phase
+
+	if oldPhase != newPhase {
+		log.V(1).Info("GPUReset phase changed", "node", gr.Spec.NodeName, "old", oldPhase, "new", newPhase)
+	}
+
+	if err := r.Client.Status().Patch(ctx, updated, client.MergeFrom(&latest)); err != nil {
+		span.SetAttributes(
+			attribute.String("janitor.error.type", "status_patch_failed"),
+			attribute.String("janitor.error.message", err.Error()),
+		)
+		tracing.RecordError(span, err)
+
+		return fmt.Errorf("failed to patch GPUReset %s status: %w", grName, err)
+	}
+
+	return nil
+}
+
+// NewCondition creates a new Condition object.
+func NewCondition(
+	condType v1alpha1.GPUResetConditionType,
+	status metav1.ConditionStatus,
+	reason v1alpha1.GPUResetReason,
+	msg string,
+) metav1.Condition {
+	return metav1.Condition{
+		Type:    string(condType),
+		Status:  status,
+		Reason:  string(reason),
+		Message: msg,
+	}
+}
+
+func (r *GPUResetReconciler) getNode(ctx context.Context, name string) (*corev1.Node, error) {
+	var node corev1.Node
+
+	nodeKey := client.ObjectKey{Name: name}
+	if err := r.Get(ctx, nodeKey, &node); err != nil {
+		return nil, err
+	}
+
+	return &node, nil
+}

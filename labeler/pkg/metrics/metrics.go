@@ -1,0 +1,105 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metrics
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Status constants for metrics
+const (
+	StatusSuccess = "success"
+	StatusFailed  = "failed"
+	ClassLabel    = "class"
+
+	SkipReasonEvaluationError = "evaluation_error"
+	SkipReasonMissingSource   = "missing_source"
+)
+
+var (
+	// EventsProcessed tracks the total number of pod events processed
+	EventsProcessed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "labeler_events_processed_total",
+			Help: "Total number of pod events processed.",
+		},
+		[]string{"status"},
+	)
+
+	// NodeUpdateFailures tracks the total number of node update failures during reconciliation
+	NodeUpdateFailures = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "labeler_node_update_failures_total",
+			Help: "Total number of node update failures during reconciliation.",
+		},
+	)
+
+	// EventHandlingDuration tracks the histogram of event handling durations
+	EventHandlingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "labeler_event_handling_duration_seconds",
+			Help:    "Histogram of event handling durations.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	// CurrentDeviceCount records the current device count observed for a node and device class.
+	CurrentDeviceCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "labeler_device_count_current",
+			Help: "Current device count observed for a node and device class.",
+		},
+		[]string{"node", ClassLabel},
+	)
+
+	// ExpectedDeviceCount records the learned or overridden expected count for a hardware class partition.
+	ExpectedDeviceCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "labeler_device_count_expected",
+			Help: "Expected device count for a device class and hardware partition.",
+		},
+		[]string{ClassLabel, "partition"},
+	)
+
+	// DeviceCountSource is 1 for the source that counted a node's devices. A
+	// node has no series for a class while no source is available.
+	DeviceCountSource = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "labeler_device_count_source",
+			Help: "Source that counted a node's devices for a device class (1 for the selected source).",
+		},
+		[]string{"node", ClassLabel, "source"},
+	)
+
+	// DeviceCountSkippedUpdates tracks skipped device-count label updates.
+	DeviceCountSkippedUpdates = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "labeler_device_count_skipped_updates_total",
+			Help: "Total number of skipped device-count label updates.",
+		},
+		[]string{ClassLabel, "reason"},
+	)
+
+	// NodeLabelsSkippedManaged counts reconcile attempts skipped because the node
+	// is opted out of NVSentinel management (ADR-040). See commons/pkg/managed
+	// for the canonical label key and value.
+	NodeLabelsSkippedManaged = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "labeler_node_labels_skipped_managed_total",
+			Help: "Node label reconcile attempts skipped because the node is opted out of NVSentinel management.",
+		},
+	)
+)

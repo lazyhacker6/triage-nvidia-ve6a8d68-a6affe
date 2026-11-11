@@ -1,0 +1,211 @@
+// Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package gpuservices
+
+import (
+	"fmt"
+	"time"
+)
+
+// Manager represents a specific GPU service manager configuration,
+// combining its resolved name with the detailed specification used for teardown.
+type Manager struct {
+	Name string      `mapstructure:"name" json:"name"`
+	Spec ManagerSpec `mapstructure:"spec" json:"spec"`
+}
+
+// ManagerSpec allows for the inline definition of a custom component and its applications.
+type ManagerSpec struct {
+	// A map of labels common to all applications managed by this component.
+	// Typically this would be 'app.kubernetes.io/managed-by': 'some-operator'.
+	ManagerSelector map[string]string `mapstructure:"managerSelector" json:"managerSelector"`
+
+	// The namespace where the managed applications are running.
+	Namespace string `mapstructure:"namespace" json:"namespace"`
+
+	// The list of specific applications to tear down and restore.
+	Apps []AppSpec `mapstructure:"apps" json:"apps"`
+
+	// TeardownTimeout defines the maximum time to wait for managed service pods to terminate.
+	TeardownTimeout time.Duration `mapstructure:"teardownTimeout" json:"teardownTimeout"`
+
+	// RestoreTimeout defines the maximum time to wait for managed service pods to become ready.
+	RestoreTimeout time.Duration `mapstructure:"restoreTimeout" json:"restoreTimeout"`
+}
+
+// AppSpec defines how to find and manage a single application.
+type AppSpec struct {
+	// A map of labels to select the pods for this specific application.
+	// This is combined with the manager's selector to form the final pod selector.
+	AppSelector map[string]string `mapstructure:"appSelector" json:"appSelector"`
+
+	// The node label used to control the deployment of this application.
+	NodeLabel string `mapstructure:"nodeLabel" json:"nodeLabel"`
+
+	// The value to set the NodeLabel to for enabling/deploying the application.
+	// Defaults to "true" if not specified.
+	EnabledValue string `mapstructure:"enabledValue" json:"enabledValue"`
+
+	// The value to set the NodeLabel to for disabling/undeploying the application.
+	// Defaults to "false" if not specified.
+	DisabledValue string `mapstructure:"disabledValue" json:"disabledValue"`
+}
+
+// Well-known values used by the pre-defined manager configurations below.
+const (
+	// managerGPUOperator is the registry key and namespace of the NVIDIA GPU Operator.
+	managerGPUOperator = "gpu-operator"
+	// labelApp is the pod label used to select an individual managed application.
+	labelApp = "app"
+	// labelManagedBy is the pod label that the GPU Operator sets on its device plugin mode operands.
+	labelManagedBy = "app.kubernetes.io/managed-by"
+	// nodeLabelEnabled / nodeLabelDisabled are the default node-label values
+	// that enable and disable a managed application.
+	nodeLabelEnabled  = "true"
+	nodeLabelDisabled = "false"
+)
+
+// Registry holds all known, pre-defined Manager configurations.
+var Registry = map[string]ManagerSpec{
+	// The gpu-operator entry lists the operands of both GPU Operator modes. The controller stops only the
+	// operands that have a pod on the node when the reset starts. The device plugin mode operands carry the
+	// app.kubernetes.io/managed-by label. The DRA mode operands do not, so their selector uses only the app label.
+	managerGPUOperator: {
+		Namespace: managerGPUOperator,
+		Apps: []AppSpec{
+			{
+				AppSelector:   map[string]string{labelApp: "nvidia-device-plugin-daemonset", labelManagedBy: managerGPUOperator},
+				NodeLabel:     "nvidia.com/gpu.deploy.device-plugin",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+			{
+				AppSelector:   map[string]string{labelApp: "nvidia-dcgm", labelManagedBy: managerGPUOperator},
+				NodeLabel:     "nvidia.com/gpu.deploy.dcgm",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+			{
+				AppSelector:   map[string]string{labelApp: "nvidia-dcgm-exporter", labelManagedBy: managerGPUOperator},
+				NodeLabel:     "nvidia.com/gpu.deploy.dcgm-exporter",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+			{
+				AppSelector:   map[string]string{labelApp: "gpu-feature-discovery", labelManagedBy: managerGPUOperator},
+				NodeLabel:     "nvidia.com/gpu.deploy.gpu-feature-discovery",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+			{
+				AppSelector:   map[string]string{labelApp: "nvidia-dcgm-dra"},
+				NodeLabel:     "nvidia.com/gpu.deploy.dcgm-dra",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+			{
+				AppSelector:   map[string]string{labelApp: "nvidia-dcgm-exporter-dra"},
+				NodeLabel:     "nvidia.com/gpu.deploy.dcgm-exporter-dra",
+				EnabledValue:  nodeLabelEnabled,
+				DisabledValue: nodeLabelDisabled,
+			},
+		},
+		TeardownTimeout: 5 * time.Minute,
+		RestoreTimeout:  10 * time.Minute,
+	},
+	// add additional GPU services managers here
+}
+
+// GPUClientsNodeLabel is the node label that GPU Operator 26.7 and later sets to "true" on each GPU node. A GPU
+// client pod that the GPU Operator does not manage selects this label, in its nodeSelector or in its required node
+// affinity. The GPU Operator sets the label to another value to remove these pods before it unloads the driver.
+const GPUClientsNodeLabel = "nvidia.com/gpu.deploy.client"
+
+// GPUClientsApp is the managed service for the GPU client pods that select GPUClientsNodeLabel. The pods can be in
+// any namespace, so the app has no pod selector. The controller finds the pods by the node label they select.
+func GPUClientsApp() AppSpec {
+	return AppSpec{
+		NodeLabel:     GPUClientsNodeLabel,
+		EnabledValue:  nodeLabelEnabled,
+		DisabledValue: nodeLabelDisabled,
+	}
+}
+
+// IsGPUClients reports whether the app is GPUClientsApp. An app in a custom spec that uses the same node label
+// with a pod selector is an ordinary app.
+func (a AppSpec) IsGPUClients() bool {
+	return a.NodeLabel == GPUClientsNodeLabel && len(a.AppSelector) == 0
+}
+
+// WithGPUClients returns the manager with GPUClientsApp added to its apps. It does not change the apps of the
+// given manager, which can share their array with the registry. A manager that already has an app for the node
+// label is returned unchanged. A manager without apps, which stops nothing, gets the timeouts of the gpu-operator
+// manager.
+func WithGPUClients(manager Manager) Manager {
+	for _, app := range manager.Spec.Apps {
+		if app.NodeLabel == GPUClientsNodeLabel {
+			return manager
+		}
+	}
+
+	if len(manager.Spec.Apps) == 0 {
+		manager.Spec.TeardownTimeout = Registry[managerGPUOperator].TeardownTimeout
+		manager.Spec.RestoreTimeout = Registry[managerGPUOperator].RestoreTimeout
+	}
+
+	apps := make([]AppSpec, 0, len(manager.Spec.Apps)+1)
+	apps = append(apps, manager.Spec.Apps...)
+	apps = append(apps, GPUClientsApp())
+	manager.Spec.Apps = apps
+
+	return manager
+}
+
+// NewManager constructs and resolves a Manager.
+// If only 'name' is provided (and the spec is empty), it attempts to load the full configuration from the registry.
+// If both 'name' and a non-empty 'spec' are provided, the custom spec is prioritized and validated.
+func NewManager(name string, spec ManagerSpec) (Manager, error) {
+	if name == "" {
+		return Manager{Name: ""}, nil
+	}
+
+	isSpecEmpty := spec.Namespace == "" && len(spec.Apps) == 0
+	if isSpecEmpty {
+		registrySpec, found := Registry[name]
+		if !found {
+			return Manager{}, fmt.Errorf("GPU services manager '%s' not found in registry", name)
+		}
+
+		return Manager{Name: name, Spec: registrySpec}, nil
+	}
+
+	if spec.Namespace == "" {
+		return Manager{}, fmt.Errorf("GPU services manager Namespace must be set when providing a custom spec")
+	}
+
+	if len(spec.Apps) == 0 {
+		return Manager{}, fmt.Errorf("GPU services manager Apps list must not be empty when providing a custom spec")
+	}
+
+	if spec.TeardownTimeout < 0 {
+		return Manager{}, fmt.Errorf("GPU services manager TeardownTimeout must be a non-negative value")
+	}
+
+	if spec.RestoreTimeout < 0 {
+		return Manager{}, fmt.Errorf("GPU services manager RestoreTimeout must be a non-negative value")
+	}
+
+	return Manager{Name: name, Spec: spec}, nil
+}

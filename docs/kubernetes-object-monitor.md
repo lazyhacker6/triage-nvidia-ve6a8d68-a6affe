@@ -1,0 +1,190 @@
+# Kubernetes Object Monitor
+
+## Overview
+
+The Kubernetes Object Monitor watches any Kubernetes resource (nodes, pods, custom resources, etc.) and generates health events when they enter unhealthy states. It's a policy-based monitor that uses CEL (Common Expression Language) expressions to detect problems in your cluster resources.
+
+Think of it as a customizable watchdog for your Kubernetes cluster - you define what "unhealthy" means for different resources, and it alerts NVSentinel when problems occur.
+
+### Why Do You Need This?
+
+While NVSentinel includes specialized monitors for GPUs and system logs, your cluster health depends on many other factors:
+
+- **Node conditions**: Nodes can become NotReady, have disk pressure, memory pressure, or network issues
+- **Custom resources**: Your application's CRDs (Custom Resource Definitions) may have status fields indicating failures
+- **Application-specific health**: Resources managed by your operators or controllers may need monitoring
+- **Integration with existing systems**: Quickly integrate external monitoring systems or tools into NVSentinel by exposing their status as Kubernetes resources
+
+The Kubernetes Object Monitor fills these gaps by letting you define custom health checks for any resource in your cluster using simple CEL expressions. This provides a quick way to integrate existing systems into NVSentinel without writing custom monitors.
+
+## How It Works
+
+The monitor operates using policies that you define:
+
+1. **Watch resources**: Uses Kubernetes controllers to watch specified resource types (Nodes, Pods, Jobs, CRDs, etc.)
+2. **Evaluate health state**: Evaluates CEL expressions against resource state
+3. **Detect unhealthy state**: When a CEL expression evaluates to **true**, the resource is considered unhealthy and an unhealthy event is generated
+4. **Detect recovery**: When a CEL expression evaluates to **false**, the resource is considered healthy and a healthy event is automatically sent
+5. **Map to nodes**: Associates the health event with a specific node using CEL expressions
+6. **Publish events**: Sends health events to Platform Connectors for processing by NVSentinel core modules
+
+The monitor automatically creates Kubernetes RBAC permissions based on your policies, granting read access to the resources you want to monitor.
+
+## Configuration
+
+Configure the Kubernetes Object Monitor through Helm values by defining policies:
+
+```yaml
+kubernetes-object-monitor:
+  enabled: true
+  
+  maxConcurrentReconciles: 1
+  resyncPeriod: 5m
+  
+  policies:
+    # Example 1: Monitor node readiness
+    - name: node-not-ready
+      enabled: true
+      resource:
+        group: ""         # Core API group (empty string)
+        version: v1
+        kind: Node
+      predicate:
+        expression: |
+          resource.status.conditions.filter(c, c.type == "Ready" && c.status == "False").size() > 0
+      healthEvent:
+        componentClass: Node
+        isFatal: true
+        message: "Node is not ready"
+        recommendedAction: CONTACT_SUPPORT
+        errorCode:
+          - NODE_NOT_READY
+    
+    # Example 2: Monitor custom resource with node association
+    - name: gpu-job-failed
+      enabled: true
+      resource:
+        group: batch.example.com
+        version: v1alpha1
+        kind: GPUJob
+        namespace: gpu-operator  # Optional: restrict informer cache to one namespace
+      predicate:
+        # Detect when job fails
+        expression: |
+          has(resource.status.state) && resource.status.state == "Failed"
+      nodeAssociation:
+        # Map this job to a specific node
+        expression: resource.spec.nodeName
+      healthEvent:
+        componentClass: GPU
+        isFatal: false
+        message: "GPU job failed on node"
+        recommendedAction: CONTACT_SUPPORT
+        errorCode:
+          - GPU_JOB_FAILED
+```
+
+### Policy Configuration
+
+Each policy has these components:
+
+#### Resource Selection
+```yaml
+resource:
+  group: ""              # API group (empty for core resources)
+  version: v1            # API version
+  kind: Node             # Resource kind
+  # namespace: gpu-operator # Optional, only for namespaced resources
+```
+
+Leave `namespace` unset to watch all namespaces for that resource kind. For namespaced resources with large object counts, setting it reduces informer cache memory usage. Do not set it for cluster-scoped resources such as `Node`.
+
+#### Predicate (Detection Logic)
+```yaml
+predicate:
+  expression: |
+    # CEL expression that returns true when resource is unhealthy
+    # When true: unhealthy event is sent
+    # When false: healthy event is automatically sent
+    resource.status.conditions.filter(c, c.type == "Ready" && c.status == "False").size() > 0
+```
+
+Available variables in predicates:
+- `resource`: The Kubernetes resource being evaluated
+- `now`: Current timestamp
+- `lookup(version, kind, namespace, name)`: Fetch related resources
+
+#### Node Association (Optional)
+```yaml
+nodeAssociation:
+  expression: resource.spec.nodeName  # CEL expression that returns node name
+```
+
+For resources that don't directly reference a node, you can use `lookup()` to traverse relationships:
+
+```yaml
+nodeAssociation:
+  # Get node from a related Pod
+  expression: |
+    lookup('v1', 'Pod', resource.metadata.namespace, resource.spec.podName).spec.nodeName
+```
+
+#### Cached Fields
+
+The `resource` variable is served from the informer cache, not fetched per evaluation. Policies are read once at startup, so the fields each expression touches are derived from the compiled CEL and the cache keeps only those, plus the metadata the informer itself needs (`apiVersion`, `kind`, `metadata.name`, `metadata.namespace`, `metadata.uid`, `metadata.resourceVersion`, `metadata.deletionTimestamp`). A node object is mostly labels, annotations, managed fields and cached image lists, none of which a typical predicate reads, so this cuts the cache to a fraction of its former size on large clusters. The retained fields are logged per resource kind at startup.
+
+A recorded field keeps its whole subtree, so comprehensions and computed map keys need no special care: `resource.status.conditions.filter(c, c.type == "Ready")` keeps every field of every condition, and `resource.metadata.labels[resource.spec.nodeName]` keeps all of `metadata.labels`.
+
+A map key read as a string literal keeps that one entry rather than the whole map, and this holds for a membership test as well: `'nvidia.com/gpu.present' in resource.metadata.labels` keeps only that key. A key the expression computes keeps the whole map, as above. Two policies that select the same objects can therefore cache different amounts, so prefer literal keys where you have the choice.
+
+An expression that uses the resource as a whole rather than through a field access, such as `size(resource)`, cannot be reduced to a set of fields. That resource kind is then cached in full, which is correct but gives up the saving for every policy on that kind. Prefer reading the specific fields you need.
+
+The same derivation covers `lookup()`. A call that gives its apiVersion and kind as string literals, as in `lookup('v1', 'Pod', resource.metadata.namespace, resource.spec.podName).spec.nodeName`, has the fields it reads off the returned object derived too, and that kind is cached cluster-wide pruned to them. Such a kind needs `get`, `list` and `watch` on it cluster-wide: `get` for the calls that read through the API server, `list` and `watch` because the cache watches every object of the kind. Grant all three in the ClusterRole for any kind a policy looks up but no policy watches, as the generated rules cover only the kinds policies watch. Where `list` and `watch` are missing the call reads through the API server instead, and logs once that it did.
+
+The informer for such a kind is created by the first call that needs it and lists every object of the kind before it can answer. Calls read through the API server until it has caught up, so that no evaluation waits on it.
+
+A call that computes its apiVersion or kind, whose result is used as a whole, that sits in an expression using the watched resource as a whole, or that names a kind cached for particular namespaces only, always reads through the API server. Each read is then one request per evaluation, so a policy that looks up a literal kind and reads named fields off it is the cheaper shape by a wide margin.
+
+#### Health Event Template
+```yaml
+healthEvent:
+  componentClass: Node           # Component type (Node, GPU, etc.)
+  isFatal: true                 # Severity flag
+  message: "Node is not ready"  # Human-readable message
+  recommendedAction: CONTACT_SUPPORT  # Action hint
+  errorCode:
+    - NODE_NOT_READY            # Error codes for classification
+  quarantineOverrides:          # Optional: override node cordon behavior
+    force: true                 # Or use skip: true; do not set both
+  drainOverrides:               # Optional: override pod eviction behavior
+    skip: true                  # Or use force: true; do not set both
+```
+
+For each override block, `force` and `skip` are mutually exclusive. Use `force`
+when this policy should perform the action regardless of normal rules, or `skip`
+when this policy should bypass the action.
+
+## Key Features
+
+### Policy-Based Monitoring
+Define custom health checks for any Kubernetes resource using declarative policies - no code required.
+
+### CEL Expression Language
+Use CEL for flexible, powerful condition evaluation with access to the full resource object.
+
+### Resource Relationships
+The `lookup()` function lets you traverse resource relationships to associate health events with nodes.
+
+### Automatic RBAC
+Kubernetes permissions are automatically generated based on your policies - you don't manage RBAC manually.
+
+### State Tracking
+Maintains state for each resource to detect transitions between healthy and unhealthy states.
+
+The monitor saves each unhealthy match in the `nvsentinel.nvidia.com/k8s-object-monitor-policy-matches` annotation on the node. When the monitor starts, it reads these annotations and checks each saved resource again. A resource that became healthy or was deleted while the monitor was stopped gets a healthy event, so its node can recover. If the monitor cannot read the node annotations at startup, it does not start, and Kubernetes restarts it.
+
+### Extensible
+Monitor any resource: core resources (Nodes, Pods), namespaced resources, cluster-scoped resources, or CRDs.
+
+### Controller-Runtime Based
+Uses Kubernetes controller-runtime for efficient, scalable resource watching with caching.

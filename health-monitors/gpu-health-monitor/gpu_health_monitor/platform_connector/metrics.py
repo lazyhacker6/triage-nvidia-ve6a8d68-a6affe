@@ -1,0 +1,87 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from prometheus_client import Histogram, Counter, Gauge
+
+dcgm_health_events_publish_time_to_grpc_channel = Histogram(
+    "dcgm_health_events_publish_time_to_grpc_channel",
+    "Amount of time spent in publishing dcgm health events on the grpc channel",
+    labelnames=["operation_name"],
+)
+
+health_events_insertion_to_uds_succeed = Counter(
+    "health_events_insertion_to_uds_succeed", "Total number of successful insertion of health events to UDS"
+)
+
+health_events_insertion_to_uds_error = Counter(
+    "health_events_insertion_to_uds_error", "Total number of failed insertions of health events to UDS"
+)
+
+# Operator-visible signal that platform-connector was unavailable on this node,
+# distinct from a true gRPC RPC error.
+health_events_insertion_skipped_pc_unavailable = Counter(
+    "health_events_insertion_skipped_pc_unavailable",
+    "Total number of health-event sends skipped because the platform-connector Unix socket was missing",
+)
+
+# Direct-mode publisher metrics: the monitor publishes straight to the
+# central deployment platform connector, one batch at a time.
+health_events_direct_publish_succeed = Counter(
+    "health_events_direct_publish_succeed",
+    "Total number of health-event batches delivered to the deployment platform connector",
+)
+
+health_events_direct_publish_dropped = Counter(
+    "health_events_direct_publish_dropped",
+    "Total number of health-event batches dropped by the direct publisher, by reason",
+    labelnames=["reason"],
+)
+
+health_events_direct_publish_retries = Counter(
+    "health_events_direct_publish_retries",
+    "Total number of direct-publish send retries",
+)
+
+# is_fatal is "true" or "false": the isFatal that gpu-health-monitor sends for
+# the event that set the series. Platform-connectors overrides do not change it.
+# Alerts can use it to skip informational events (recommendedAction NONE)
+# without keeping their own list of error codes.
+#
+# processing_strategy is the ProcessingStrategy enum name that
+# gpu-health-monitor sends with the event that set the series (global or
+# per-check), for example EXECUTE_REMEDIATION or STORE_ONLY. Platform-connectors
+# never changes STORE_ONLY to a strategy that acts, so STORE_ONLY means
+# NVSentinel does not act. EXECUTE_REMEDIATION means the monitor requests
+# action; platform-connectors can still change the strategy, for example to
+# STORE_ONLY on a node labelled nvsentinel.dgxc.nvidia.com/managed=false.
+dcgm_health_active_events = Gauge(
+    "dcgm_health_active_events",
+    "Active health events by watch type, GPU, error code, whether the event is fatal, and processing strategy",
+    labelnames=["event_type", "gpu_id", "error_code", "is_fatal", "processing_strategy"],
+)
+
+# Switches get their own gauge rather than sharing gpu_id: switch and GPU ids are
+# separate sequences both starting at 0, so one label would make gpu_id="3" match
+# GPU 3 and switch 3 at once.
+dcgm_health_active_switch_events = Gauge(
+    "dcgm_health_active_switch_events",
+    "Active health events by watch type, NVSwitch, and error code",
+    labelnames=["event_type", "switch_id", "error_code"],
+)
+
+dcgm_connectivity_consecutive_observations = Gauge(
+    "dcgm_connectivity_consecutive_observations",
+    "Consecutive DCGM connectivity observations by result",
+    labelnames=["result"],
+)

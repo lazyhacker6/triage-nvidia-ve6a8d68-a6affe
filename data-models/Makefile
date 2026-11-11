@@ -1,0 +1,235 @@
+# Data Models Makefile
+# Individual module build and test targets
+
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# MODULE-SPECIFIC CONFIGURATION
+# =============================================================================
+
+# Data-models specific settings
+# LINT_EXTRA_FLAGS now configured in .golangci.yml (v2 format)
+CLEAN_EXTRA_FILES :=
+
+# Exclude protobuf files from test coverage
+TEST_EXCLUDE_PACKAGES := pkg/protos
+
+# Docker configuration
+HAS_DOCKER := 0
+DOCKER_EXTRA_ARGS :=
+
+# =============================================================================
+# INCLUDE COMMON DEFINITIONS
+# =============================================================================
+
+include ../make/common.mk
+include ../make/go.mk
+
+# =============================================================================
+# MODULE-SPECIFIC TARGETS
+# =============================================================================
+
+
+# =============================================================================
+# CRD GENERATION (protoc-gen-crd)
+# =============================================================================
+
+# Where local version of protoc-gen-crd module is stored
+LOCAL_PATH ?= ..
+# Where compiled local plugin is stored
+LOCAL_PROTOC_GEN_CRD ?= $(LOCAL_PATH)/cmd/protoc-gen-crd/protoc-gen-crd
+# Where installed protoc-gen-crd is stored
+PROTOC_GEN_CRD ?= $(shell which protoc-gen-crd || echo "$(GOPATH)/bin/protoc-gen-crd")
+# protoc-gen-crd version to install (read from repo root .versions.yaml)
+PROTOC_GEN_CRD_VERSION ?= $(shell yq '.protobuf.protoc_gen_crd' ../.versions.yaml)
+
+# Path to output generated CRD YAML files (relative to repo root)
+CRD_OUT_DIR = ../distros/kubernetes/nvsentinel/charts/k8s-datastore/crds
+CRD_FILE = $(CRD_OUT_DIR)/health_event.crd.yaml
+
+# ExtRR CRD lands in the janitor chart, not k8s-datastore, because the ExtRR
+# reconciler ships with janitor.
+EXTRR_CRD_OUT_DIR = ../distros/kubernetes/nvsentinel/charts/janitor/crds
+EXTRR_CRD_FILE = $(EXTRR_CRD_OUT_DIR)/external_remediation.crd.yaml
+
+# MR CRD lands in the lifecycle-manager chart, where its reconciler ships.
+MR_CRD_OUT_DIR = ../distros/kubernetes/nvsentinel/charts/lifecycle-manager/crds
+MR_CRD_FILE = $(MR_CRD_OUT_DIR)/maintenance_request.crd.yaml
+
+# Path to vendored crd.proto
+PROTO_OPTIONS = vendor/github.com/yandex/protoc-gen-crd/library/go/k8s/protoc_gen_crd/proto/crd.proto
+
+# Command template to invoke protoc for CRD generation; the output directory is
+# parameterized so different protos can target different chart directories.
+# Usage: $(call PROTOC_CRD_CMD,<out-dir>) <proto-file>
+PROTOC_CRD_CMD = protoc --plugin=protoc-gen-crd=$(PROTOC_GEN_CRD) -I=protobufs -I=vendor --crd_out=paths=source_relative:$(1)
+
+# Backwards-compat alias for any existing callers that hard-coded
+# PROTOC_COMMAND against CRD_OUT_DIR.
+PROTOC_COMMAND = $(call PROTOC_CRD_CMD,$(CRD_OUT_DIR))
+
+# protoc-gen-crd unconditionally emits empty maps/sequences (annotations: {},
+# shortNames: [], additionalPrinterColumns: []) that Kubernetes strips on
+# apply, causing permanent ArgoCD OutOfSync drift. Strip them post-generation.
+# Usage: $(call STRIP_EMPTY_CRD_FIELDS,<crd-file>)
+define STRIP_EMPTY_CRD_FIELDS
+	yq -i 'del(.metadata.annotations | select(length == 0))' $(1)
+	yq -i 'del(.spec.names.shortNames | select(length == 0))' $(1)
+	yq -i 'del(.spec.versions[].additionalPrinterColumns | select(length == 0))' $(1)
+endef
+
+# Install protoc-gen-crd from github (default)
+.PHONY: install-plugin-remote
+install-plugin-remote:
+	@echo "Installing protoc-gen-crd from github..."
+	GO111MODULE=on go install github.com/yandex/protoc-gen-crd/cmd/protoc-gen-crd@$(PROTOC_GEN_CRD_VERSION)
+
+# Install protoc-gen-crd from local source (if developing plugin)
+.PHONY: install-plugin-local
+install-plugin-local:
+	cd $(LOCAL_PATH)/cmd/protoc-gen-crd && go build
+	cp $(LOCAL_PATH)/cmd/protoc-gen-crd/protoc-gen-crd $(GOPATH)/bin/
+
+$(PROTO_OPTIONS):
+	$(GO) mod vendor
+	@if [ ! -f $(PROTO_OPTIONS) ]; then \
+		echo "ERROR: crd.proto not found in vendor. Check tools.go and go.mod setup."; \
+		exit 1; \
+	fi
+
+.PHONY: vendor-proto
+vendor-proto: $(PROTO_OPTIONS)
+
+# Generate CRD YAML for health_event.proto directly in Helm chart directory
+$(CRD_FILE): vendor-proto protobufs/health_event.proto install-plugin-remote
+	@echo "Generating CRD YAML at $(CRD_FILE)..."
+	mkdir -p $(CRD_OUT_DIR)
+	$(call PROTOC_CRD_CMD,$(CRD_OUT_DIR)) health_event.proto
+	$(call STRIP_EMPTY_CRD_FIELDS,$(CRD_FILE))
+	@ls -l $(CRD_FILE) || (echo "CRD file not generated!" && exit 1)
+
+# Generate CRD YAML for external_remediation.proto into the janitor chart.
+# protoc-gen-crd emits a CRD file for every transitively-imported proto that
+# carries a k8s_crd option, so running it against external_remediation.proto
+# also produces a stray health_event.crd.yaml here — the canonical
+# HealthEventResource CRD lives in the k8s-datastore chart, not janitor, so we
+# remove the duplicate after generation.
+$(EXTRR_CRD_FILE): vendor-proto protobufs/external_remediation.proto protobufs/health_event.proto install-plugin-remote
+	@echo "Generating CRD YAML at $(EXTRR_CRD_FILE)..."
+	mkdir -p $(EXTRR_CRD_OUT_DIR)
+	$(call PROTOC_CRD_CMD,$(EXTRR_CRD_OUT_DIR)) external_remediation.proto
+	@rm -f $(EXTRR_CRD_OUT_DIR)/health_event.crd.yaml
+	$(call STRIP_EMPTY_CRD_FIELDS,$(EXTRR_CRD_FILE))
+	@ls -l $(EXTRR_CRD_FILE) || (echo "ExtRR CRD file not generated!" && exit 1)
+
+# MR CRD: maintenance_request.proto transitively imports health_event and
+# external_remediation, each of which carries a k8s_crd option, so
+# protoc-gen-crd emits stray CRD files for them — remove those after
+# generation since the canonical copies live in other charts.
+$(MR_CRD_FILE): vendor-proto protobufs/maintenance_request.proto protobufs/health_event.proto protobufs/external_remediation.proto install-plugin-remote
+	@echo "Generating CRD YAML at $(MR_CRD_FILE)..."
+	mkdir -p $(MR_CRD_OUT_DIR)
+	$(call PROTOC_CRD_CMD,$(MR_CRD_OUT_DIR)) maintenance_request.proto
+	@rm -f $(MR_CRD_OUT_DIR)/health_event.crd.yaml $(MR_CRD_OUT_DIR)/external_remediation.crd.yaml
+	$(call STRIP_EMPTY_CRD_FIELDS,$(MR_CRD_FILE))
+	@ls -l $(MR_CRD_FILE) || (echo "MR CRD file not generated!" && exit 1)
+
+.PHONY: compile-crd-server
+compile-crd-server: $(CRD_FILE) $(EXTRR_CRD_FILE) $(MR_CRD_FILE)
+
+# Clean generated CRD YAML
+.PHONY: crd-clean
+crd-clean:
+	rm -f $(CRD_FILE) $(EXTRR_CRD_FILE) $(MR_CRD_FILE)
+
+# Generate Go protobuf files for data-models (shared across all Go modules)
+.PHONY: protos-generate
+protos-generate: vendor-proto protos-clean compile-crd-server
+	@echo "Generating Go protobuf files for data-models..."
+	@echo "=== Tool Versions ==="
+	@echo "Go: $$(go version)"
+	@echo "protoc: $$(protoc --version)"
+	@echo "protoc-gen-go: $$(protoc-gen-go --version)"
+	@echo "protoc-gen-go-grpc: $$(protoc-gen-go-grpc --version)"
+	@echo "========================"
+	# Generate Go protobuf files (shared by all Go modules)
+	protoc -I protobufs/ -I vendor/ \
+		--go_out=pkg/protos/ --go_opt=paths=source_relative \
+		--go-grpc_out=pkg/protos/ --go-grpc_opt=paths=source_relative \
+		protobufs/health_event.proto \
+		protobufs/external_remediation.proto \
+		protobufs/maintenance_request.proto
+
+# Clean generated Go protobuf files
+.PHONY: protos-clean
+protos-clean: crd-clean
+	@echo "Cleaning generated Go protobuf files in data-models..."
+	@echo "Removing Go protobuf files (.pb.go)..."
+	find pkg/protos/ -name "*.pb.go" -type f -delete 2>/dev/null || true
+
+# Override test target to exclude protobuf packages
+test:
+	@echo "Running tests on $(MODULE_NAME)..."
+	$(GOTESTSUM) --junitfile report.xml -- -race $(TEST_EXTRA_FLAGS) $$(go list ./... | grep -v $(TEST_EXCLUDE_PACKAGES)) -coverprofile=coverage.txt -covermode atomic
+
+# Override lint-test to use the custom test target
+lint-test:
+	@echo "Linting and testing $(MODULE_NAME)..."
+	$(GO) vet ./... && \
+	$(GOLANGCI_LINT) run --config $(GOLANGCI_CONFIG_PATH) $(LINT_EXTRA_FLAGS) && \
+	$(MAKE) test && \
+	$(GO) tool cover -func coverage.txt && \
+	$(GOCOVER_COBERTURA) < coverage.txt > coverage.xml
+
+# =============================================================================
+# MODULE HELP
+# =============================================================================
+
+help:
+	@echo "Data Models Makefile - Using nvsentinel common.mk standards"
+	@echo ""
+	@echo "This module contains shared data models and protobuf definitions."
+	@echo ""
+	@echo "Configuration (environment variables):"
+	@echo "  MODULE_NAME=$(MODULE_NAME)"
+	@echo "  REPO_ROOT=$(REPO_ROOT)"
+	@echo "  HAS_DOCKER=$(HAS_DOCKER)"
+	@echo ""
+	@echo "Main targets:"
+	@echo "  all        - Run lint-test (standardized default)"
+	@echo "  lint-test  - Run full lint and test suite (matches CI)"
+	@echo ""
+	@echo "Individual targets:"
+	@echo "  vet        - Run go vet"
+	@echo "  lint       - Run golangci-lint with code-climate output"
+	@echo "  test       - Run tests with coverage (excludes protobuf packages)"
+	@echo "  coverage   - Generate coverage reports"
+	@echo "  build      - Build the module"
+	@echo ""
+	@echo "Protobuf targets:"
+	@echo "  protos-generate - Generate Go protobuf files from .proto sources"
+	@echo "  protos-clean    - Remove generated Go protobuf files"
+	@echo ""
+	@echo "Utility targets:"
+	@echo "  clean      - Clean build artifacts and reports"
+	@echo "  help       - Show this help message"
+	@echo ""
+	@echo "Module-specific notes:"
+	@echo "  - Contains shared Go data models and protobuf definitions"
+	@echo "  - Generates Go protobuf files (shared by all Go modules)"
+	@echo "  - Python protobuf files are generated in gpu-health-monitor"
+	@echo "  - Excludes protobuf packages from test coverage"
+	@echo "  - No Docker builds (library module only)"
+	@echo "  - Uses standardized nvsentinel build patterns"

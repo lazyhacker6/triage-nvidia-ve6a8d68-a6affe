@@ -1,0 +1,481 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package mongodb
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+)
+
+const (
+	// fieldHealthEventNodeName is the node-name field path in health event documents.
+	fieldHealthEventNodeName = "healthevent.nodename"
+	fieldCreatedAt           = "createdAt"
+	fieldDocumentID          = "_id"
+	operatorGreaterThan      = "$gt"
+)
+
+// MongoHealthEventStore implements HealthEventStore for MongoDB
+type MongoHealthEventStore struct {
+	databaseClient   client.DatabaseClient
+	collectionClient client.CollectionClient
+}
+
+// NewMongoHealthEventStore creates a new MongoDB health event store
+func NewMongoHealthEventStore(databaseClient client.DatabaseClient,
+	collectionClient client.CollectionClient) datastore.HealthEventStore {
+	return &MongoHealthEventStore{
+		databaseClient:   databaseClient,
+		collectionClient: collectionClient,
+	}
+}
+
+// UpdateHealthEventStatus updates health event status
+func (h *MongoHealthEventStore) UpdateHealthEventStatus(ctx context.Context, id string,
+	status datastore.HealthEventStatus) error {
+	// Update the health event status
+	err := h.databaseClient.UpdateDocumentStatus(ctx, id, "healtheventstatus", status)
+	if err != nil {
+		return fmt.Errorf("failed to update health event status: %w", err)
+	}
+
+	return nil
+}
+
+// UpdateSpanID writes a service's span ID into the span_ids map for trace context propagation.
+func (h *MongoHealthEventStore) UpdateSpanID(ctx context.Context, id string, serviceName string, spanID string) error {
+	err := h.databaseClient.UpdateDocumentStatusFields(ctx, id, map[string]any{
+		"healtheventstatus.spanids." + serviceName: spanID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update span ID: %w", err)
+	}
+
+	return nil
+}
+
+// FindHealthEventsByFilter finds health events by filter
+func (h *MongoHealthEventStore) FindHealthEventsByFilter(ctx context.Context,
+	filter map[string]any) ([]datastore.HealthEventWithStatus, error) {
+	cursor, err := h.databaseClient.Find(ctx, filter, nil)
+	if err != nil {
+		return nil, datastore.NewQueryError(
+			datastore.ProviderMongoDB,
+			"failed to find health events by filter",
+			err,
+		).WithMetadata("filter", filter)
+	}
+	defer cursor.Close(ctx)
+
+	var events []datastore.HealthEventWithStatus
+
+	// Iterate manually to populate both the struct and RawEvent with _id
+	for cursor.Next(ctx) {
+		// First decode into a raw map to preserve _id
+		var rawDoc map[string]any
+		if err := cursor.Decode(&rawDoc); err != nil {
+			return nil, datastore.NewQueryError(
+				datastore.ProviderMongoDB,
+				"failed to decode raw document",
+				err,
+			).WithMetadata("filter", filter)
+		}
+
+		// Then use bson to convert the raw map into our struct
+		var event datastore.HealthEventWithStatus
+
+		bsonBytes, err := bson.Marshal(rawDoc)
+		if err != nil {
+			return nil, datastore.NewQueryError(
+				datastore.ProviderMongoDB,
+				"failed to marshal raw document to BSON",
+				err,
+			).WithMetadata("filter", filter)
+		}
+
+		if err := bson.Unmarshal(bsonBytes, &event); err != nil {
+			return nil, datastore.NewQueryError(
+				datastore.ProviderMongoDB,
+				"failed to unmarshal BSON to health event",
+				err,
+			).WithMetadata("filter", filter)
+		}
+
+		// Store the raw document (with _id) in RawEvent
+		event.RawEvent = rawDoc
+
+		events = append(events, event)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, datastore.NewQueryError(
+			datastore.ProviderMongoDB,
+			"cursor error while iterating health events",
+			err,
+		).WithMetadata("filter", filter)
+	}
+
+	// Normalize HealthEvent fields from bson.M to map[string]interface{}
+	normalizeHealthEvents(events)
+
+	return events, nil
+}
+
+// findLatestByFilter returns the newest matching event by creation time and document ID.
+// Errors are returned unwrapped so callers can add their own message and metadata.
+func (h *MongoHealthEventStore) findLatestByFilter(
+	ctx context.Context, filter map[string]any,
+) (*datastore.HealthEventWithStatus, error) {
+	options := &client.FindOneOptions{
+		Sort: bson.D{
+			{Key: fieldCreatedAt, Value: -1},
+			{Key: fieldDocumentID, Value: -1},
+		},
+	}
+
+	result, err := h.databaseClient.FindOne(ctx, filter, options)
+	if err != nil {
+		return nil, err
+	}
+
+	var rawDoc map[string]any
+
+	if err := result.Decode(&rawDoc); err != nil {
+		if client.IsNoDocumentsError(err) {
+			return nil, nil // No matching event
+		}
+
+		return nil, err
+	}
+
+	event, err := decodeRawDocToHealthEvent(rawDoc)
+	if err != nil {
+		return nil, err
+	}
+
+	return &event, nil
+}
+
+// FindLatestHealthEventByQuery returns the newest matching event (by createdAt) using a
+// server-side sort and limit, so it never loads more than one document.
+func (h *MongoHealthEventStore) FindLatestHealthEventByQuery(ctx context.Context,
+	builder datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error) {
+	event, err := h.findLatestByFilter(ctx, builder.ToMongo())
+	if err != nil {
+		return nil, datastore.NewQueryError(
+			datastore.ProviderMongoDB,
+			"failed to find latest health event by query",
+			err,
+		)
+	}
+
+	return event, nil
+}
+
+// FindHealthEventsByQuery finds health events using query builder
+// MongoDB: converts builder to map and uses existing FindHealthEventsByFilter
+func (h *MongoHealthEventStore) FindHealthEventsByQuery(ctx context.Context,
+	builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error) {
+	// Convert query builder to MongoDB filter
+	filter := builder.ToMongo()
+
+	// Use existing implementation
+	return h.FindHealthEventsByFilter(ctx, filter)
+}
+
+// decodeRawDocToHealthEvent decodes a raw BSON map into a HealthEventWithStatus,
+// preserving the original map in RawEvent.
+func decodeRawDocToHealthEvent(rawDoc map[string]any) (datastore.HealthEventWithStatus, error) {
+	bsonBytes, err := bson.Marshal(rawDoc)
+	if err != nil {
+		return datastore.HealthEventWithStatus{}, datastore.NewQueryError(
+			datastore.ProviderMongoDB, "failed to marshal document to BSON", err)
+	}
+
+	var event datastore.HealthEventWithStatus
+	if err := bson.Unmarshal(bsonBytes, &event); err != nil {
+		return datastore.HealthEventWithStatus{}, datastore.NewQueryError(
+			datastore.ProviderMongoDB, "failed to unmarshal BSON to health event", err)
+	}
+
+	event.RawEvent = rawDoc
+
+	return event, nil
+}
+
+type batchedQueryPosition struct {
+	createdAt any
+	id        any
+	set       bool
+}
+
+func (p batchedQueryPosition) filter(base map[string]any) map[string]any {
+	if !p.set {
+		return base
+	}
+
+	return map[string]any{"$and": []any{
+		base,
+		map[string]any{"$or": []any{
+			map[string]any{fieldCreatedAt: map[string]any{operatorGreaterThan: p.createdAt}},
+			map[string]any{
+				fieldCreatedAt:  p.createdAt,
+				fieldDocumentID: map[string]any{operatorGreaterThan: p.id},
+			},
+		}},
+	}}
+}
+
+// FindHealthEventsByQueryBatched iterates matching health events from oldest to
+// newest in bounded batches. Return a non-nil error from fn to stop iteration.
+func (h *MongoHealthEventStore) FindHealthEventsByQueryBatched(ctx context.Context,
+	builder datastore.QueryBuilder, batchSize int,
+	fn func([]datastore.HealthEventWithStatus) error) error {
+	if batchSize <= 0 {
+		return datastore.NewValidationError(
+			datastore.ProviderMongoDB, "batch size must be greater than zero", nil)
+	}
+
+	baseFilter := builder.ToMongo()
+	position := batchedQueryPosition{}
+
+	for {
+		batch, rowsRead, next, err := h.readHealthEventBatch(
+			ctx, position.filter(baseFilter), batchSize)
+		if err != nil {
+			return err
+		}
+
+		if len(batch) > 0 {
+			normalizeHealthEvents(batch)
+
+			if err := fn(batch); err != nil {
+				return err
+			}
+		}
+
+		if rowsRead < batchSize {
+			break
+		}
+
+		position = next
+	}
+
+	return nil
+}
+
+func (h *MongoHealthEventStore) readHealthEventBatch(
+	ctx context.Context,
+	filter map[string]any,
+	batchSize int,
+) ([]datastore.HealthEventWithStatus, int, batchedQueryPosition, error) {
+	limit := int64(batchSize)
+	findOptions := &client.FindOptions{
+		Sort: bson.D{
+			{Key: fieldCreatedAt, Value: 1},
+			{Key: fieldDocumentID, Value: 1},
+		},
+		Limit: &limit,
+	}
+
+	cursor, err := h.databaseClient.Find(ctx, filter, findOptions)
+	if err != nil {
+		return nil, 0, batchedQueryPosition{}, datastore.NewQueryError(
+			datastore.ProviderMongoDB, "failed to find health events for batched query", err)
+	}
+
+	closed := false
+	defer func() {
+		if !closed {
+			_ = cursor.Close(ctx)
+		}
+	}()
+
+	batch := make([]datastore.HealthEventWithStatus, 0, batchSize)
+	position := batchedQueryPosition{}
+	rowsRead := 0
+
+	for cursor.Next(ctx) {
+		rowsRead++
+
+		var rawDoc map[string]any
+		if err := cursor.Decode(&rawDoc); err != nil {
+			return nil, rowsRead, position, datastore.NewQueryError(
+				datastore.ProviderMongoDB, "failed to decode document in batched query", err)
+		}
+
+		createdAt, hasCreatedAt := rawDoc[fieldCreatedAt]
+		id, hasID := rawDoc[fieldDocumentID]
+
+		if !hasCreatedAt || !hasID {
+			return nil, rowsRead, position, datastore.NewQueryError(
+				datastore.ProviderMongoDB,
+				"document is missing the batched-query cursor fields",
+				nil,
+			)
+		}
+
+		position = batchedQueryPosition{createdAt: createdAt, id: id, set: true}
+
+		event, err := decodeBatchedHealthEvent(ctx, rawDoc, createdAt)
+		if err != nil {
+			return nil, rowsRead, position, datastore.NewQueryError(
+				datastore.ProviderMongoDB, "document has invalid batched-query createdAt", err)
+		}
+
+		batch = append(batch, event)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, rowsRead, position, datastore.NewQueryError(
+			datastore.ProviderMongoDB, "cursor error while iterating batched query", err)
+	}
+
+	closeErr := cursor.Close(ctx)
+	closed = true
+
+	if closeErr != nil {
+		return nil, rowsRead, position, datastore.NewQueryError(
+			datastore.ProviderMongoDB, "failed to close cursor for batched query", closeErr)
+	}
+
+	return batch, rowsRead, position, nil
+}
+
+func decodeBatchedHealthEvent(
+	ctx context.Context,
+	rawDoc map[string]any,
+	createdAt any,
+) (datastore.HealthEventWithStatus, error) {
+	recordCreatedAt, err := batchedHealthEventCreatedAt(createdAt)
+	if err != nil {
+		return datastore.HealthEventWithStatus{}, err
+	}
+
+	event, err := decodeRawDocToHealthEvent(rawDoc)
+	if err != nil {
+		// Cold-start supersession can still use readable identity and
+		// health-state fields when only a typed status field is malformed.
+		slog.WarnContext(ctx, "Preserving raw document after struct conversion failed in batched query",
+			"error", err)
+
+		event = datastore.HealthEventWithStatus{RawEvent: rawDoc}
+	}
+
+	event.CreatedAt = recordCreatedAt
+
+	return event, nil
+}
+
+func batchedHealthEventCreatedAt(value any) (time.Time, error) {
+	switch createdAt := value.(type) {
+	case time.Time:
+		return createdAt, nil
+	case bson.DateTime:
+		return createdAt.Time(), nil
+	default:
+		return time.Time{}, fmt.Errorf("unsupported createdAt type %T", value)
+	}
+}
+
+// normalizeHealthEvents converts bson.M types to map[string]interface{} in HealthEvent fields
+// This ensures consistency across database providers (MongoDB-specific types -> generic maps)
+func normalizeHealthEvents(events []datastore.HealthEventWithStatus) {
+	for i := range events {
+		if events[i].HealthEvent != nil {
+			events[i].HealthEvent = normalizeValue(events[i].HealthEvent)
+		}
+	}
+}
+
+// normalizeValue recursively converts MongoDB types (bson.M, bson.D, bson.A, etc.) to standard Go types
+func normalizeValue(v any) any {
+	switch val := v.(type) {
+	case bson.D:
+		return normalizeD(val)
+	case bson.A:
+		return normalizeArray(val)
+	case bson.M:
+		// bson.M is a defined type, not an alias for map[string]interface{}, so it
+		// does not match the case below. The collection client sets
+		// DefaultDocumentM, which makes this the shape documents actually decode
+		// into -- without this case the whole value is returned un-normalized.
+		return normalizeMap(val)
+	case map[string]any:
+		return normalizeMap(val)
+	case []any:
+		return normalizeArray(val)
+	default:
+		// Primitive types, return as-is
+		return val
+	}
+}
+
+// normalizeD converts bson.D to map[string]interface{} and normalizes nested values
+func normalizeD(val bson.D) any {
+	bsonBytes, err := bson.Marshal(val)
+	if err != nil {
+		return val // Return as-is if marshal fails
+	}
+
+	var m map[string]any
+	if err := bson.Unmarshal(bsonBytes, &m); err != nil {
+		return val // Return as-is if unmarshal fails
+	}
+
+	return normalizeMap(m)
+}
+
+// normalizeMap recursively normalizes all values in a map
+func normalizeMap(m map[string]any) map[string]any {
+	result := make(map[string]any, len(m))
+	for k, v := range m {
+		result[k] = normalizeValue(v)
+	}
+
+	return result
+}
+
+// normalizeArray recursively normalizes all elements in an array
+func normalizeArray(arr any) []any {
+	var length int
+
+	var getValue func(int) any
+
+	switch v := arr.(type) {
+	case bson.A:
+		length = len(v)
+		getValue = func(i int) any { return v[i] }
+	case []any:
+		length = len(v)
+		getValue = func(i int) any { return v[i] }
+	default:
+		return nil
+	}
+
+	result := make([]any, length)
+	for i := 0; i < length; i++ {
+		result[i] = normalizeValue(getValue(i))
+	}
+
+	return result
+}

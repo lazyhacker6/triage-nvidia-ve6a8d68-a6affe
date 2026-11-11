@@ -1,0 +1,1086 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package xid
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	pb "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/xid/parser"
+)
+
+const (
+	testMetadataJSON = `
+{
+  "version": "1.0",
+  "timestamp": "2025-12-10T18:12:55Z",
+  "node_name": "test-node",
+  "chassis_serial": null,
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-123",
+      "pci_address": "0000:00:08.0",
+      "serial_number": "1655322020697",
+      "device_name": "NVIDIA H100 80GB HBM3",
+      "nvlinks": [
+        {
+          "link_id": 0,
+          "remote_pci_address": "ffff:ff:ff.0",
+          "remote_link_id": 0
+        },
+        {
+          "link_id": 1,
+          "remote_pci_address": "ffff:ff:ff.0",
+          "remote_link_id": 0
+        }
+      ]
+    }
+  ]
+}`
+	// Pre-R575 driver version metadata (uses V1 IntrInfoBinary patterns from Column C)
+	testMetadataPreR575JSON = `
+{
+  "version": "1.0",
+  "timestamp": "2025-12-10T18:12:55Z",
+  "node_name": "test-node",
+  "driver_version": "570.148.08",
+  "chassis_serial": null,
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-123",
+      "pci_address": "0000:00:08.0",
+      "serial_number": "1655322020697",
+      "device_name": "NVIDIA H100 80GB HBM3",
+      "nvlinks": []
+    }
+  ]
+}`
+	// R575+ driver version metadata (uses V2 IntrInfoBinary patterns from Column D)
+	testMetadataR575JSON = `
+{
+  "version": "1.0",
+  "timestamp": "2025-12-10T18:12:55Z",
+  "node_name": "test-node",
+  "driver_version": "575.51.02",
+  "chassis_serial": null,
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-123",
+      "pci_address": "0000:00:08.0",
+      "serial_number": "1655322020697",
+      "device_name": "NVIDIA H100 80GB HBM3",
+      "nvlinks": []
+    }
+  ]
+}`
+	testMetadataMissingPCIJSON = `
+{
+  "version": "1.0",
+  "timestamp": "2025-12-10T18:12:55Z",
+  "node_name": "test-node",
+  "chassis_serial": null,
+  "gpus": [
+    {
+      "gpu_id": 0,
+      "uuid": "GPU-123",
+      "serial_number": "1655322020697",
+      "device_name": "NVIDIA H100 80GB HBM3",
+      "nvlinks": [
+        {
+          "link_id": 0,
+          "remote_pci_address": "ffff:ff:ff.0",
+          "remote_link_id": 0
+        },
+        {
+          "link_id": 1,
+          "remote_pci_address": "ffff:ff:ff.0",
+          "remote_link_id": 0
+        }
+      ]
+    }
+  ]
+}`
+)
+
+func TestParseNVRMGPUMapLine(t *testing.T) {
+	xidHandler := &XIDHandler{}
+
+	testCases := []struct {
+		name  string
+		line  string
+		pciId string
+		gpuId string
+	}{
+		{
+			name:  "Valid XID Error",
+			line:  "NVRM: GPU at PCI:0000:00:08.0: GPU-123",
+			pciId: "0000:00:08.0",
+			gpuId: "GPU-123",
+		},
+		{
+			name:  "Invalid XID Error",
+			line:  "NVRM: Some other error message",
+			pciId: "",
+			gpuId: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			pciId, gpuId := xidHandler.parseNVRMGPUMapLine(tc.line)
+			assert.Equal(t, tc.pciId, pciId)
+			assert.Equal(t, tc.gpuId, gpuId)
+		})
+	}
+}
+
+func TestParseGPUResetLine(t *testing.T) {
+	xidHandler := &XIDHandler{}
+
+	testCases := []struct {
+		name    string
+		line    string
+		gpuId   string
+		success bool
+	}{
+		{
+			name:    "Valid GPU Reset Line Success",
+			line:    "GPU reset executed: GPU-123, success: true",
+			gpuId:   "GPU-123",
+			success: true,
+		},
+		{
+			name:    "Valid GPU Reset Line Failure",
+			line:    "GPU reset executed: GPU-123, success: false",
+			gpuId:   "GPU-123",
+			success: false,
+		},
+		{
+			name:    "Invalid GPU Reset Line",
+			line:    "GPU reset executed:",
+			gpuId:   "",
+			success: false,
+		},
+		{
+			name:    "XID Log Line GPU",
+			line:    "NVRM: GPU at PCI:0000:00:08.0: GPU-123",
+			gpuId:   "",
+			success: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			gpuId, success := xidHandler.parseGPUResetLine(tc.line)
+			assert.Equal(t, tc.gpuId, gpuId)
+			assert.Equal(t, tc.success, success)
+		})
+	}
+}
+
+func TestNormalizePCI(t *testing.T) {
+	xidHandler := &XIDHandler{}
+
+	testCases := []struct {
+		name          string
+		pci           string
+		normalizedPCI string
+	}{
+		{
+			name:          "Valid PCI",
+			pci:           "0000:00:08.0",
+			normalizedPCI: "0000:00:08",
+		},
+		{
+			name:          "PCI without dot",
+			pci:           "0000:00:08",
+			normalizedPCI: "0000:00:08",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			normalizedPCI := xidHandler.normalizePCI(tc.pci)
+			assert.Equal(t, tc.normalizedPCI, normalizedPCI)
+		})
+	}
+}
+
+func TestDetermineFatality(t *testing.T) {
+	xidHandler, err := NewXIDHandler("test-node",
+		"test-agent", "test-component", "test-check", "http://localhost:8080", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+	assert.Nil(t, err)
+
+	testCases := []struct {
+		name     string
+		code     pb.RecommendedAction
+		fatality bool
+	}{
+		{
+			name:     "Fatal XID",
+			code:     pb.RecommendedAction_CONTACT_SUPPORT,
+			fatality: true,
+		},
+		{
+			name:     "Non-Fatal XID",
+			code:     pb.RecommendedAction_NONE,
+			fatality: false,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			fatality := xidHandler.determineFatality(tc.code)
+			assert.Equal(t, tc.fatality, fatality)
+		})
+	}
+}
+
+// mockParser is a mock implementation of parser.Parser for testing
+type mockParser struct {
+	parseFunc func(message string) (*parser.Response, error)
+}
+
+func (m *mockParser) Parse(message string) (*parser.Response, error) {
+	if m.parseFunc != nil {
+		return m.parseFunc(message)
+	}
+	return nil, nil
+}
+
+func TestProcessLine(t *testing.T) {
+	tmpDir := t.TempDir()
+	metadataFile := filepath.Join(tmpDir, "gpu_metadata.json")
+	require.NoError(t, os.WriteFile(metadataFile, []byte(testMetadataJSON), 0600))
+	metadataFileMissingPCI := filepath.Join(tmpDir, "gpu_metadata_missing_pci.json")
+	require.NoError(t, os.WriteFile(metadataFileMissingPCI, []byte(testMetadataMissingPCIJSON), 0600))
+
+	testCases := []struct {
+		name          string
+		message       string
+		setupHandler  func() *XIDHandler
+		expectEvent   bool
+		expectError   bool
+		validateEvent func(t *testing.T, events *pb.HealthEvents)
+	}{
+		{
+			name:    "NVRM GPU Map Line",
+			message: "NVRM: GPU at PCI:0000:00:08.0: GPU-12345678-1234-1234-1234-123456789012",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return nil, nil
+					},
+				}
+				return h
+			},
+			expectEvent: false,
+			expectError: false,
+		},
+		{
+			name:    "Valid XID Message",
+			message: "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_STORE_ONLY)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return &parser.Response{
+							Success: true,
+							Result: parser.XIDDetails{
+								DecodedXIDStr: "Xid 79",
+								PCIE:          "0000:00:08.0",
+								Mnemonic:      "GPU has fallen off the bus",
+								Resolution:    "CONTACT_SUPPORT",
+								Number:        79,
+							},
+						}, nil
+					},
+				}
+				return h
+			},
+			expectEvent: true,
+			expectError: false,
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				assert.Equal(t, "test-agent", event.Agent)
+				assert.Equal(t, "xid-check", event.CheckName)
+				assert.Equal(t, "GPU", event.ComponentClass)
+				assert.False(t, event.IsHealthy)
+				assert.True(t, event.IsFatal)
+				assert.Equal(t, pb.RecommendedAction_CONTACT_SUPPORT, event.RecommendedAction)
+				assert.Equal(t, "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process", event.Message)
+				require.Len(t, event.ErrorCode, 1)
+				assert.Equal(t, "Xid 79", event.ErrorCode[0])
+				require.Len(t, event.EntitiesImpacted, 1)
+				assert.Equal(t, "PCI", event.EntitiesImpacted[0].EntityType)
+				assert.Equal(t, "0000:00:08", event.EntitiesImpacted[0].EntityValue)
+				// Issue #197: Message field stores full journal, no Metadata duplication
+				assert.Empty(t, event.Metadata)
+				assert.Equal(t, pb.ProcessingStrategy_STORE_ONLY, event.ProcessingStrategy)
+			},
+		},
+		{
+			name:    "Valid GPU Reset Message",
+			message: "GPU reset executed: GPU-123, success: true",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", metadataFile, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				return h
+			},
+			expectEvent: true,
+			expectError: false,
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				expectedEvent := &pb.HealthEvent{
+					Version:        1,
+					Agent:          "test-agent",
+					CheckName:      "xid-check",
+					ComponentClass: "GPU",
+					EntitiesImpacted: []*pb.Entity{
+						{
+							EntityType:  "PCI",
+							EntityValue: "0000:00:08",
+						},
+						{
+							EntityType:  "GPU_UUID",
+							EntityValue: "GPU-123",
+						},
+					},
+					Message:            healthyHealthEventMessage,
+					IsFatal:            false,
+					IsHealthy:          true,
+					NodeName:           "test-node",
+					RecommendedAction:  pb.RecommendedAction_NONE,
+					ProcessingStrategy: pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+				}
+				assert.NotNil(t, event.GeneratedTimestamp)
+				event.GeneratedTimestamp = nil
+				assert.Equal(t, expectedEvent, event)
+			},
+		},
+		{
+			name:    "GPU Reset Failure Message",
+			message: "GPU reset executed: GPU-123, success: false",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", metadataFile, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				return h
+			},
+			expectEvent: true,
+			expectError: false,
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				expectedEvent := &pb.HealthEvent{
+					Version:        1,
+					Agent:          "test-agent",
+					CheckName:      "xid-check",
+					ComponentClass: "GPU",
+					EntitiesImpacted: []*pb.Entity{
+						{
+							EntityType:  "PCI",
+							EntityValue: "0000:00:08",
+						},
+						{
+							EntityType:  "GPU_UUID",
+							EntityValue: "GPU-123",
+						},
+					},
+					ErrorCode:          []string{gpuResetFailureErrorCode},
+					Message:            gpuResetFailureMessage,
+					IsFatal:            true,
+					IsHealthy:          false,
+					NodeName:           "test-node",
+					RecommendedAction:  pb.RecommendedAction_RESTART_VM,
+					ProcessingStrategy: pb.ProcessingStrategy_EXECUTE_REMEDIATION,
+				}
+				assert.NotNil(t, event.GeneratedTimestamp)
+				event.GeneratedTimestamp = nil
+				assert.Equal(t, expectedEvent, event)
+			},
+		},
+		{
+			name:    "Valid GPU Reset Message with Metadata Collector not Initialized",
+			message: "GPU reset executed: GPU-123, success: true",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				return h
+			},
+			expectEvent: false,
+			expectError: true,
+		},
+		{
+			name:    "Valid GPU Reset Message with Metadata Collector missing GPU UUID",
+			message: "GPU reset executed: GPU-456, success: true",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", metadataFile, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				return h
+			},
+			expectEvent: false,
+			expectError: true,
+		},
+		{
+			name:    "Valid GPU Reset Message with Metadata Collector not containing PCI",
+			message: "GPU reset executed: GPU-123, success: true",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", metadataFileMissingPCI, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				return h
+			},
+			expectEvent: false,
+			expectError: true,
+		},
+		{
+			name:    "Valid XID with GPU UUID from NVRM: RESET_GPU overridden to RESTART_VM",
+			message: "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return &parser.Response{
+							Success: true,
+							Result: parser.XIDDetails{
+								DecodedXIDStr: "Xid 79",
+								PCIE:          "0000:00:08.0",
+								Mnemonic:      "GPU has fallen off the bus",
+								Resolution:    "RESET_GPU",
+								Number:        79,
+							},
+						}, nil
+					},
+				}
+				h.pciToGPUUUID["0000:00:08"] = "GPU-12345678-1234-1234-1234-123456789012"
+				return h
+			},
+			expectEvent: true,
+			expectError: false,
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				require.Len(t, event.EntitiesImpacted, 2)
+				assert.Equal(t, "PCI", event.EntitiesImpacted[0].EntityType)
+				assert.Equal(t, "GPU_UUID", event.EntitiesImpacted[1].EntityType)
+				assert.Equal(t, "GPU-12345678-1234-1234-1234-123456789012", event.EntitiesImpacted[1].EntityValue)
+				assert.Equal(t, "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process", event.Message)
+				assert.Equal(t, pb.RecommendedAction_RESTART_VM, event.RecommendedAction)
+				assert.Empty(t, event.Metadata)
+			},
+		},
+		{
+			name:    "Valid XID with GPU UUID from Metadata Collector: RESET_GPU kept",
+			message: "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", metadataFile, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return &parser.Response{
+							Success: true,
+							Result: parser.XIDDetails{
+								DecodedXIDStr: "Xid 79",
+								PCIE:          "0000:00:08.0",
+								Mnemonic:      "GPU has fallen off the bus",
+								Resolution:    "RESET_GPU",
+								Number:        79,
+							},
+						}, nil
+					},
+				}
+				return h
+			},
+			expectEvent: true,
+			expectError: false,
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				require.Len(t, event.EntitiesImpacted, 2)
+				assert.Equal(t, "PCI", event.EntitiesImpacted[0].EntityType)
+				assert.Equal(t, "GPU_UUID", event.EntitiesImpacted[1].EntityType)
+				assert.Equal(t, "GPU-123", event.EntitiesImpacted[1].EntityValue)
+				assert.Equal(t, "NVRM: Xid (PCI:0000:00:08.0): 79, pid=12345, name=test-process", event.Message)
+				assert.Equal(t, pb.RecommendedAction_COMPONENT_RESET, event.RecommendedAction)
+				assert.Empty(t, event.Metadata)
+				assert.Equal(t, pb.ProcessingStrategy_EXECUTE_REMEDIATION, event.ProcessingStrategy)
+			},
+		},
+		{
+			name:    "Parser Returns Error",
+			message: "Some random message",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return nil, errors.New("parse error")
+					},
+				}
+				return h
+			},
+			expectEvent: false,
+			expectError: false,
+		},
+		{
+			name:    "Parser Returns Nil Response",
+			message: "Some random message",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return nil, nil
+					},
+				}
+				return h
+			},
+			expectEvent: false,
+			expectError: false,
+		},
+		{
+			name:    "Parser Returns Success=false",
+			message: "Some random message",
+			setupHandler: func() *XIDHandler {
+				h, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+				h.parser = &mockParser{
+					parseFunc: func(msg string) (*parser.Response, error) {
+						return &parser.Response{
+							Success: false,
+						}, nil
+					},
+				}
+				return h
+			},
+			expectEvent: false,
+			expectError: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := tc.setupHandler()
+			events, err := handler.ProcessLine(tc.message)
+
+			if tc.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			if tc.expectEvent {
+				require.NotNil(t, events)
+				if tc.validateEvent != nil {
+					tc.validateEvent(t, events)
+				}
+			} else {
+				assert.Nil(t, events)
+			}
+		})
+	}
+}
+
+func TestProcessLine_XID154RecoveryToNoneEmitsHealthyClear(t *testing.T) {
+	h := newHandlerWithMetadata(t)
+	h.parser = &mockParser{parseFunc: func(string) (*parser.Response, error) {
+		return &parser.Response{
+			Success: true,
+			Result: parser.XIDDetails{
+				DecodedXIDStr: "154",
+				Number:        154,
+				PCIE:          "0000:00:08.0",
+				Resolution:    "NONE",
+			},
+		}, nil
+	}}
+
+	events, err := h.ProcessLine("NVRM: Xid (PCI:0000:00:08.0): 154, GPU recovery action changed from 0x1 (GPU Reset Required) to 0x0 (None)")
+	require.NoError(t, err)
+	require.NotNil(t, events)
+	require.Len(t, events.Events, 2)
+
+	source := events.Events[0]
+	assert.Equal(t, []string{"154"}, source.ErrorCode)
+	assert.False(t, source.IsHealthy)
+
+	clear := events.Events[1]
+	assert.True(t, clear.IsHealthy)
+	assert.False(t, clear.IsFatal)
+	assert.Equal(t, pb.RecommendedAction_NONE, clear.RecommendedAction)
+	assert.Empty(t, clear.ErrorCode, "an empty error code clears all XID conditions for the impacted entities")
+	assert.Equal(t, source.Agent, clear.Agent)
+	assert.Equal(t, source.CheckName, clear.CheckName)
+	assert.Equal(t, source.ComponentClass, clear.ComponentClass)
+	assert.Equal(t, source.NodeName, clear.NodeName)
+	assert.Equal(t, source.EntitiesImpacted, clear.EntitiesImpacted)
+}
+
+func TestProcessLine_XID154ClearsTrackedMetadataForOnlyRecoveredGPU(t *testing.T) {
+	h := newHandlerWithMetadata(t)
+	h.parser = &mockParser{parseFunc: func(line string) (*parser.Response, error) {
+		switch line {
+		case "gpu-a-xid-74":
+			return &parser.Response{Success: true, Result: parser.XIDDetails{
+				DecodedXIDStr: "74", Number: 74, PCIE: "0000:00:08.0", Resolution: "NONE",
+				Metadata: map[string]string{"NVLINK": "7", "REG0": "gpu-a-reg"},
+			}}, nil
+		case "gpu-b-xid-74":
+			return &parser.Response{Success: true, Result: parser.XIDDetails{
+				DecodedXIDStr: "74", Number: 74, PCIE: "0000:00:09.0", Resolution: "NONE",
+				Metadata: map[string]string{"NVLINK": "8", "REG0": "gpu-b-reg"},
+			}}, nil
+		case "gpu-a-recovered":
+			return &parser.Response{Success: true, Result: parser.XIDDetails{
+				DecodedXIDStr: "154", Number: 154, PCIE: "0000:00:08.0", Resolution: "NONE",
+			}}, nil
+		default:
+			t.Fatalf("unexpected parser input %q", line)
+			return nil, nil
+		}
+	}}
+
+	for _, line := range []string{"gpu-a-xid-74", "gpu-b-xid-74"} {
+		_, err := h.ProcessLine(line)
+		require.NoError(t, err)
+	}
+
+	events, err := h.ProcessLine("gpu-a-recovered")
+	require.NoError(t, err)
+	require.Len(t, events.Events, 2)
+
+	clear := events.Events[1]
+	require.True(t, clear.IsHealthy)
+	assert.Contains(t, clear.EntitiesImpacted, &pb.Entity{EntityType: "NVLINK", EntityValue: "7"})
+	assert.Contains(t, clear.EntitiesImpacted, &pb.Entity{EntityType: "REG0", EntityValue: "gpu-a-reg"})
+	assert.NotContains(t, clear.EntitiesImpacted, &pb.Entity{EntityType: "NVLINK", EntityValue: "8"})
+	assert.NotContains(t, clear.EntitiesImpacted, &pb.Entity{EntityType: "REG0", EntityValue: "gpu-b-reg"})
+}
+
+func TestProcessLine_OnlyXID154RecoveryToNoneEmitsHealthyClear(t *testing.T) {
+	testCases := []struct {
+		name     string
+		response *parser.Response
+	}{
+		{
+			name: "XID 154 still requests reset",
+			response: &parser.Response{Success: true, Result: parser.XIDDetails{
+				DecodedXIDStr: "154", Number: 154, PCIE: "0000:00:08.0", Resolution: "COMPONENT_RESET",
+			}},
+		},
+		{
+			name: "another non-fatal XID with no action",
+			response: &parser.Response{Success: true, Result: parser.XIDDetails{
+				DecodedXIDStr: "32", Number: 32, PCIE: "0000:00:08.0", Resolution: "NONE",
+			}},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHandlerWithMetadata(t)
+			h.parser = &mockParser{parseFunc: func(string) (*parser.Response, error) { return tc.response, nil }}
+
+			events, err := h.ProcessLine("ignored")
+			require.NoError(t, err)
+			require.NotNil(t, events)
+			require.Len(t, events.Events, 1)
+		})
+	}
+}
+
+func TestCreateHealthEventFromResponse(t *testing.T) {
+	handler, _ := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check", "", "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+
+	testCases := []struct {
+		name          string
+		xidResp       *parser.Response
+		message       string
+		setupHandler  func()
+		validateEvent func(t *testing.T, events *pb.HealthEvents)
+	}{
+		{
+			name: "Basic XID Event",
+			xidResp: &parser.Response{
+				Success: true,
+				Result: parser.XIDDetails{
+					DecodedXIDStr: "Xid 79",
+					PCIE:          "0000:00:08.0",
+					Mnemonic:      "GPU has fallen off the bus",
+					Resolution:    "CONTACT_SUPPORT",
+					Number:        79,
+				},
+			},
+			message:      "Test XID message",
+			setupHandler: func() {},
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				assert.Equal(t, uint32(1), events.Version)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				assert.Equal(t, uint32(1), event.Version)
+				assert.Equal(t, "test-agent", event.Agent)
+				assert.Equal(t, "xid-check", event.CheckName)
+				assert.Equal(t, "GPU", event.ComponentClass)
+				assert.False(t, event.IsHealthy)
+				assert.True(t, event.IsFatal)
+				assert.Equal(t, pb.RecommendedAction_CONTACT_SUPPORT, event.RecommendedAction)
+				assert.Equal(t, "Test XID message", event.Message)
+				require.Len(t, event.ErrorCode, 1)
+				assert.Equal(t, "Xid 79", event.ErrorCode[0])
+				assert.Equal(t, "test-node", event.NodeName)
+				assert.NotNil(t, event.GeneratedTimestamp)
+				assert.Empty(t, event.Metadata)
+				assert.Equal(t, pb.ProcessingStrategy_EXECUTE_REMEDIATION, event.ProcessingStrategy)
+			},
+		},
+		{
+			name: "XID Event with GPU UUID",
+			xidResp: &parser.Response{
+				Success: true,
+				Result: parser.XIDDetails{
+					DecodedXIDStr: "Xid 13",
+					PCIE:          "0000:00:09.0",
+					Mnemonic:      "Graphics Engine Exception",
+					Resolution:    "IGNORE",
+					Number:        13,
+				},
+			},
+			message: "Test XID message",
+			setupHandler: func() {
+				handler.pciToGPUUUID["0000:00:09"] = "GPU-ABCDEF12-3456-7890-ABCD-EF1234567890"
+			},
+			validateEvent: func(t *testing.T, events *pb.HealthEvents) {
+				require.NotNil(t, events)
+				require.Len(t, events.Events, 1)
+				event := events.Events[0]
+				require.Len(t, event.EntitiesImpacted, 2)
+				assert.Equal(t, "PCI", event.EntitiesImpacted[0].EntityType)
+				assert.Equal(t, "0000:00:09", event.EntitiesImpacted[0].EntityValue)
+				assert.Equal(t, "GPU_UUID", event.EntitiesImpacted[1].EntityType)
+				assert.Equal(t, "GPU-ABCDEF12-3456-7890-ABCD-EF1234567890", event.EntitiesImpacted[1].EntityValue)
+				assert.Equal(t, "Test XID message", event.Message)
+				assert.Empty(t, event.Metadata)
+				assert.Equal(t, pb.ProcessingStrategy_EXECUTE_REMEDIATION, event.ProcessingStrategy)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler.pciToGPUUUID = make(map[string]string)
+			tc.setupHandler()
+
+			events := handler.createHealthEventFromResponse(tc.xidResp, tc.message)
+
+			if tc.validateEvent != nil {
+				tc.validateEvent(t, events)
+			}
+		})
+	}
+}
+
+// TestNVL5XIDDriverVersionDependentParsing verifies that NVL5 XIDs (144-150) are parsed
+// differently based on driver version. Pre-R575 drivers use V1 IntrInfoBinary patterns (Column C),
+// while R575+ drivers use V2 patterns (Column D) from the Xid-Catalog.xlsx.
+func TestNVL5XIDDriverVersionDependentParsing(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create metadata files with different driver versions
+	metadataPreR575 := filepath.Join(tmpDir, "metadata_pre_r575.json")
+	require.NoError(t, os.WriteFile(metadataPreR575, []byte(testMetadataPreR575JSON), 0600))
+
+	metadataR575 := filepath.Join(tmpDir, "metadata_r575.json")
+	require.NoError(t, os.WriteFile(metadataR575, []byte(testMetadataR575JSON), 0600))
+
+	// XID 145 NVL5 message with intrInfo=0x00000082 and errorStatus=0x00000040
+	// This intrInfo matches V1 Rule 7 pattern "------000000----------0010000010" (RLW_REMAP, RESET_GPU)
+	// but does NOT match any V2 pattern
+	//
+	// Binary of 0x00000082: 00000000000000000000000010000010
+	// V1 Rule 7 pattern requires bits 22-31 = "0010000010" - matches
+	// V2 Rule 7 pattern requires bits 25-31 = "0000100" but we have "0000010" - no match
+	nvl5Message := "NVRM: Xid (PCI:0000:00:08.0): 145, RLW_REMAP Nonfatal XC1 i0 Link 10 (0x00000082 0x00000040 0x00000000 0x00000000 0x00000000 0x00000000)"
+
+	t.Run("Pre-R575 driver matches V1 pattern with RESET_GPU resolution", func(t *testing.T) {
+		handler, err := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check",
+			"", metadataPreR575, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+		require.NoError(t, err)
+
+		events, err := handler.ProcessLine(nvl5Message)
+		require.NoError(t, err)
+		require.NotNil(t, events, "Should match V1 pattern and produce event")
+		require.Len(t, events.Events, 1)
+
+		event := events.Events[0]
+		// V1 Rule 7 match: RLW_REMAP with Resolution="RESET_GPU" maps to COMPONENT_RESET
+		assert.Equal(t, pb.RecommendedAction_COMPONENT_RESET, event.RecommendedAction,
+			"Pre-R575 driver should match V1 Rule 7 pattern (RESET_GPU maps to COMPONENT_RESET)")
+		assert.Contains(t, event.ErrorCode[0], "145")
+	})
+
+	t.Run("R575+ driver does not match V1 intrInfo pattern", func(t *testing.T) {
+		handler, err := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check",
+			"", metadataR575, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+		require.NoError(t, err)
+
+		events, err := handler.ProcessLine(nvl5Message)
+		require.NoError(t, err)
+		require.NotNil(t, events, "Should still produce event even without NVL5 rule match")
+		require.Len(t, events.Events, 1)
+
+		event := events.Events[0]
+		// V2 patterns do NOT match this intrInfo (0x82), so no rule matches, returns default NONE
+		assert.Equal(t, pb.RecommendedAction_NONE, event.RecommendedAction,
+			"R575+ driver should NOT match V1 intrInfo pattern, returns default NONE")
+		assert.Contains(t, event.ErrorCode[0], "145")
+	})
+
+	// Second message with intrInfo=0x00000004 that matches V2 Rule 7 but NOT V1
+	// V2 Rule 7: IntrInfo="------000000-------------0000100" (bits 25-31 = 0000100 = 4)
+	// V1 Rule 7: IntrInfo="------000000----------0010000010" (bits 22-31 = 0010000010 = 130)
+	nvl5MessageV2 := "NVRM: Xid (PCI:0000:00:08.0): 145, RLW_REMAP Nonfatal XC1 i0 Link 10 (0x00000004 0x00000040 0x00000000 0x00000000 0x00000000 0x00000000)"
+
+	t.Run("R575+ driver matches V2 pattern with RESET_GPU resolution", func(t *testing.T) {
+		handler, err := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check",
+			"", metadataR575, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+		require.NoError(t, err)
+
+		events, err := handler.ProcessLine(nvl5MessageV2)
+		require.NoError(t, err)
+		require.NotNil(t, events, "Should match V2 pattern and produce event")
+		require.Len(t, events.Events, 1)
+
+		event := events.Events[0]
+		// V2 Rule 7 match: RLW_REMAP with Resolution="RESET_GPU" maps to COMPONENT_RESET
+		assert.Equal(t, pb.RecommendedAction_COMPONENT_RESET, event.RecommendedAction,
+			"R575+ driver should match V2 Rule 7 pattern (RESET_GPU maps to COMPONENT_RESET)")
+		assert.Contains(t, event.ErrorCode[0], "145")
+	})
+
+	t.Run("Pre-R575 driver does not match V2 intrInfo pattern", func(t *testing.T) {
+		handler, err := NewXIDHandler("test-node", "test-agent", "GPU", "xid-check",
+			"", metadataPreR575, pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+		require.NoError(t, err)
+
+		events, err := handler.ProcessLine(nvl5MessageV2)
+		require.NoError(t, err)
+		require.NotNil(t, events, "Should still produce event even without NVL5 rule match")
+		require.Len(t, events.Events, 1)
+
+		event := events.Events[0]
+		// V1 patterns do NOT match this intrInfo (0x04), so no rule matches, returns default NONE
+		assert.Equal(t, pb.RecommendedAction_NONE, event.RecommendedAction,
+			"Pre-R575 driver should NOT match V2 intrInfo pattern, returns default NONE")
+		assert.Contains(t, event.ErrorCode[0], "145")
+	})
+}
+
+func TestNewXIDHandler(t *testing.T) {
+	testCases := []struct {
+		name                string
+		nodeName            string
+		agentName           string
+		componentClass      string
+		checkName           string
+		xidAnalyserEndpoint string
+		expectError         bool
+	}{
+		{
+			name:                "With XID Analyser Endpoint",
+			nodeName:            "test-node",
+			agentName:           "test-agent",
+			componentClass:      "GPU",
+			checkName:           "xid-check",
+			xidAnalyserEndpoint: "http://localhost:8080",
+			expectError:         false,
+		},
+		{
+			name:                "Without XID Analyser Endpoint",
+			nodeName:            "test-node",
+			agentName:           "test-agent",
+			componentClass:      "GPU",
+			checkName:           "xid-check",
+			xidAnalyserEndpoint: "",
+			expectError:         false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler, err := NewXIDHandler(tc.nodeName, tc.agentName, tc.componentClass, tc.checkName, tc.xidAnalyserEndpoint, "/tmp/metadata.json", pb.ProcessingStrategy_EXECUTE_REMEDIATION)
+
+			if tc.expectError {
+				assert.Error(t, err)
+				assert.Nil(t, handler)
+			} else {
+				assert.NoError(t, err)
+				require.NotNil(t, handler)
+				assert.Equal(t, tc.nodeName, handler.nodeName)
+				assert.Equal(t, tc.agentName, handler.defaultAgentName)
+				assert.Equal(t, tc.componentClass, handler.defaultComponentClass)
+				assert.Equal(t, tc.checkName, handler.checkName)
+				assert.NotNil(t, handler.pciToGPUUUID)
+				assert.NotNil(t, handler.parser)
+				assert.NotNil(t, handler.metadataReader)
+			}
+		})
+	}
+}
+
+func TestProcessLine_SidecarGuidance_PreservesRecoveryBehavior(t *testing.T) {
+	testCases := []struct {
+		name       string
+		message    string
+		fields     string
+		wantSuffix string
+	}{
+		{
+			name:       "action supplied",
+			fields:     `,"investigatory_action":"Check device diagnostics"`,
+			wantSuffix: ", Investigatory Action=Check device diagnostics",
+		},
+		{
+			name: "missing action",
+		},
+		{
+			name:   "null action",
+			fields: `,"investigatory_action":null`,
+		},
+		{
+			name:   "empty action",
+			fields: `,"investigatory_action":""`,
+		},
+		{
+			name:   "blank action",
+			fields: `,"investigatory_action":" \t\n "`,
+		},
+		{
+			name:       "padded action",
+			fields:     `,"investigatory_action":" \nCheck device diagnostics\t "`,
+			wantSuffix: ", Investigatory Action=Check device diagnostics",
+		},
+		{
+			name:       "original message preserved",
+			message:    "Synthetic XID message\n",
+			fields:     `,"investigatory_action":"Check device diagnostics"`,
+			wantSuffix: ", Investigatory Action=Check device diagnostics",
+		},
+	}
+
+	recoveries := []struct {
+		name       string
+		xid        int
+		resolution string
+		wantAction pb.RecommendedAction
+		wantFatal  bool
+		wantEvents int
+	}{
+		{
+			name:       "nonfatal XID",
+			xid:        149,
+			resolution: "XID_154_EVAL",
+			wantAction: pb.RecommendedAction_NONE,
+			wantEvents: 1,
+		},
+		{
+			name:       "XID 154 requests reset",
+			xid:        154,
+			resolution: "COMPONENT_RESET",
+			wantAction: pb.RecommendedAction_COMPONENT_RESET,
+			wantFatal:  true,
+			wantEvents: 1,
+		},
+		{
+			name:       "XID 154 returns to None",
+			xid:        154,
+			resolution: "NONE",
+			wantAction: pb.RecommendedAction_NONE,
+			wantEvents: 2,
+		},
+	}
+
+	for _, tc := range testCases {
+		for _, recovery := range recoveries {
+			t.Run(tc.name+"/"+recovery.name, func(t *testing.T) {
+				response := fmt.Sprintf(
+					`{"success":true,"result":{"number":%d,`+
+						`"decoded_xid_string":"%d","pcie_bdf":"0000:00:08.0",`+
+						`"resolution":%q%s}}`,
+					recovery.xid, recovery.xid, recovery.resolution, tc.fields,
+				)
+
+				server := httptest.NewServer(http.HandlerFunc(
+					func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+
+						if _, err := io.WriteString(w, response); err != nil {
+							t.Errorf("write sidecar response: %v", err)
+						}
+					},
+				))
+				defer server.Close()
+
+				handler := newHandlerWithMetadata(t)
+				handler.parser = parser.NewSidecarParser(
+					server.URL, "test-node", func() string { return "580.173.02" },
+				)
+
+				original := tc.message
+				if original == "" {
+					original = "Synthetic XID message"
+				}
+
+				events, err := handler.ProcessLine(original)
+				require.NoError(t, err)
+				require.NotNil(t, events)
+				require.Len(t, events.Events, recovery.wantEvents)
+
+				event := events.Events[0]
+				assert.Equal(t, original+tc.wantSuffix, event.Message)
+				assert.Equal(t, recovery.wantAction, event.RecommendedAction)
+				assert.Equal(t, recovery.wantFatal, event.IsFatal)
+				assert.False(t, event.IsHealthy)
+				assert.Equal(t, []string{fmt.Sprint(recovery.xid)}, event.ErrorCode)
+				assert.Equal(t, "test-node", event.NodeName)
+				assert.Equal(t, pb.ProcessingStrategy_EXECUTE_REMEDIATION, event.ProcessingStrategy)
+				assert.Empty(t, event.Metadata)
+				assert.Contains(t, event.EntitiesImpacted, &pb.Entity{
+					EntityType: "GPU_UUID", EntityValue: "GPU-123",
+				})
+
+				if recovery.wantEvents == 2 {
+					clear := events.Events[1]
+					assert.True(t, clear.IsHealthy)
+					assert.False(t, clear.IsFatal)
+					assert.Equal(t, pb.RecommendedAction_NONE, clear.RecommendedAction)
+					assert.Equal(t, "GPU recovery action returned to None", clear.Message)
+					assert.Empty(t, clear.ErrorCode)
+					assert.Equal(t, event.EntitiesImpacted, clear.EntitiesImpacted)
+				}
+			})
+		}
+	}
+}

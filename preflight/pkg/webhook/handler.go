@@ -1,0 +1,262 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package webhook
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+
+	"github.com/nvidia/nvsentinel/preflight/pkg/config"
+	"github.com/nvidia/nvsentinel/preflight/pkg/gang"
+	admissionv1 "k8s.io/api/admission/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// GangRegistration is sent to the controller to register a pod with its gang.
+type GangRegistration struct {
+	Namespace     string
+	PodName       string
+	GangID        string
+	ConfigMapName string
+	// OwnerReference points the gang ConfigMap at its scheduler owner for Kubernetes GC.
+	OwnerReference *metav1.OwnerReference
+	// CheckNames is a comma-separated list of preflight checks this pod
+	// will run. Annotation order when present, chart order for defaults.
+	CheckNames string
+}
+
+// GangRegistrationFunc is called after a pod is admitted to register it with a gang.
+type GangRegistrationFunc func(ctx context.Context, reg GangRegistration)
+
+// EnsureCAFunc is called with the pod's namespace after checks were injected,
+// so the platform connector CA ConfigMap copy exists there before the pod's
+// volumes are mounted. It must not fail admission: the callback logs its own
+// errors and the CA bundle sync retries the namespace on its next tick.
+type EnsureCAFunc func(ctx context.Context, namespace string)
+
+type Handler struct {
+	injector       *Injector
+	onGangRegister GangRegistrationFunc
+	ensureCA       EnsureCAFunc
+}
+
+// NewHandler builds a Handler from the preflight config, the namespace-aware
+// gang discoverer resolver, the reader used for DRA GPU detection, the
+// callback invoked to register a pod with its gang after admission, and the
+// callback that copies the platform connector CA bundle into the pod's
+// namespace (nil when the checks publish to the socket or do not verify the
+// server).
+func NewHandler(
+	cfg *config.Config,
+	resolver *gang.DiscovererResolver,
+	draReader client.Reader,
+	onGangRegister GangRegistrationFunc,
+	ensureCA EnsureCAFunc,
+) *Handler {
+	return &Handler{
+		injector:       NewInjector(cfg, resolver, draReader),
+		onGangRegister: onGangRegister,
+		ensureCA:       ensureCA,
+	}
+}
+
+func (h *Handler) HandleMutate(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		slog.Error("Failed to read request body", "error", err)
+		http.Error(w, "failed to read request body", http.StatusBadRequest)
+
+		return
+	}
+
+	var admissionReview admissionv1.AdmissionReview
+	if err := json.Unmarshal(body, &admissionReview); err != nil {
+		slog.Error("Failed to unmarshal admission review", "error", err)
+		http.Error(w, "failed to unmarshal admission review", http.StatusBadRequest)
+
+		return
+	}
+
+	response := h.mutate(r.Context(), admissionReview.Request)
+	admissionReview.Response = response
+
+	if admissionReview.Request != nil {
+		admissionReview.Response.UID = admissionReview.Request.UID
+	}
+
+	respBytes, err := json.Marshal(admissionReview)
+	if err != nil {
+		slog.Error("Failed to marshal response", "error", err)
+		http.Error(w, "failed to marshal response", http.StatusInternalServerError)
+
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if _, err := w.Write(respBytes); err != nil {
+		slog.Error("Failed to write response", "error", err)
+	}
+}
+
+func (h *Handler) mutate(ctx context.Context, req *admissionv1.AdmissionRequest) *admissionv1.AdmissionResponse {
+	if req == nil {
+		return &admissionv1.AdmissionResponse{
+			Allowed: true,
+		}
+	}
+
+	slog.Debug("Processing admission request",
+		"namespace", req.Namespace,
+		"name", req.Name,
+		"operation", req.Operation)
+
+	var pod corev1.Pod
+	if err := json.Unmarshal(req.Object.Raw, &pod); err != nil {
+		slog.Error("Failed to unmarshal pod", "error", err)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("failed to unmarshal pod: %v", err),
+			},
+		}
+	}
+
+	// Set namespace from request if not in pod spec (common for admission)
+	if pod.Namespace == "" {
+		pod.Namespace = req.Namespace
+	}
+
+	patch, gangCtx, err := h.injector.InjectInitContainers(withAdmittedPod(ctx, req.Object.Raw), &pod)
+	if err != nil {
+		slog.Error("Failed to inject init containers", "error", err)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("failed to inject init containers: %v", err),
+			},
+		}
+	}
+
+	if patch == nil {
+		slog.Debug("No mutation needed", "pod", pod.Name, "namespace", req.Namespace)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: true,
+		}
+	}
+
+	// Register pod with gang controller if it's part of a gang
+	if gangCtx != nil && h.onGangRegister != nil {
+		h.registerGang(ctx, &pod, gangCtx)
+	}
+
+	// The injected checks mount the CA ConfigMap copy from their own
+	// namespace, so make sure it is there before the pod starts.
+	if h.ensureCA != nil {
+		h.ensureCA(ctx, pod.Namespace)
+	}
+
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		slog.Error("Failed to marshal patch", "error", err)
+
+		return &admissionv1.AdmissionResponse{
+			Allowed: false,
+			Result: &metav1.Status{
+				Message: fmt.Sprintf("failed to marshal patch: %v", err),
+			},
+		}
+	}
+
+	slog.Info("Mutating pod",
+		"namespace", req.Namespace,
+		"pod", pod.Name,
+		"patchOps", len(patch))
+
+	patchType := admissionv1.PatchTypeJSONPatch
+
+	return &admissionv1.AdmissionResponse{
+		Allowed:   true,
+		Patch:     patchBytes,
+		PatchType: &patchType,
+	}
+}
+
+// registerGang hands the admitted pod to the gang controller so the gang
+// ConfigMap exists before the scheduler looks for it.
+func (h *Handler) registerGang(ctx context.Context, pod *corev1.Pod, gangCtx *GangContext) {
+	podName := pod.Name
+	if podName == "" {
+		podName = pod.GenerateName
+
+		slog.Info("Pod name is empty, using generated name", "pod", podName)
+	}
+
+	slog.Info("Registering pod with gang",
+		"namespace", pod.Namespace,
+		"pod", podName,
+		"gangID", gangCtx.GangID,
+		"configMap", gangCtx.ConfigMapName)
+
+	h.onGangRegister(ctx, GangRegistration{
+		Namespace:      pod.Namespace,
+		PodName:        podName,
+		GangID:         gangCtx.GangID,
+		ConfigMapName:  gangCtx.ConfigMapName,
+		OwnerReference: gangCtx.OwnerReference,
+		CheckNames:     gangCtx.CheckNames,
+	})
+}
+
+type admittedPodKey struct{}
+
+// withAdmittedPod keeps the pod JSON from the admission request in ctx.
+// Decoding into corev1.Pod drops fields that this client version does not
+// define, such as spec.workloadRef from Kubernetes 1.35.
+func withAdmittedPod(ctx context.Context, raw []byte) context.Context {
+	return context.WithValue(ctx, admittedPodKey{}, raw)
+}
+
+// admittedPodFrom decodes the raw pod that withAdmittedPod stored. It returns
+// nil when ctx has no pod or the pod cannot be decoded.
+func admittedPodFrom(ctx context.Context, namespace string) *unstructured.Unstructured {
+	raw, ok := ctx.Value(admittedPodKey{}).([]byte)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+
+	object := map[string]any{}
+	if err := json.Unmarshal(raw, &object); err != nil {
+		slog.Warn("Failed to decode admitted pod for gang discovery", "error", err)
+		return nil
+	}
+
+	pod := &unstructured.Unstructured{Object: object}
+	if pod.GetNamespace() == "" {
+		pod.SetNamespace(namespace)
+	}
+
+	return pod
+}

@@ -1,0 +1,526 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package informers
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"testing"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestExcludedPodTransformUsesRuntimeNamespaceRegexSemantics(t *testing.T) {
+	t.Parallel()
+
+	excludeRegex := regexp.MustCompile(`^(kube-.*|nvsentinel)$`)
+	transform := excludedPodTransform(excludeRegex)
+	informers := &Informers{}
+
+	tests := []struct {
+		namespace string
+		excluded  bool
+	}{
+		{namespace: "kube-system", excluded: true},
+		{namespace: "kube-public", excluded: true},
+		{namespace: "nvsentinel", excluded: true},
+		{namespace: "user-kube-system", excluded: false},
+		{namespace: "workload", excluded: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.namespace, func(t *testing.T) {
+			pod := richDrainEligiblePod(tt.namespace, "pod", "node-a")
+
+			transformed, err := transform(pod)
+			require.NoError(t, err)
+
+			included, err := informers.shouldIncludeNamespace(tt.namespace, "*", excludeRegex)
+			require.NoError(t, err)
+			assert.Equal(t, tt.excluded, !included)
+
+			transformedPod := transformed.(*v1.Pod)
+			if tt.excluded {
+				assert.Empty(t, transformedPod.Spec.NodeName)
+				assert.Empty(t, transformedPod.Spec.Containers)
+			} else {
+				assert.NotSame(t, pod, transformedPod)
+				assert.Equal(t, pod.Spec.NodeName, transformedPod.Spec.NodeName)
+				assert.Equal(t, pod.Status.Phase, transformedPod.Status.Phase)
+			}
+		})
+	}
+}
+
+func TestExcludedPodTransformDetectsDaemonSetOwners(t *testing.T) {
+	t.Parallel()
+
+	transform := excludedPodTransform(regexp.MustCompile(`^kube-system$`))
+	pod := richDrainEligiblePod("workload", "daemon", "node-a")
+	pod.OwnerReferences = []metav1.OwnerReference{
+		{Kind: "ReplicaSet", Name: "replica"},
+		{Kind: "DaemonSet", Name: "daemon"},
+	}
+
+	transformed, err := transform(pod)
+	require.NoError(t, err)
+
+	transformedPod := transformed.(*v1.Pod)
+	assert.Equal(t, pod.Name, transformedPod.Name)
+	assert.Equal(t, pod.Namespace, transformedPod.Namespace)
+	assert.Equal(t, pod.UID, transformedPod.UID)
+	assert.Equal(t, pod.ResourceVersion, transformedPod.ResourceVersion)
+	assert.Empty(t, transformedPod.Spec.NodeName)
+	assert.Empty(t, transformedPod.OwnerReferences)
+	assert.True(t, isDaemonSetOwned(pod.OwnerReferences))
+}
+
+func TestExcludedPodTransformRetainsDrainFieldsOnly(t *testing.T) {
+	t.Parallel()
+
+	pod := richDrainEligiblePod("workload", "eligible", "node-a")
+	transform := excludedPodTransform(regexp.MustCompile(`^kube-system$`))
+
+	transformed, err := transform(pod)
+	require.NoError(t, err)
+
+	cachedPod := transformed.(*v1.Pod)
+	expected := &v1.Pod{
+		Name:              "eligible",
+		Namespace:         "workload",
+		UID:               types.UID("workload-eligible"),
+		ResourceVersion:   "11",
+		DeletionTimestamp: pod.DeletionTimestamp.DeepCopy(),
+		Annotations: map[string]string{
+			model.PodDeviceAnnotationName: `{"devices":{"nvidia.com/gpu":["GPU-1"]}}`,
+		},
+		OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet"}},
+		Spec: v1.PodSpec{
+			NodeName:                      "node-a",
+			TerminationGracePeriodSeconds: new(int64(60)),
+			Containers: []v1.Container{{
+				Resources: v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+				},
+			}},
+			InitContainers: []v1.Container{{
+				Resources: v1.ResourceRequirements{
+					Limits: v1.ResourceList{v1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+				},
+			}},
+			ResourceClaims: []v1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: new("gpu-template")}},
+		},
+		Status: v1.PodStatus{
+			Phase:                 v1.PodRunning,
+			ResourceClaimStatuses: []v1.PodResourceClaimStatus{{Name: "gpu", ResourceClaimName: new("eligible-gpu")}},
+			Conditions: []v1.PodCondition{{
+				Type:               v1.PodReady,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: pod.Status.Conditions[0].LastTransitionTime,
+			}},
+		},
+	}
+
+	assert.NotSame(t, pod, cachedPod)
+	assert.Equal(t, expected, cachedPod)
+}
+
+func TestInformerTransformsPassThroughUnknownObjects(t *testing.T) {
+	t.Parallel()
+
+	tombstone := cache.DeletedFinalStateUnknown{Key: "workload/pod"}
+	podTransform := excludedPodTransform(regexp.MustCompile(`^kube-system$`))
+
+	transformedPodObject, err := podTransform(tombstone)
+	require.NoError(t, err)
+	assert.Equal(t, tombstone, transformedPodObject)
+
+	transformedNodeObject, err := nodeTransform()(tombstone)
+	require.NoError(t, err)
+	assert.Equal(t, tombstone, transformedNodeObject)
+}
+
+func TestNodeTransformRetainsEventAndEvaluatorFields(t *testing.T) {
+	t.Parallel()
+
+	node := &v1.Node{
+		Name:            "node-a",
+		UID:             types.UID("node-uid"),
+		ResourceVersion: "42",
+		Labels:          map[string]string{"large": "metadata"},
+		Annotations: map[string]string{
+			common.QuarantineHealthEventAnnotationKey: `{"events":[]}`,
+			"unrelated": "discard",
+		},
+		Spec:   v1.NodeSpec{Unschedulable: true},
+		Status: v1.NodeStatus{Phase: v1.NodeRunning},
+	}
+
+	transformed, err := nodeTransform()(node)
+	require.NoError(t, err)
+
+	transformedNode := transformed.(*v1.Node)
+	assert.Equal(t, node.Name, transformedNode.Name)
+	assert.Equal(t, node.UID, transformedNode.UID)
+	assert.Equal(t, node.ResourceVersion, transformedNode.ResourceVersion)
+	assert.Equal(t, map[string]string{
+		common.QuarantineHealthEventAnnotationKey: `{"events":[]}`,
+	}, transformedNode.Annotations)
+	assert.Empty(t, transformedNode.Labels)
+	assert.Empty(t, transformedNode.Spec)
+	assert.Empty(t, transformedNode.Status)
+}
+
+// TestNodeTransform_RequestedLabels_RetainsOnlyRequestedLabels keeps the node cache small when
+// customDrain.nodeSelector needs a label to pick the drain path.
+func TestNodeTransform_RequestedLabels_RetainsOnlyRequestedLabels(t *testing.T) {
+	t.Parallel()
+
+	node := &v1.Node{
+		Name:   "node-a",
+		Labels: map[string]string{"scheduler": "slurm", "large": "metadata"},
+	}
+
+	transformed, err := nodeTransform("scheduler", "absent")(node)
+	require.NoError(t, err)
+
+	assert.Equal(t, map[string]string{"scheduler": "slurm"}, transformed.(*v1.Node).Labels)
+}
+
+func TestInformerTransformsIntegrateWithIndexes(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	systemPod := richDrainEligiblePod("kube-system", "system", "node-a")
+	daemonPod := richDrainEligiblePod("workload", "daemon", "node-a")
+	daemonPod.OwnerReferences = []metav1.OwnerReference{{Kind: "DaemonSet", Name: "daemon"}}
+	eligiblePod := richDrainEligiblePod("workload", "eligible", "node-a")
+	node := &v1.Node{
+		Name:            "node-a",
+		UID:             types.UID("node-uid"),
+		ResourceVersion: "7",
+		Annotations: map[string]string{
+			common.QuarantineHealthEventAnnotationKey: `{"events":[]}`,
+		},
+	}
+
+	client := fake.NewSimpleClientset(systemPod, daemonPod, eligiblePod, node)
+	informers, err := NewInformers(client, 0, new(5), false, false, `^kube-system$`, nil)
+	require.NoError(t, err)
+	require.NoError(t, informers.Run(ctx))
+
+	nodeIndexedPods, err := informers.podInformer.GetIndexer().ByIndex(NodeIndex, node.Name)
+	require.NoError(t, err)
+	require.Len(t, nodeIndexedPods, 1)
+	assert.Equal(t, eligiblePod.Name, nodeIndexedPods[0].(*v1.Pod).Name)
+	assert.Equal(t, eligiblePod.Spec.NodeName, nodeIndexedPods[0].(*v1.Pod).Spec.NodeName)
+	assert.Empty(t, nodeIndexedPods[0].(*v1.Pod).Spec.Containers[0].Image)
+
+	systemCached, exists, err := informers.podInformer.GetIndexer().GetByKey("kube-system/system")
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Empty(t, systemCached.(*v1.Pod).Spec.NodeName)
+
+	daemonCached, exists, err := informers.podInformer.GetIndexer().GetByKey("workload/daemon")
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Empty(t, daemonCached.(*v1.Pod).Spec.NodeName)
+
+	cachedNode, err := informers.GetNode(node.Name)
+	require.NoError(t, err)
+	assert.Equal(t, node.UID, cachedNode.UID)
+	assert.Equal(t, node.ResourceVersion, cachedNode.ResourceVersion)
+	assert.Equal(t, node.Annotations, cachedNode.Annotations)
+}
+
+func TestEventRecorderAggregatesNodeEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	testEnv := envtest.Environment{}
+	cfg, err := testEnv.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, testEnv.Stop()) })
+
+	client, err := kubernetes.NewForConfig(cfg)
+	require.NoError(t, err)
+	node, err := client.CoreV1().Nodes().Create(ctx, &v1.Node{
+		Name: "node-a",
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	informers, err := NewInformers(client, 0, new(5), false, false, "", nil)
+	require.NoError(t, err)
+	require.NoError(t, informers.Run(ctx))
+
+	require.NoError(t, informers.UpdateNodeEvent(ctx, node.Name, "AwaitingPodCompletion", "waiting"))
+	require.NoError(t, informers.UpdateNodeEvent(ctx, node.Name, "AwaitingPodCompletion", "waiting"))
+	require.EventuallyWithT(t, func(collect *assert.CollectT) {
+		events, listErr := client.CoreV1().Events(metav1.NamespaceDefault).List(ctx, metav1.ListOptions{})
+		if !assert.NoError(collect, listErr) || !assert.Len(collect, events.Items, 1) {
+			return
+		}
+
+		event := events.Items[0]
+		assert.Equal(collect, node.UID, event.InvolvedObject.UID)
+		assert.Equal(collect, v1.EventTypeNormal, event.Type)
+		assert.Equal(collect, "nvsentinel-node-drainer", event.Source.Component)
+		assert.Equal(collect, int32(2), event.Count)
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
+func TestFindEvictablePodsInNamespaceAndNode_DRAClaims_DetectsGPURequests(t *testing.T) {
+	ctx := t.Context()
+
+	testEnv := envtest.Environment{}
+	cfg, err := testEnv.Start()
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, testEnv.Stop()) })
+
+	client, err := kubernetes.NewForConfig(cfg)
+	require.NoError(t, err)
+
+	const namespace = "workload"
+
+	_, err = client.CoreV1().Namespaces().Create(ctx, &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: namespace},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	for claimName, deviceClassName := range map[string]string{
+		"gpu-claim":          "gpu.nvidia.com",
+		"gpu-template-abc12": "gpu.nvidia.com",
+		"nic-claim":          "nic.example.com",
+	} {
+		_, err = client.ResourceV1().ResourceClaims(namespace).Create(ctx, &resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: claimName},
+			Spec: resourcev1.ResourceClaimSpec{Devices: resourcev1.DeviceClaim{Requests: []resourcev1.DeviceRequest{{
+				Name:    "device",
+				Exactly: &resourcev1.ExactDeviceRequest{DeviceClassName: deviceClassName},
+			}}}},
+		}, metav1.CreateOptions{})
+		require.NoError(t, err)
+	}
+
+	const (
+		missingAnnotation = "is requesting devices but is missing device annotation; " +
+			"partial drains need the metadata-collector pod device mapper (podMapper.enabled)"
+		noClaimNeeded     = "-" // bind the claim status entry with a nil ResourceClaimName
+	)
+
+	tests := []struct {
+		name            string
+		annotated       bool
+		gpuLimit        bool
+		claim           v1.PodResourceClaim
+		boundClaim      string
+		wantPartialErr  string
+		wantPartialPods int
+		wantGPUOnlyErr  string
+		wantGPUOnlyPods int
+	}{
+		{
+			name:            "unannotated pod with GPU claim fails partial drain",
+			claim:           v1.PodResourceClaim{Name: "gpu", ResourceClaimName: new("gpu-claim")},
+			wantPartialErr:  missingAnnotation,
+			wantGPUOnlyPods: 1,
+		},
+		{
+			name:            "unannotated pod with generated GPU claim fails partial drain without reading the template",
+			claim:           v1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: new("deleted-template")},
+			boundClaim:      "gpu-template-abc12",
+			wantPartialErr:  missingAnnotation,
+			wantGPUOnlyPods: 1,
+		},
+		{
+			name:           "unannotated pod with template claim but no bound claim fails closed",
+			claim:          v1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: new("gpu-template")},
+			wantPartialErr: "no ResourceClaim is bound",
+			wantGPUOnlyErr: "no ResourceClaim is bound",
+		},
+		{
+			name:  "unannotated pod with non-GPU claim is not a GPU pod",
+			claim: v1.PodResourceClaim{Name: "nic", ResourceClaimName: new("nic-claim")},
+		},
+		{
+			name:           "unannotated pod with missing claim fails closed",
+			claim:          v1.PodResourceClaim{Name: "gpu", ResourceClaimName: new("missing-claim")},
+			wantPartialErr: "not found",
+			wantGPUOnlyErr: "not found",
+		},
+		{
+			name:            "annotated pod is drained without reading its claim",
+			annotated:       true,
+			claim:           v1.PodResourceClaim{Name: "gpu", ResourceClaimName: new("missing-claim")},
+			wantPartialPods: 1,
+			wantGPUOnlyPods: 1,
+		},
+		{
+			name:            "unannotated pod with GPU limit fails partial drain and is GPU-only drained",
+			gpuLimit:        true,
+			wantPartialErr:  missingAnnotation,
+			wantGPUOnlyPods: 1,
+		},
+		{
+			name:       "unannotated pod whose claim status says no claim was needed is not a GPU pod",
+			claim:      v1.PodResourceClaim{Name: "gpu", ResourceClaimTemplateName: new("gpu-template")},
+			boundClaim: noClaimNeeded,
+		},
+		{
+			name: "CPU-only pod is neither drained nor blocks the drain",
+		},
+	}
+
+	for idx, tt := range tests {
+		pod := &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("pod-%d", idx), Namespace: namespace},
+			Spec: v1.PodSpec{
+				NodeName:   fmt.Sprintf("node-%d", idx),
+				Containers: []v1.Container{{Name: "workload", Image: "workload:latest"}},
+			},
+		}
+		if tt.annotated {
+			pod.Annotations = map[string]string{model.PodDeviceAnnotationName: `{"devices":{"nvidia.com/gpu":["GPU-1"]}}`}
+		}
+
+		if tt.gpuLimit {
+			pod.Spec.Containers[0].Resources.Limits = v1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")}
+		}
+
+		if tt.claim.Name != "" {
+			pod.Spec.ResourceClaims = []v1.PodResourceClaim{tt.claim}
+		}
+
+		created, err := client.CoreV1().Pods(namespace).Create(ctx, pod, metav1.CreateOptions{})
+		require.NoError(t, err)
+
+		if tt.boundClaim != "" {
+			claimStatus := v1.PodResourceClaimStatus{Name: tt.claim.Name}
+			if tt.boundClaim != noClaimNeeded {
+				claimStatus.ResourceClaimName = new(tt.boundClaim)
+			}
+
+			created.Status.ResourceClaimStatuses = []v1.PodResourceClaimStatus{claimStatus}
+			_, err = client.CoreV1().Pods(namespace).UpdateStatus(ctx, created, metav1.UpdateOptions{})
+			require.NoError(t, err)
+		}
+	}
+
+	informers, err := NewInformers(client, 0, new(5), true, false, "", nil)
+	require.NoError(t, err)
+	require.NoError(t, informers.Run(ctx))
+
+	partialDrainEntity := &protos.Entity{EntityType: "GPU_UUID", EntityValue: "GPU-1"}
+
+	for idx, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nodeName := fmt.Sprintf("node-%d", idx)
+
+			pods, err := informers.FindEvictablePodsInNamespaceAndNode(ctx, namespace, nodeName, partialDrainEntity)
+			if tt.wantPartialErr != "" {
+				require.ErrorContains(t, err, tt.wantPartialErr)
+			} else {
+				require.NoError(t, err)
+				assert.Len(t, pods, tt.wantPartialPods)
+			}
+
+			pods, err = informers.FindEvictablePodsInNamespaceAndNode(ctx, namespace, nodeName, nil)
+			if tt.wantGPUOnlyErr != "" {
+				require.ErrorContains(t, err, tt.wantGPUOnlyErr)
+
+				event := &model.HealthEventWithStatus{CreatedAt: time.Now().Add(-time.Hour)}
+				err = informers.DeletePodsAfterTimeout(ctx, nodeName, []string{namespace}, 1, event, nil)
+				require.ErrorContains(t, err, "could not check every namespace",
+					"timeout path must requeue instead of force deleting nothing")
+			} else {
+				require.NoError(t, err)
+				assert.Len(t, pods, tt.wantGPUOnlyPods)
+			}
+		})
+	}
+}
+
+func richDrainEligiblePod(namespace, name, nodeName string) *v1.Pod {
+	deletionTimestamp := metav1.NewTime(time.Now().Add(-time.Minute))
+
+	return &v1.Pod{
+		Name:            name,
+		Namespace:       namespace,
+		UID:             types.UID(namespace + "-" + name),
+		ResourceVersion: "11",
+		Labels:          map[string]string{"app": name},
+		Annotations: map[string]string{
+			model.PodDeviceAnnotationName: `{"devices":{"nvidia.com/gpu":["GPU-1"]}}`,
+			"unrelated":                   "discard",
+		},
+		OwnerReferences:   []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "owner"}},
+		Finalizers:        []string{"example.com/finalizer"},
+		DeletionTimestamp: &deletionTimestamp,
+		Spec: v1.PodSpec{
+			NodeName:                      nodeName,
+			TerminationGracePeriodSeconds: new(int64(60)),
+			InitContainers: []v1.Container{
+				{
+					Name:  "init",
+					Image: "init:latest",
+					Resources: v1.ResourceRequirements{
+						Limits:   v1.ResourceList{v1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+					},
+				},
+			},
+			Containers: []v1.Container{
+				{
+					Name:  "workload",
+					Image: "workload:latest",
+					Resources: v1.ResourceRequirements{
+						Limits:   v1.ResourceList{v1.ResourceName("nvidia.com/gpu"): resource.MustParse("1")},
+						Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("100m")},
+					},
+				},
+			},
+			ResourceClaims: []v1.PodResourceClaim{{Name: "gpu", ResourceClaimTemplateName: new("gpu-template")}},
+		},
+		Status: v1.PodStatus{
+			Phase:                 v1.PodRunning,
+			ResourceClaimStatuses: []v1.PodResourceClaimStatus{{Name: "gpu", ResourceClaimName: new("eligible-gpu")}},
+			Conditions: []v1.PodCondition{
+				{
+					Type:               v1.PodReady,
+					Status:             v1.ConditionTrue,
+					LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Minute)),
+				},
+				{Type: v1.PodScheduled, Status: v1.ConditionTrue},
+			},
+			ContainerStatuses: []v1.ContainerStatus{{Name: "workload", Ready: true}},
+		},
+	}
+}

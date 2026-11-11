@@ -1,0 +1,148 @@
+# Node Drainer
+
+## Overview
+
+The Node Drainer module is NVSentinel's evacuation coordinator. When nodes are quarantined due to hardware faults, this module safely evacuates all running workloads from the affected nodes, moving them to healthy ones. 
+
+Think of it as an evacuation coordinator - similar to how a building evacuation ensures everyone exits safely and in an orderly manner before repairs begin, Node Drainer ensures all your important workloads are safely moved off faulty nodes before maintenance or repairs take place.
+
+### Why Do You Need This?
+
+When the Fault Quarantine module cordons a node, it only prevents *new* workloads from being scheduled there. Existing workloads continue running on the faulty hardware, which can lead to:
+
+- **Continued failures**: Training jobs keep crashing on faulty GPUs
+- **Data corruption**: Computation results become unreliable
+- **Resource waste**: Other nodes in distributed jobs wait for the slow/faulty node
+- **Delayed repairs**: Hardware can't be fixed while workloads are still running
+
+The Node Drainer module solves this by:
+- **Gracefully evicting pods** from quarantined nodes
+- **Respecting pod disruption budgets** to maintain application availability  
+- **Handling different workload types** with appropriate eviction strategies
+- **Providing status updates** so you can track drain progress
+- **Working with Kubernetes** to ensure workloads are rescheduled on healthy nodes
+- **Executing partial drains** to only drain pods using unhealthy GPUs (when possible)
+
+## How It Works
+
+The Node Drainer watches the datastore for quarantined nodes and safely evacuates their workloads:
+
+1. Receives quarantined node events from the datastore
+2. Determines if a full drain or a partial drain needs to be executed
+3. Determines eviction mode from namespace configuration or pod policies (labels or owner kind)
+4. Evicts pods using Kubernetes Eviction API (respects PodDisruptionBudgets)
+5. Monitors progress and handles stuck or slow-terminating pods
+6. Updates status when complete
+
+System namespace pods are skipped. DaemonSets are typically not evicted as they're system-critical.
+
+## Configuration
+
+Configure the Node Drainer module through Helm values:
+
+```yaml
+node-drainer:
+  enabled: true
+  dryRun: false          # Test mode - logs actions without executing
+  
+  evictionTimeoutInSeconds: "60"     # Max time to wait for pod termination
+  systemNamespaces: "^(nvsentinel|kube-system|gpu-operator)$"  # Namespaces to skip
+  deleteAfterTimeoutMinutes: 60      # Force delete after this timeout
+  notReadyTimeoutMinutes: 5          # Timeout for stuck pods
+  drainGPUPods: false                # Only drain pods requesting GPU
+  
+  userNamespaces:
+    - name: "*"                      # Pattern matching namespaces
+      mode: "AllowCompletion"        # Eviction mode
+
+  podDrainPolicies: []               # Alternative to userNamespaces
+  
+  partialDrainEnabled: true
+```
+
+### Eviction Modes
+
+The module supports three eviction modes for different workload types:
+
+**AllowCompletion**: Wait for pods to terminate gracefully
+- Respects pod's `terminationGracePeriodSeconds`
+- Best for most workloads
+
+**Immediate**: Evict pods immediately without waiting
+- Minimal grace period
+- Use for stateless workloads
+
+**DeleteAfterTimeout**: Wait for configured timeout, then force delete
+- Waits up to `deleteAfterTimeoutMinutes` from event creation time
+- Force deletes remaining pods after timeout
+- Use for training jobs that need time to checkpoint
+
+### Configuration Options
+
+- **Dry Run**: Test drain behavior without evicting pods
+- **Eviction Timeout**: How long to wait for individual pod eviction (in seconds)
+- **System Namespaces**: Regex pattern for namespaces to skip (system pods)
+- **Delete Timeout**: Minutes to wait before force deleting pods
+- **Not Ready Timeout**: Minutes before considering a pod stuck
+- **Drain GPU Pods**: When enabled, only drains pods requesting GPU resources; CPU-only workloads remain on the node
+- **User Namespaces**: Define eviction mode per namespace pattern (supports `*` wildcard)
+- **Pod Drain Policies**: Select eviction modes by pod labels or owner kind; mutually exclusive with `userNamespaces`
+- **Partial Drain**: Enable or disable partial drain functionality
+
+## Key Features
+
+### Namespace or Pod-Based Eviction Modes
+Configure how different workloads are evacuated:
+- **AllowCompletion**: Graceful termination for most workloads
+- **Immediate**: Fast eviction for stateless services
+- **DeleteAfterTimeout**: Wait for training jobs to checkpoint, then force delete
+
+### Pod Drain Policies
+
+Use `podDrainPolicies` when workloads in the same namespace need different eviction modes.
+Set `userNamespaces: []` to clear the default namespace rule; configuring both lists is rejected.
+
+```yaml
+node-drainer:
+  userNamespaces: []
+  podDrainPolicies:
+    - name: finish-training
+      namespace: training-*
+      podSelector: "example.com/drain-mode=finish"
+      mode: AllowCompletion
+    - name: replaceable-workers
+      podSelector: "example.com/drain-mode=immediate"
+      mode: Immediate
+```
+
+The first matching policy wins. Each policy requires a unique name, a Kubernetes label
+selector, a list of controller `ownerKinds` or both, and an eviction mode. The optional
+`namespace` glob restricts where it applies.
+Pods that match no policy are outside the drain scope and do not block completion, so selectors
+must cover every workload that should be drained. System namespace and DaemonSet exclusions,
+GPU-only filtering and partial GPU drain scope still apply. Force drain changes selected pods
+to `Immediate` without including unmatched pods. Custom drain cannot be combined with policies.
+
+See [Pod Drain Policies configuration](configuration/node-drainer.md#pod-drain-policies)
+for selector syntax, owner kinds, label updates and timeout behavior.
+
+### Graceful Eviction
+- Uses Kubernetes Eviction API
+- Respects PodDisruptionBudgets
+- Honors pod termination grace periods
+- System pods automatically skipped
+
+### Timeout Handling
+Multiple timeout mechanisms prevent stuck drains:
+- Eviction timeout for individual pods
+- NotReady timeout for unhealthy pods
+- DeleteAfterTimeout for long-running workloads
+
+### Cold Start Recovery
+Automatically resumes drain operations after restarts - queries datastore for in-progress drains and continues from where it left off.
+
+### Partial Drain Functionality
+For GPU faults that can be remediated with a GPU reset, the Node Drainer only drains selected pods using the unhealthy GPU. For faults that require a node reboot, it drains all eligible pods on the node selected by the configured namespace rules or pod policies.
+
+### GPU-Only Draining
+When `drainGPUPods: true` is set, the Node Drainer filters pod eviction to only target workloads that request GPU resources. The feature detects GPU resources using device annotations provided by the Metadata Collector, which tracks GPU allocation across the cluster. Pods without the annotation are also drained if a DRA ResourceClaim requests the `gpu.nvidia.com` DeviceClass for them. Default is `false`.

@@ -1,0 +1,217 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package client
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore/providers/mongodb/watcher"
+	"google.golang.org/protobuf/types/known/timestamppb"
+)
+
+// Common operations that consolidate patterns found across all modules
+
+// UpdateHealthEventNodeQuarantineStatus updates the node quarantine status
+// Used by fault-quarantine-module
+func UpdateHealthEventNodeQuarantineStatus(ctx context.Context, client DatabaseClient,
+	eventID string, status string, spanID string) error {
+	fields := map[string]any{
+		nodeQuarantinedStatusField: status,
+	}
+
+	if status == "Quarantined" || status == "AlreadyQuarantined" {
+		fields["healtheventstatus.quarantinefinishtimestamp"] = timestamppb.Now()
+	}
+
+	fields["healtheventstatus.spanids."+tracing.ServiceFaultQuarantine] = spanID
+
+	return client.UpdateDocumentStatusFields(ctx, eventID, fields)
+}
+
+// Backward compatibility helpers
+
+// Legacy type aliases for backward compatibility
+type MongoDBConfig = watcher.MongoDBConfig
+type MongoDBClientTLSCertConfig = watcher.MongoDBClientTLSCertConfig
+
+// Database-agnostic constants and helpers
+const (
+	// Default retry configuration for database operations
+	DefaultMaxRetries = 3
+	DefaultRetryDelay = 2 * time.Second
+)
+
+// IsNoDocumentsError checks if an error indicates no documents were found
+// This abstracts the database-specific error messages
+func IsNoDocumentsError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := err.Error()
+
+	return errMsg == "mongo: no documents in result" || errMsg == "no documents in result"
+}
+
+// BuildTimeRangeFilter creates a time range filter using database-agnostic builders
+// This replaces the MongoDB-specific filter construction
+func BuildTimeRangeFilter(field string, after *time.Time, before *time.Time) any {
+	builder := NewFilterBuilder()
+
+	switch {
+	case after != nil && before != nil:
+		// Range query: field > after AND field <= before
+		timeRange := map[string]any{}
+		timeRange[opGT] = *after
+		timeRange[opLTE] = *before
+		builder.Eq(field, timeRange)
+	case after != nil:
+		builder.Gt(field, *after)
+	case before != nil:
+		builder.Lte(field, *before)
+	}
+
+	return builder.Build()
+}
+
+// BuildStatusFilter creates a status filter using database-agnostic builders
+// This replaces direct MongoDB filter construction
+func BuildStatusFilter(field string, status any) any {
+	return NewFilterBuilder().Eq(field, status).Build()
+}
+
+// BuildNotNullFilter creates a "not null" filter using database-agnostic builders
+// This replaces direct MongoDB $ne: null usage
+func BuildNotNullFilter(field string) any {
+	return NewFilterBuilder().Ne(field, nil).Build()
+}
+
+// BuildSetUpdate creates a set update using database-agnostic builders
+// This replaces direct MongoDB $set operator usage
+func BuildSetUpdate(updates map[string]any) any {
+	builder := NewUpdateBuilder()
+	for field, value := range updates {
+		builder.Set(field, value)
+	}
+
+	return builder.Build()
+}
+
+// Semantic database methods that eliminate the need for error type checking
+
+// FindOneWithExists performs a FindOne operation and returns whether a document was found
+// This eliminates the need for modules to check for "no documents" errors
+func FindOneWithExists(
+	ctx context.Context,
+	client DatabaseClient,
+	filter any,
+	options *FindOneOptions,
+	result any,
+) (found bool, err error) {
+	dbResult, err := client.FindOne(ctx, filter, options)
+	if err != nil {
+		return false, fmt.Errorf("database query failed: %w", err)
+	}
+
+	if err := dbResult.Decode(result); err != nil {
+		// Check if this is a "no documents found" case
+		if IsNoDocumentsError(err) {
+			return false, nil // Not found, but not an error
+		}
+
+		return false, fmt.Errorf("failed to decode result: %w", err)
+	}
+
+	return true, nil
+}
+
+// UpdateWithResult performs an update and returns semantic results
+// This eliminates the need to inspect UpdateResult fields
+func UpdateWithResult(
+	ctx context.Context,
+	client DatabaseClient,
+	filter any,
+	update any,
+) (matched int64, modified int64, err error) {
+	result, err := client.UpdateDocument(ctx, filter, update)
+	if err != nil {
+		return 0, 0, fmt.Errorf("update operation failed: %w", err)
+	}
+
+	return result.MatchedCount, result.ModifiedCount, nil
+}
+
+// RetryableUpdateWithResult combines UpdateWithResult with retry logic
+func RetryableUpdateWithResult(
+	ctx context.Context,
+	client DatabaseClient,
+	filter any,
+	update any,
+	maxRetries int,
+	retryDelay time.Duration,
+) (matched int64, modified int64, err error) {
+	var lastErr error
+
+	for i := 1; i <= maxRetries; i++ {
+		matched, modified, err := UpdateWithResult(ctx, client, filter, update)
+		if err == nil {
+			return matched, modified, nil
+		}
+
+		lastErr = err
+
+		if i < maxRetries {
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return 0, 0, fmt.Errorf("update failed after %d retries: %w", maxRetries, lastErr)
+}
+
+// RetryableDocumentUpsertWithResult performs a document upsert with retry logic and returns results
+// Returns (inserted count, updated count, error)
+func RetryableDocumentUpsertWithResult(
+	ctx context.Context,
+	client DatabaseClient,
+	filter any,
+	document any,
+	maxRetries int,
+	retryDelay time.Duration,
+) (inserted int64, updated int64, err error) {
+	var lastErr error
+
+	for i := 1; i <= maxRetries; i++ {
+		result, err := client.UpsertDocument(ctx, filter, document)
+		if err == nil {
+			// Determine if this was an insert or update based on UpsertedCount vs ModifiedCount
+			if result.UpsertedCount > 0 {
+				return result.UpsertedCount, 0, nil
+			}
+
+			return 0, result.ModifiedCount, nil
+		}
+
+		lastErr = err
+
+		if i < maxRetries {
+			time.Sleep(retryDelay)
+		}
+	}
+
+	return 0, 0, fmt.Errorf("document upsert failed after %d retries: %w", maxRetries, lastErr)
+}

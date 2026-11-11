@@ -1,0 +1,370 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package controller
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/healthpub"
+	"github.com/nvidia/nvsentinel/health-monitors/kubernetes-object-monitor/pkg/annotations"
+	"github.com/nvidia/nvsentinel/health-monitors/kubernetes-object-monitor/pkg/config"
+	"github.com/nvidia/nvsentinel/health-monitors/kubernetes-object-monitor/pkg/metrics"
+	"github.com/nvidia/nvsentinel/health-monitors/kubernetes-object-monitor/pkg/policy"
+)
+
+type HealthEventPublisher interface {
+	PublishHealthEvent(
+		ctx context.Context,
+		policy *config.Policy,
+		nodeName string,
+		isHealthy bool,
+		resourceInfo *config.ResourceInfo,
+	) error
+}
+
+type ResourceReconciler struct {
+	client.Client
+	evaluator     *policy.Evaluator
+	publisher     HealthEventPublisher
+	annotationMgr *annotations.Manager
+	policies      []config.Policy
+	gvk           schema.GroupVersionKind
+	// matchStates maps stateKey -> nodeName
+	matchStates   map[string]string
+	matchStatesMu sync.RWMutex
+}
+
+func NewResourceReconciler(
+	c client.Client,
+	evaluator *policy.Evaluator,
+	pub HealthEventPublisher,
+	annotationMgr *annotations.Manager,
+	policies []config.Policy,
+	gvk schema.GroupVersionKind,
+) *ResourceReconciler {
+	return &ResourceReconciler{
+		Client:        c,
+		evaluator:     evaluator,
+		publisher:     pub,
+		annotationMgr: annotationMgr,
+		policies:      policies,
+		gvk:           gvk,
+		matchStates:   make(map[string]string),
+	}
+}
+
+// RestoreState restores the match state that an earlier run saved in node annotations.
+// It keeps only the matches of the enabled policies of this reconciler, and returns one
+// event for each of them. The caller sends the events to the controller, so that each
+// restored resource is reconciled once after the cache syncs. A resource that was
+// deleted while the monitor was stopped produces no delete event, and this reconcile is
+// what publishes its healthy event.
+func (r *ResourceReconciler) RestoreState(allMatches map[string]string) []event.GenericEvent {
+	r.matchStatesMu.Lock()
+	defer r.matchStatesMu.Unlock()
+
+	var events []event.GenericEvent
+
+	for stateKey, nodeName := range allMatches {
+		obj, ok := r.objectForStateKey(stateKey)
+		if !ok {
+			continue
+		}
+
+		r.matchStates[stateKey] = nodeName
+
+		events = append(events, event.GenericEvent{Object: obj})
+	}
+
+	slog.Info("Restored policy match state from annotations", "gvk", r.gvk.String(), "matches", len(events))
+
+	return events
+}
+
+// objectForStateKey reverses getStateKey for the enabled policies of this reconciler.
+// It returns an object that holds only the GVK, the namespace and the name.
+func (r *ResourceReconciler) objectForStateKey(stateKey string) (*unstructured.Unstructured, bool) {
+	for i := range r.policies {
+		p := &r.policies[i]
+		if !p.Enabled {
+			continue
+		}
+
+		objectKey, ok := strings.CutPrefix(stateKey, p.Name+"/")
+		if !ok {
+			continue
+		}
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(r.gvk)
+
+		if namespace, name, namespaced := strings.Cut(objectKey, "/"); namespaced {
+			obj.SetNamespace(namespace)
+			obj.SetName(name)
+		} else {
+			obj.SetName(objectKey)
+		}
+
+		return obj, true
+	}
+
+	return nil, false
+}
+
+func (r *ResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(r.gvk)
+
+	if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
+		return r.handleGetError(ctx, err, req)
+	}
+
+	for _, p := range r.policies {
+		if !p.Enabled {
+			continue
+		}
+
+		if !p.Resource.MatchesNamespace(obj.GetNamespace()) {
+			continue
+		}
+
+		if err := r.reconcilePolicy(ctx, &p, obj); err != nil {
+			slog.Error("Failed to reconcile policy", "policy", p.Name, "resource", req.NamespacedName, "error", err)
+			metrics.ReconciliationErrors.WithLabelValues(r.gvk.Kind, "policy_reconcile_error").Inc()
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *ResourceReconciler) handleGetError(ctx context.Context, err error, req ctrl.Request) (ctrl.Result, error) {
+	if client.IgnoreNotFound(err) == nil {
+		r.cleanupDeletedResource(ctx, req)
+		return ctrl.Result{}, nil
+	}
+
+	metrics.ReconciliationErrors.WithLabelValues(r.gvk.Kind, "get_resource_error").Inc()
+
+	return ctrl.Result{}, fmt.Errorf("failed to get resource: %w", err)
+}
+
+// cleanupDeletedResource handles cleanup when a resource is deleted.
+// when a pod is deleted, we uncordon the node immediately.
+// This means if a replacement pod comes up unhealthy, it will be re-cordoned.
+func (r *ResourceReconciler) cleanupDeletedResource(ctx context.Context, req ctrl.Request) {
+	slog.Info("Cleaning up deleted resource", "resource", req.NamespacedName)
+
+	for _, p := range r.policies {
+		if !p.Enabled {
+			continue
+		}
+
+		if !p.Resource.MatchesNamespace(req.Namespace) {
+			continue
+		}
+
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(r.gvk)
+		obj.SetNamespace(req.Namespace)
+		obj.SetName(req.Name)
+
+		stateKey := r.getStateKey(&p, obj)
+
+		r.matchStatesMu.RLock()
+		nodeName, wasMatched := r.matchStates[stateKey]
+		r.matchStatesMu.RUnlock()
+
+		if wasMatched {
+			// For Node resources, the deleted resource is the node itself.
+			// In this case, there's no point publishing a healthy event or trying to
+			// remove annotations - the node is gone.
+			isNodeResource := r.gvk.Kind == "Node" && nodeName == req.Name
+			if isNodeResource {
+				slog.Info("Node deleted, cleaning up internal state without publishing",
+					"policy", p.Name, "node", nodeName)
+
+				r.matchStatesMu.Lock()
+				delete(r.matchStates, stateKey)
+				r.matchStatesMu.Unlock()
+
+				continue
+			}
+
+			resourceInfo := &config.ResourceInfo{
+				Group:     r.gvk.Group,
+				Version:   r.gvk.Version,
+				Kind:      r.gvk.Kind,
+				Namespace: req.Namespace,
+				Name:      req.Name,
+			}
+
+			// Pod deleted - publish healthy event to uncordon the node
+			slog.Info("Resource deleted, publishing healthy event to uncordon node",
+				"policy", p.Name, "resource", req.NamespacedName, "node", nodeName)
+
+			if err := r.publisher.PublishHealthEvent(ctx, &p, nodeName, true, resourceInfo); err != nil {
+				slog.Error("Failed to publish healthy event for deleted resource",
+					"policy", p.Name,
+					"resource", req.NamespacedName,
+					"node", nodeName,
+					"error", err)
+				metrics.HealthEventsPublishErrors.WithLabelValues(p.Name, "grpc_error").Inc()
+			}
+
+			r.matchStatesMu.Lock()
+			delete(r.matchStates, stateKey)
+			r.matchStatesMu.Unlock()
+
+			if err := r.annotationMgr.RemoveMatch(ctx, nodeName, stateKey); err != nil {
+				slog.Error("Failed to remove match state from annotation", "node", nodeName, "stateKey", stateKey, "error", err)
+			}
+		}
+	}
+}
+
+func (r *ResourceReconciler) reconcilePolicy(
+	ctx context.Context,
+	p *config.Policy,
+	obj *unstructured.Unstructured,
+) error {
+	matched, err := r.evaluator.EvaluatePredicate(ctx, p.Name, obj)
+	if err != nil {
+		metrics.PolicyEvaluationErrors.WithLabelValues(p.Name, "cel_error").Inc()
+
+		return fmt.Errorf("predicate evaluation failed: %w", err)
+	}
+
+	nodeName, err := r.evaluator.EvaluateNodeAssociation(ctx, p.Name, obj)
+	if err != nil {
+		metrics.PolicyEvaluationErrors.WithLabelValues(p.Name, "node_association_error").Inc()
+
+		return fmt.Errorf("node association evaluation failed: %w", err)
+	}
+
+	if nodeName == "" {
+		nodeName = obj.GetName()
+	}
+
+	stateKey := r.getStateKey(p, obj)
+
+	r.matchStatesMu.RLock()
+	storedNodeName, wasMatched := r.matchStates[stateKey]
+	r.matchStatesMu.RUnlock()
+
+	resourceInfo := &config.ResourceInfo{
+		Group:     r.gvk.Group,
+		Version:   r.gvk.Version,
+		Kind:      r.gvk.Kind,
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+	}
+
+	if matched && !wasMatched {
+		return r.handleUnhealthyTransition(ctx, p, nodeName, stateKey, resourceInfo)
+	}
+
+	if !matched && wasMatched {
+		return r.handleHealthyTransition(ctx, p, storedNodeName, stateKey, resourceInfo)
+	}
+
+	return nil
+}
+
+func (r *ResourceReconciler) handleUnhealthyTransition(
+	ctx context.Context,
+	p *config.Policy,
+	nodeName string,
+	stateKey string,
+	resourceInfo *config.ResourceInfo,
+) error {
+	if err := r.publisher.PublishHealthEvent(ctx, p, nodeName, false, resourceInfo); err != nil {
+		if !rejectedForGood(err, p, nodeName, "unhealthy") {
+			return fmt.Errorf("failed to publish unhealthy event: %w", err)
+		}
+	}
+
+	r.matchStatesMu.Lock()
+	r.matchStates[stateKey] = nodeName
+	r.matchStatesMu.Unlock()
+
+	if err := r.annotationMgr.AddMatch(ctx, nodeName, stateKey, nodeName); err != nil {
+		slog.Error("Failed to persist match state to annotation", "node", nodeName, "stateKey", stateKey, "error", err)
+	}
+
+	metrics.PolicyMatches.WithLabelValues(p.Name, nodeName, r.gvk.Kind).Inc()
+
+	return nil
+}
+
+// rejectedForGood reports whether the platform connector refused the events
+// for good, counting the rejection and logging it: a requeue would get the
+// same answer, so the caller lets the state advance. Any other publish error
+// is counted as a gRPC error and left to the caller to return.
+func rejectedForGood(err error, p *config.Policy, nodeName, kind string) bool {
+	if !errors.Is(err, healthpub.ErrPublishRejected) {
+		metrics.HealthEventsPublishErrors.WithLabelValues(p.Name, "grpc_error").Inc()
+
+		return false
+	}
+
+	metrics.HealthEventsPublishErrors.WithLabelValues(p.Name, "rejected").Inc()
+	slog.Error("Platform connector rejected the event for good; not retrying it",
+		"event", kind, "policy", p.Name, "node", nodeName, "error", err)
+
+	return true
+}
+
+func (r *ResourceReconciler) handleHealthyTransition(
+	ctx context.Context,
+	p *config.Policy,
+	nodeName string,
+	stateKey string,
+	resourceInfo *config.ResourceInfo,
+) error {
+	if err := r.publisher.PublishHealthEvent(ctx, p, nodeName, true, resourceInfo); err != nil {
+		if !rejectedForGood(err, p, nodeName, "healthy") {
+			return fmt.Errorf("failed to publish healthy event: %w", err)
+		}
+	}
+
+	r.matchStatesMu.Lock()
+	delete(r.matchStates, stateKey)
+	r.matchStatesMu.Unlock()
+
+	if err := r.annotationMgr.RemoveMatch(ctx, nodeName, stateKey); err != nil {
+		slog.Error("Failed to remove match state from annotation", "node", nodeName, "stateKey", stateKey, "error", err)
+	}
+
+	return nil
+}
+
+// getStateKey generates the state key for tracking: policyName/namespace/resourceName
+func (r *ResourceReconciler) getStateKey(p *config.Policy, obj *unstructured.Unstructured) string {
+	if obj.GetNamespace() != "" {
+		return fmt.Sprintf("%s/%s/%s", p.Name, obj.GetNamespace(), obj.GetName())
+	}
+
+	return fmt.Sprintf("%s/%s", p.Name, obj.GetName())
+}

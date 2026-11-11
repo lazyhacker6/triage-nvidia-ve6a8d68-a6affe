@@ -1,0 +1,437 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package parser
+
+import (
+	"reflect"
+	"testing"
+
+	datamodels "github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+func TestParseSequenceStage(t *testing.T) {
+	tests := []struct {
+		name    string
+		stage   string
+		event   datamodels.HealthEventWithStatus
+		want    map[string]any
+		wantErr bool
+	}{
+		{
+			name:  "simple $match stage with this reference",
+			stage: `{"$match": {"healthevent.nodename": "this.healthevent.nodename", "healthevent.isfatal": true}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "test-node-1",
+					IsFatal:  true,
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"healthevent.nodename": "test-node-1",
+					"healthevent.isfatal":  true,
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "$match stage with nested this references",
+			stage: `{"$match": {"healthevent.nodename": "this.healthevent.nodename", "healthevent.errorcode.0": "this.healthevent.errorcode.0"}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName:  "gpu-node-2",
+					ErrorCode: []string{"13", "31"},
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"healthevent.nodename":    "gpu-node-2",
+					"healthevent.errorcode.0": "13",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "$count stage without this references",
+			stage: `{"$count": "total"}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "node1",
+				},
+			},
+			want: map[string]any{
+				"$count": "total",
+			},
+			wantErr: false,
+		},
+		{
+			name:  "complex $match with expression and this references",
+			stage: `{"$match": {"$expr": {"$gte": ["$healthevent.generatedtimestamp.seconds", 1000]}, "healthevent.nodename": "this.healthevent.nodename"}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "expr-node",
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"$expr": map[string]any{
+						"$gte": []any{
+							"$healthevent.generatedtimestamp.seconds",
+							float64(1000),
+						},
+					},
+					"healthevent.nodename": "expr-node",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "stage with entity array access",
+			stage: `{"$match": {"healthevent.entitiesimpacted.0.entityvalue": "this.healthevent.entitiesimpacted.0.entityvalue"}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					EntitiesImpacted: []*protos.Entity{
+						{EntityType: "GPU", EntityValue: "GPU-123"},
+					},
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"healthevent.entitiesimpacted.0.entityvalue": "GPU-123",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "stage with full entitiesimpacted array (MongoDB filter context)",
+			stage: `{"$match": {"$filter": {"input": "this.healthevent.entitiesimpacted", "cond": {"$eq": ["$$this.entitytype", "GPU"]}}}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					EntitiesImpacted: []*protos.Entity{
+						{EntityType: "GPU", EntityValue: "0"},
+						{EntityType: "CPU", EntityValue: "1"},
+					},
+				},
+			},
+			// After normalization, protobuf array should have lowercase field names
+			want: map[string]any{
+				"$match": map[string]any{
+					"$filter": map[string]any{
+						"input": []any{
+							map[string]any{"entitytype": "GPU", "entityvalue": "0"},
+							map[string]any{"entitytype": "CPU", "entityvalue": "1"},
+						},
+						"cond": map[string]any{
+							"$eq": []any{"$$this.entitytype", "GPU"},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "invalid JSON stage",
+			stage:   `{invalid json}`,
+			event:   datamodels.HealthEventWithStatus{},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name:  "stage with invalid this reference",
+			stage: `{"$match": {"healthevent.nonexistent": "this.healthevent.nonexistentfield"}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "test",
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name:  "nested arrays in stage",
+			stage: `{"$match": {"filters": ["this.healthevent.nodename", "this.healthevent.checkname"]}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName:  "array-node",
+					CheckName: "TestCheck",
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"filters": []any{"array-node", "TestCheck"},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:  "deeply nested map with this references",
+			stage: `{"$match": {"nested": {"level1": {"level2": "this.healthevent.nodename"}}}}`,
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "deep-node",
+				},
+			},
+			want: map[string]any{
+				"$match": map[string]any{
+					"nested": map[string]any{
+						"level1": map[string]any{
+							"level2": "deep-node",
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseSequenceStage(tt.stage, tt.event)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseSequenceStage() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ParseSequenceStage() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetValueFromPath(t *testing.T) {
+	remediated := wrapperspb.Bool(true)
+
+	tests := []struct {
+		name    string
+		path    string
+		event   datamodels.HealthEventWithStatus
+		want    any
+		wantErr bool
+	}{
+		{
+			name: "simple field access",
+			path: "healthevent.nodename",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "test-node",
+				},
+			},
+			want:    "test-node",
+			wantErr: false,
+		},
+		{
+			name: "boolean field",
+			path: "healthevent.isfatal",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					IsFatal: true,
+				},
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "array element access",
+			path: "healthevent.errorcode.0",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					ErrorCode: []string{"13", "31", "48"},
+				},
+			},
+			want:    "13",
+			wantErr: false,
+		},
+		{
+			name: "nested BoolValue field",
+			path: "healtheventstatus.faultremediated.value",
+			event: datamodels.HealthEventWithStatus{
+				HealthEventStatus: &protos.HealthEventStatus{
+					FaultRemediated: remediated,
+				},
+			},
+			want:    true,
+			wantErr: false,
+		},
+		{
+			name: "entity array access",
+			path: "healthevent.entitiesimpacted.0.entityvalue",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					EntitiesImpacted: []*protos.Entity{
+						{EntityType: "GPU", EntityValue: "GPU-456"},
+					},
+				},
+			},
+			want:    "GPU-456",
+			wantErr: false,
+		},
+		//	UserPodsEvictionStatus: &protos.OperationStatus{Status: &protos.Status{Value: string(model.StatusSucceeded)}},
+		{
+			name: "deeply nested field",
+			path: "healtheventstatus.userpodsevictionstatus.status",
+			event: datamodels.HealthEventWithStatus{
+				HealthEventStatus: &protos.HealthEventStatus{
+					UserPodsEvictionStatus: &protos.OperationStatus{
+						Status:  string(datamodels.StatusSucceeded),
+						Message: "Done",
+					},
+				},
+			},
+			want:    string(datamodels.StatusSucceeded),
+			wantErr: false,
+		},
+		{
+			name: "invalid path - too short",
+			path: "healthevent",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "test",
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "invalid field name",
+			path: "healthevent.nonexistent",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "test",
+				},
+			},
+			want:    nil,
+			wantErr: true,
+		},
+		{
+			name: "invalid array index",
+			path: "healthevent.errorcode.99",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					ErrorCode: []string{"13"},
+				},
+			},
+			want:    nil,
+			wantErr: false,
+		},
+		{
+			name: "case insensitive field matching",
+			path: "healthevent.NodeName",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "case-test",
+				},
+			},
+			want:    "case-test",
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := getValueFromPath(tt.path, tt.event)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("getValueFromPath() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("getValueFromPath() = %v (%T), want %v (%T)", got, got, tt.want, tt.want)
+			}
+		})
+	}
+}
+
+func TestProcessValue(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   any
+		event   datamodels.HealthEventWithStatus
+		want    any
+		wantErr bool
+	}{
+		{
+			name:  "plain string without this reference",
+			value: "static-value",
+			event: datamodels.HealthEventWithStatus{},
+			want:  "static-value",
+		},
+		{
+			name:  "this reference string",
+			value: "this.healthevent.nodename",
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "node123",
+				},
+			},
+			want: "node123",
+		},
+		{
+			name:  "number value",
+			value: float64(42),
+			event: datamodels.HealthEventWithStatus{},
+			want:  float64(42),
+		},
+		{
+			name:  "boolean value",
+			value: true,
+			event: datamodels.HealthEventWithStatus{},
+			want:  true,
+		},
+		{
+			name: "map with this reference",
+			value: map[string]any{
+				"field": "this.healthevent.checkname",
+			},
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					CheckName: "TestCheck",
+				},
+			},
+			want: map[string]any{
+				"field": "TestCheck",
+			},
+		},
+		{
+			name: "array with this reference",
+			value: []any{
+				"this.healthevent.nodename",
+				"static",
+			},
+			event: datamodels.HealthEventWithStatus{
+				HealthEvent: &protos.HealthEvent{
+					NodeName: "arraynode",
+				},
+			},
+			want: []any{
+				"arraynode",
+				"static",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := processValue(tt.value, tt.event)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("processValue() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("processValue() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

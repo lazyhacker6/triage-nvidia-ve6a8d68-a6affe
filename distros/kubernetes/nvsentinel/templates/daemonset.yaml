@@ -1,0 +1,165 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+{{ if include "nvsentinel.pcDaemonset.enabled" . -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "nvsentinel.fullname" . }}
+  labels:
+    {{- include "nvsentinel.labels" . | nindent 4 }}
+spec:
+  updateStrategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "nvsentinel.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        {{- with .Values.platformConnector.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+      labels:
+        {{- include "nvsentinel.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "nvsentinel.serviceAccountName" . }}
+      {{- $seLinuxOptions := (.Values.global).seLinuxOptions }}
+      {{- if or .Values.global.auditLogging.enabled $seLinuxOptions }}
+      securityContext:
+        {{- if .Values.global.auditLogging.enabled }}
+        fsGroup: 65532
+        {{- end }}
+        {{- with $seLinuxOptions }}
+        seLinuxOptions:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      {{- $pgCert := eq (include "nvsentinel.platformConnector.pgClientCert" .) "true" }}
+      {{- if or .Values.global.auditLogging.enabled $pgCert }}
+      initContainers:
+        {{- if .Values.global.auditLogging.enabled }}
+        {{- include "nvsentinel.auditLogging.initContainer" . | nindent 8 }}
+        {{- end }}
+        {{- include "nvsentinel.platformConnector.pgCertInitContainer" (dict "context" . "runAsUser" 0) | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: platform-connector
+          image: "{{ .Values.platformConnector.image.repository }}:{{ .Values.platformConnector.image.tag | default .Values.global.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.platformConnector.image.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              drop:
+              - ALL
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.global.metricsPort }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          args:
+          - "--config=/etc/config/config.json"
+          - "--metrics-port={{ .Values.global.metricsPort }}"
+          {{- include "nvsentinel.platformConnector.datastoreCertArgs" . | nindent 10 }}
+          - "--socket={{ .Values.socketPath }}"
+          resources:
+            {{- toYaml .Values.platformConnector.resources | nindent 12 }}
+          volumeMounts:
+            - name: var-run-vol
+              mountPath: /var/run
+            - name: platform-connector-configmap
+              mountPath: /etc/config/
+            {{- include "nvsentinel.platformConnector.datastoreVolumeMounts" . | nindent 12 }}
+            {{- if .Values.global.auditLogging.enabled }}
+            {{- include "nvsentinel.auditLogging.volumeMount" . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LOG_LEVEL
+              value: "{{ .Values.platformConnector.logLevel }}"
+            # App name for connection identification in logs and currentOp
+            - name: APP_NAME
+              value: "platform-connector"
+            {{- if .Values.global.auditLogging.enabled }}
+            {{- include "nvsentinel.auditLogging.envVars" . | nindent 12 }}
+            {{- end }}
+            {{- include "nvsentinel.platformConnector.datastoreEnv" . | nindent 12 }}
+            {{- if .Values.global.tracing.enabled }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.global.tracing.endpoint | quote }}
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: {{ .Values.global.tracing.insecure | quote }}
+            {{- end }}
+          envFrom:
+            {{- include "nvsentinel.platformConnector.datastoreEnvFrom" . | nindent 12 }}
+      volumes:
+        - name: var-run-vol
+          hostPath:
+            path: /var/run/nvsentinel
+            type: DirectoryOrCreate
+        - name: platform-connector-configmap
+          configMap:
+            name: {{ include "nvsentinel.fullname" . }}
+        {{- include "nvsentinel.platformConnector.datastoreVolumes" . | nindent 8 }}
+        {{- if .Values.global.auditLogging.enabled }}
+        {{- include "nvsentinel.auditLogging.volume" . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.platformConnector.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.global.tolerations | default .Values.platformConnector.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.global.priorityClassName | default .Values.platformConnector.priorityClassName) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+{{- end }}

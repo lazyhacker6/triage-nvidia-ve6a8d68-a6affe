@@ -1,0 +1,110 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package evaluator
+
+import (
+	"context"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/config"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/informers"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/queue"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+)
+
+type DrainEvaluator interface {
+	// Database-agnostic method
+	EvaluateEventWithDatabase(context.Context, model.HealthEventWithStatus, queue.DataStore,
+		datastore.HealthEventStore) (*DrainActionResult, error)
+}
+
+type NodeDrainEvaluator struct {
+	config            config.TomlConfig
+	informers         InformersInterface
+	customDrainClient CustomDrainClientInterface
+	podPolicies       *config.PodPolicyMatcher
+	customDrainNodes  *config.CustomDrainNodeMatcher
+}
+
+type InformersInterface interface {
+	GetNamespacesMatchingPattern(context.Context, string, string, string) ([]string, error)
+	CheckIfAllPodsAreEvictedInImmediateMode(context.Context, []string, string, time.Duration,
+		*protos.Entity, ...informers.PodFilter) bool
+	CheckIfObservedPodsAreEvictedInImmediateMode(context.Context, []string, string, time.Duration,
+		*protos.Entity, []*v1.Pod, ...informers.PodFilter) bool
+	FindEvictablePodsInNamespaceAndNode(context.Context, string, string, *protos.Entity,
+		...informers.PodFilter) ([]*v1.Pod, error)
+	GetNode(string) (*v1.Node, error)
+}
+
+type CustomDrainClientInterface interface {
+	ExistsForNode(ctx context.Context, nodeName string) (exists bool, drainComplete bool, err error)
+	GetCRStatus(ctx context.Context, crName string) (found bool, complete bool, err error)
+}
+
+type DrainAction int
+
+const (
+	ActionSkip DrainAction = iota
+	ActionWait
+	ActionCreateCR
+	ActionEvictImmediate
+	ActionEvictWithTimeout
+	ActionCheckCompletion
+	ActionMarkAlreadyDrained
+	ActionUpdateStatus
+	ActionCancel
+)
+
+type DrainActionResult struct {
+	Action             DrainAction
+	Namespaces         []string
+	Timeout            time.Duration
+	WaitDelay          time.Duration // For ActionWait
+	Status             model.Status  // For ActionUpdateStatus and ActionCancel
+	PartialDrainEntity *protos.Entity
+	PodFilter          informers.PodFilter
+}
+
+var drainActionNames = map[DrainAction]string{
+	ActionSkip:               "Skip",
+	ActionWait:               "Wait",
+	ActionCreateCR:           "CreateCR",
+	ActionEvictImmediate:     "EvictImmediate",
+	ActionEvictWithTimeout:   "EvictWithTimeout",
+	ActionCheckCompletion:    "CheckCompletion",
+	ActionMarkAlreadyDrained: "MarkAlreadyDrained",
+	ActionUpdateStatus:       "UpdateStatus",
+	ActionCancel:             "Cancel",
+}
+
+func (a DrainAction) String() string {
+	if name, ok := drainActionNames[a]; ok {
+		return name
+	}
+
+	return "Unknown"
+}
+
+type namespaces struct {
+	immediateEvictionNamespaces  []string
+	allowCompletionNamespaces    []string
+	deleteAfterTimeoutNamespaces []string
+	podFilters                   map[config.EvictMode]informers.PodFilter
+}

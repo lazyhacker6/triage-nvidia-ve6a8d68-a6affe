@@ -1,0 +1,668 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/grpcclient"
+	"github.com/nvidia/nvsentinel/commons/pkg/healthpub"
+	"github.com/nvidia/nvsentinel/commons/pkg/logger"
+	metrics "github.com/nvidia/nvsentinel/commons/pkg/metrics"
+	"github.com/nvidia/nvsentinel/commons/pkg/server"
+	"github.com/nvidia/nvsentinel/commons/pkg/stringutil"
+	pb "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/cancellation"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/common"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/gpufallen"
+	fd "github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/syslog-monitor"
+	xidmetrics "github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/xid/metrics"
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/xid/parser"
+)
+
+const (
+	defaultAgentName       = "syslog-health-monitor"
+	defaultComponentClass  = "GPU"                                // Or a more specific class if applicable
+	defaultPollingInterval = "30m"                                // Default polling interval
+	defaultStateFilePath   = "/var/run/syslog_monitor/state.json" // Default state file path
+)
+
+var (
+	// These variables will be populated during the build process
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+
+	// Command-line flags
+	checksList = flag.String("checks", "SysLogsXIDError,SysLogsSXIDError,SysLogsGPUFallenOff",
+		"Comma separated listed of checks to enable")
+	platformConnectorSocket = flag.String("platform-connector-socket", "unix:///var/run/nvsentinel.sock",
+		"Path to the platform-connector UDS socket.")
+	platformConnectorTokenPath = flag.String("platform-connector-token-path", "",
+		"Path to a projected ServiceAccount token presented to platform-connector. "+
+			"This monitor reports health events only for the node it runs on; the token "+
+			"lets platform-connector confirm that placement. Empty disables token authentication.")
+	nodeNameEnv         = flag.String("node-name", os.Getenv("NODE_NAME"), "Node name. Defaults to NODE_NAME env var.")
+	pollingIntervalFlag = flag.String("polling-interval", defaultPollingInterval,
+		"Polling interval for health checks (e.g., 15m, 1h).")
+	stateFileFlag = flag.String("state-file", defaultStateFilePath,
+		"Path to state file for cursor persistence.")
+	metricsPort         = flag.String("metrics-port", "2112", "Port to expose Prometheus metrics on")
+	xidAnalyserEndpoint = flag.String("xid-analyser-endpoint", "",
+		"Endpoint to the XID analyser service.")
+	kataEnabled = flag.String("kata-enabled", "false",
+		"Indicates if this monitor is running in Kata Containers mode (set by DaemonSet variant).")
+	metadataPath = flag.String("metadata-path", "/var/lib/nvsentinel/gpu_metadata.json",
+		"Path to GPU metadata JSON file.")
+	processingStrategyFlag = flag.String("processing-strategy", "EXECUTE_REMEDIATION",
+		"Event processing strategy: EXECUTE_REMEDIATION or STORE_ONLY")
+	nicDriverConfigPath = flag.String("nic-driver-config", "/etc/syslog-health-monitor/nic-driver.toml",
+		"Path to NIC driver syslog pattern config (TOML). Used only when SysLogsNICDriverError is in --checks.")
+	sysfsRoot = flag.String("sysfs-root", "/nvsentinel/sys",
+		"Root path for sysfs reads (BDF→driver resolution). Typically a container mount point.")
+	cancellationsConfigPath = flag.String("cancellations-config", "/etc/syslog-health-monitor/cancellations.toml",
+		"Path to per-monitor cancellation rules (TOML). Missing file is treated as no rules.")
+	bootLookbackWindowFlag = flag.String("boot-lookback-window", "2h",
+		"How far back to scan the journal after a reboot (e.g. 30m, 1h). "+
+			"Entries older than this window are skipped to avoid re-processing ancient XIDs.")
+)
+
+var checks []fd.CheckDefinition
+
+func main() {
+	logger.SetDefaultStructuredLogger(defaultAgentName, version)
+	slog.Info("Starting syslog-health-monitor", "version", version, "commit", commit, "date", date)
+
+	if err := run(); err != nil {
+		slog.Error("Fatal error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	nodeName, err := validateNodeName()
+	if err != nil {
+		return err
+	}
+
+	ff := metrics.NewRegistry("syslog-health-monitor")
+	ff.SetStoreOnlyMode(*processingStrategyFlag)
+	ff.Set("xid_sidecar_enabled", *xidAnalyserEndpoint != "")
+	ff.Set("kata_enabled", stringutil.IsTruthyValue(*kataEnabled))
+
+	root := context.Background()
+
+	ctx, stop := signal.NotifyContext(root, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client, pubOpt, err := dialPlatformConnector(ctx, *platformConnectorSocket, *platformConnectorTokenPath)
+	if err != nil {
+		return err
+	}
+
+	checks, err = buildChecksFromFlag()
+	if err != nil {
+		return err
+	}
+
+	checks = applyKataConfig(checks)
+
+	for _, c := range checks {
+		ff.Set(c.Name, true)
+	}
+
+	preInitializeMetrics(nodeName, checks)
+
+	monitor, pollingInterval, err := createSyslogMonitor(nodeName, checks, client, pubOpt)
+	if err != nil {
+		return err
+	}
+
+	// Closes the publisher and the connection it owns.
+	defer monitor.Close()
+
+	// Health checker reports unhealthy if the polling loop has not completed
+	// an iteration within 3x the polling interval, unless the loop is waiting
+	// for the deployment platform connector to store a batch: that is the
+	// server being away, not the loop hanging, and must not restart the pod.
+	healthChecker := server.NewPollingHealthChecker(3 * pollingInterval)
+	healthChecker.AllowWaitingOn(monitor.WaitingOnServer)
+
+	srv, portInt, err := createMetricsServer(healthChecker)
+	if err != nil {
+		return err
+	}
+
+	return runServerAndLoop(ctx, srv, portInt, nodeName, monitor, pollingInterval, healthChecker)
+}
+
+// runServerAndLoop runs the metrics server and the journal polling loop under
+// one errgroup, gating the polling loop on XID-sidecar readiness when the
+// sidecar is enabled.
+func runServerAndLoop(
+	ctx context.Context,
+	srv server.Server,
+	portInt int,
+	nodeName string,
+	monitor *fd.SyslogMonitor,
+	pollingInterval time.Duration,
+	healthChecker *server.PollingHealthChecker,
+) error {
+	g, gCtx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		slog.Info("Starting metrics server", "port", portInt)
+
+		if err := srv.Serve(gCtx); err != nil {
+			slog.Error("Metrics server failed - continuing without metrics", "error", err)
+		}
+
+		return nil
+	})
+
+	// The healthy events a reboot left pending go out now, with the health
+	// endpoint served and before the XID sidecar wait: they do not need the
+	// sidecar, and on main they went out from the constructor, ahead of it. A
+	// failure is retried by the first run of the loop.
+	healthChecker.MarkAlive()
+
+	if err := monitor.FlushPostReboot(gCtx); err != nil {
+		slog.Error("Pending post-reboot bootID flush failed at start; the polling loop retries it", "error", err)
+	}
+
+	if err := waitForSidecarIfEnabled(gCtx, nodeName); err != nil {
+		return err
+	}
+
+	g.Go(func() error {
+		return runPollingLoop(gCtx, monitor, pollingInterval, checks, healthChecker)
+	})
+
+	return g.Wait()
+}
+
+// parseBootLookbackWindow parses a duration string for the boot lookback window.
+// Returns an error for invalid or negative durations. Zero is valid (unlimited).
+func parseBootLookbackWindow(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+
+	if d < 0 {
+		return 0, fmt.Errorf("negative duration %q not allowed", s)
+	}
+
+	return d, nil
+}
+
+// mustParseDuration parses a duration string and exits on failure.
+func mustParseDuration(s string) time.Duration {
+	d, err := parseBootLookbackWindow(s)
+	if err != nil {
+		slog.Error("Invalid boot-lookback-window flag", "value", s, "error", err)
+		os.Exit(1)
+	}
+
+	return d
+}
+
+func validateNodeName() (string, error) {
+	flag.Parse()
+	slog.Info("Parsed command line flags successfully")
+
+	nodeName := *nodeNameEnv
+	if nodeName == "" {
+		return "", fmt.Errorf("NODE_NAME env not set and --node-name flag not provided, cannot run")
+	}
+
+	slog.Info("Configuration", "node", nodeName, "kata-enabled", *kataEnabled)
+
+	return nodeName, nil
+}
+
+// dialPlatformConnector routes the dial through the shared healthpub
+// environment switch: with HEALTH_PUBLISH_TARGET set the client talks to the
+// deployment platform connector directly, otherwise today's node-local socket
+// dial runs unchanged (the same bounded retry dial, socket presence plus
+// readiness wait, against the same target and token path). The option hands
+// the connection to the publisher, which closes it in Close.
+func dialPlatformConnector(ctx context.Context, socket, tokenPath string) (
+	pb.PlatformConnectorClient, healthpub.Option, error,
+) {
+	_, client, pubOpt, err := healthpub.DialFromEnvOr(func() (*grpc.ClientConn, error) {
+		// Legacy socket mode: the bounded socket wait and readiness gate are
+		// part of today's startup contract, so dial exactly as before.
+		slog.Info("Creating gRPC client to platform connector", "socket", socket, "tokenAuthEnabled", tokenPath != "")
+
+		return dialWithRetry(ctx, socket, grpcclient.InsecureDialOptions(tokenPath)...)
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("syslog-health-monitor: failed to dial platform connector: %w", err)
+	}
+
+	return client, pubOpt, nil
+}
+
+// kernelOriginChecks lists checks whose source events are emitted by the kernel
+// (NVIDIA driver, NVSwitch, PCI subsystem). They must only consume kernel
+// (_TRANSPORT=kernel) journal entries: scanning every transport lets unrelated
+// high-volume userspace logs (audit, containers) push the read cursor behind
+// journald's retention window, so the segment holding an XID can be vacuumed
+// before the monitor processes it. See NVIDIA/NVSentinel#1417.
+//
+// On Kata nodes this default is overridden in applyKataConfig, because there the
+// GPU runs in the guest VM and XIDs surface via containerd rather than as host
+// kernel entries.
+var kernelOriginChecks = map[string]bool{
+	fd.XIDErrorCheck:       true,
+	fd.SXIDErrorCheck:      true,
+	fd.GPUFallenOffCheck:   true,
+	fd.NICDriverErrorCheck: true,
+}
+
+func buildChecksFromFlag() ([]fd.CheckDefinition, error) {
+	list := make([]fd.CheckDefinition, 0)
+
+	for c := range strings.SplitSeq((*checksList), ",") {
+		name := strings.TrimSpace(c)
+		if name == "" {
+			continue
+		}
+
+		check := fd.CheckDefinition{
+			Name:        name,
+			JournalPath: "/nvsentinel/var/log/journal/",
+		}
+
+		// Kernel-origin checks only consume kernel (_TRANSPORT=kernel) entries by
+		// default so they keep up with journald instead of falling behind under
+		// retention pressure from unrelated logs. See NVIDIA/NVSentinel#1417.
+		if kernelOriginChecks[name] {
+			check.Tags = []string{"-k"}
+		}
+
+		list = append(list, check)
+	}
+
+	if len(list) == 0 {
+		return nil, fmt.Errorf("no checks defined in the config file")
+	}
+
+	return list, nil
+}
+
+func applyKataConfig(list []fd.CheckDefinition) []fd.CheckDefinition {
+	if !stringutil.IsTruthyValue(*kataEnabled) {
+		return list
+	}
+
+	slog.Info("Kata mode enabled, adding containerd service filter and removing SysLogsSXIDError check")
+
+	for i := range list {
+		// On Kata nodes XIDs surface via the guest kernel relayed through
+		// containerd, not as host _TRANSPORT=kernel entries, so filter by the
+		// containerd unit and drop any kernel-transport default set in
+		// buildChecksFromFlag (the two would AND together and match nothing).
+		// See NVIDIA/NVSentinel#1417.
+		list[i].Tags = []string{"-u containerd.service"}
+	}
+
+	filtered := make([]fd.CheckDefinition, 0, len(list))
+
+	for _, check := range list {
+		if check.Name != "SysLogsSXIDError" {
+			filtered = append(filtered, check)
+		}
+	}
+
+	return filtered
+}
+
+// preInitializeMetrics materializes the CounterVec series owned by this agent
+// at zero so backends that establish a baseline from the first ingested sample
+// (e.g. Google Managed Prometheus) do not drop the first real occurrence of
+// an XID / GPU-fallen event on this node. See
+// https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#counter-sums
+// and NVIDIA/NVSentinel#1196.
+//
+// Pre-initialization is gated on the set of checks enabled for this pod, so a
+// DaemonSet deployment that only runs a subset of the checks (e.g. Kata mode
+// disables SXID) does not export counters for disabled subsystems.
+func preInitializeMetrics(nodeName string, enabledChecks []fd.CheckDefinition) {
+	enabled := make(map[string]bool, len(enabledChecks))
+	for _, c := range enabledChecks {
+		enabled[c.Name] = true
+	}
+
+	if enabled[fd.XIDErrorCheck] {
+		xidCodes, err := knownXIDCodes()
+		if err != nil {
+			// Loading the embedded catalog is best-effort: pre-initialization
+			// is an observability nicety, not a correctness requirement. Log
+			// and continue so the monitor still starts.
+			slog.Warn("Could not load XID catalog for metric pre-initialization; "+
+				"first observation of each XID code on this node may be lost in "+
+				"Google Managed Prometheus",
+				"error", err)
+		} else {
+			xidmetrics.PreInitialize(nodeName, xidCodes)
+			slog.Info("Pre-initialized XID counter metrics at zero",
+				"node", nodeName, "xidCodeCount", len(xidCodes))
+		}
+	}
+
+	if enabled[fd.GPUFallenOffCheck] {
+		gpufallen.PreInitialize(nodeName)
+		slog.Info("Pre-initialized GPU-fallen counter metric at zero", "node", nodeName)
+	}
+
+	// SxidCounterMetric is deliberately not pre-initialized because its
+	// {link, nvswitch} labels carry per-event cardinality that is not
+	// enumerable at startup. See pkg/sxid/metrics.go for the rationale.
+}
+
+// knownXIDCodes returns the set of XID codes baked into the embedded NVIDIA
+// catalog. Used to pre-initialize XidCounterMetric at 0 per known code.
+func knownXIDCodes() ([]int, error) {
+	m, err := common.LoadErrorResolutionMap()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load XID error resolution map: %w", err)
+	}
+
+	codes := make([]int, 0, len(m))
+	for code := range m {
+		codes = append(codes, code)
+	}
+
+	return codes, nil
+}
+
+func createSyslogMonitor(
+	nodeName string,
+	list []fd.CheckDefinition,
+	client pb.PlatformConnectorClient,
+	pubOpts ...healthpub.Option,
+) (*fd.SyslogMonitor, time.Duration, error) {
+	value, ok := pb.ProcessingStrategy_value[*processingStrategyFlag]
+	if !ok {
+		return nil, 0, fmt.Errorf("unexpected processingStrategy value: %q", *processingStrategyFlag)
+	}
+
+	slog.Info("Event handling strategy configured", "processingStrategy", *processingStrategyFlag)
+
+	processingStrategy := pb.ProcessingStrategy(value)
+
+	slog.Info("Creating syslog monitor", "checksCount", len(list))
+
+	cancellationsCfg, err := cancellation.LoadConfig(*cancellationsConfigPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to load cancellations config %s: %w", *cancellationsConfigPath, err)
+	}
+
+	if err := cancellation.ValidateSupportedChecks(cancellationsCfg, fd.CancellationSupportedChecks); err != nil {
+		return nil, 0, fmt.Errorf("cancellations config %s validation failed: %w", *cancellationsConfigPath, err)
+	}
+
+	enabledCheckNames := make([]string, 0, len(list))
+	for _, c := range list {
+		enabledCheckNames = append(enabledCheckNames, c.Name)
+	}
+
+	if err := cancellation.ValidateAgainstEnabledChecks(cancellationsCfg, enabledCheckNames); err != nil {
+		return nil, 0, fmt.Errorf("cancellations config %s validation failed: %w", *cancellationsConfigPath, err)
+	}
+
+	slog.Info("Loaded cancellations config",
+		"path", *cancellationsConfigPath,
+		"checksConfigured", len(cancellationsCfg.Checks))
+
+	monitor, err := fd.NewSyslogMonitor(
+		nodeName,
+		list,
+		client,
+		defaultAgentName,
+		defaultComponentClass,
+		*pollingIntervalFlag,
+		*stateFileFlag,
+		*xidAnalyserEndpoint,
+		*metadataPath,
+		processingStrategy,
+		*nicDriverConfigPath,
+		*sysfsRoot,
+		cancellationsCfg,
+		*platformConnectorSocket,
+		mustParseDuration(*bootLookbackWindowFlag),
+		pubOpts...,
+	)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error creating syslog health monitor: %w", err)
+	}
+
+	pollingInterval, err := time.ParseDuration(*pollingIntervalFlag)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error parsing polling interval: %w", err)
+	}
+
+	slog.Info("Polling interval configured", "interval", pollingInterval)
+
+	return monitor, pollingInterval, nil
+}
+
+func createMetricsServer(healthChecker *server.PollingHealthChecker) (server.Server, int, error) {
+	portInt, err := strconv.Atoi(*metricsPort)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid metrics port: %w", err)
+	}
+
+	srv := server.NewServer(
+		server.WithPort(portInt),
+		server.WithPrometheusMetrics(),
+		server.WithHealthCheck(healthChecker),
+	)
+
+	return srv, portInt, nil
+}
+
+func runPollingLoop(
+	ctx context.Context,
+	monitor *fd.SyslogMonitor,
+	interval time.Duration,
+	list []fd.CheckDefinition,
+	healthChecker *server.PollingHealthChecker,
+) error {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	slog.Info("Configured checks", "checks", list)
+	slog.Info("Syslog health monitor initialization complete, starting polling loop...")
+
+	var backoff time.Duration
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Polling loop stopped due to context cancellation")
+
+			return nil
+		case <-ticker.C:
+			slog.Info("Performing scheduled health check run...")
+
+			for {
+				// Mark alive before and after every attempt, not just on
+				// success, so the liveness probe detects a frozen loop rather
+				// than a failed dependency: on sustained failure this retry
+				// loop never returns to the outer ticker, a run itself can
+				// last a publish retry window in direct mode, and only the
+				// backoff sleep (≤30s) stays uncovered, far shorter than the
+				// staleness threshold.
+				healthChecker.MarkAlive()
+
+				if err := monitor.Run(ctx); err != nil {
+					healthChecker.MarkAlive()
+
+					backoff = nextBackoff(backoff)
+
+					slog.Error("Health check run failed; will retry after backoff", "error", err, "backoff", backoff)
+
+					timer := time.NewTimer(backoff)
+
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						slog.Info("Polling loop stopped during backoff due to context cancellation")
+
+						return nil
+					case <-timer.C:
+					}
+
+					continue
+				}
+
+				backoff = 0
+
+				break
+			}
+		}
+	}
+}
+
+// nextBackoff doubles the retry pause, from two seconds up to thirty.
+func nextBackoff(prev time.Duration) time.Duration {
+	if prev == 0 {
+		return 2 * time.Second
+	}
+
+	return min(prev*2, 30*time.Second)
+}
+
+func waitForSidecarIfEnabled(ctx context.Context, nodeName string) error {
+	if *xidAnalyserEndpoint == "" {
+		return nil
+	}
+
+	sidecar := parser.NewSidecarParser(*xidAnalyserEndpoint, nodeName, func() string { return "" })
+
+	if err := sidecar.WaitUntilReady(ctx, 30, 2*time.Second); err != nil {
+		return fmt.Errorf("sidecar readiness check failed: %w", err)
+	}
+
+	return nil
+}
+
+// dialWithRetry dials a gRPC target with bounded retries and per-attempt timeout.
+// It also verifies a unix domain socket path exists when scheme unix:// is used.
+func dialWithRetry(ctx context.Context, target string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	const (
+		maxRetries        = 10
+		perAttemptTimeout = 5 * time.Second
+	)
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		slog.Info("Checking platform connector socket availability",
+			"attempt", attempt,
+			"maxRetries", maxRetries,
+			"target", target,
+		)
+
+		// For unix:// ensure the socket path exists before dialing.
+		if after, ok := strings.CutPrefix(target, "unix://"); ok {
+			socketPath := after
+			if _, statErr := os.Stat(socketPath); statErr != nil {
+				slog.Warn("Platform connector socket file does not exist",
+					"attempt", attempt, "maxRetries", maxRetries, "error", statErr)
+
+				if attempt < maxRetries {
+					time.Sleep(time.Duration(attempt) * time.Second)
+					continue
+				}
+
+				return nil, fmt.Errorf("platform connector socket file not found after retries: %w", statErr)
+			}
+		}
+
+		// Create client connection (non-blocking).
+		conn, err := grpc.NewClient(target, opts...)
+		if err != nil {
+			slog.Warn("Error creating gRPC client", "attempt", attempt, "maxRetries", maxRetries, "error", err)
+
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+
+			return nil, fmt.Errorf("failed to create gRPC client after retries: %w", err)
+		}
+
+		// Actively connect and wait until Ready (or timeout/cancel).
+		if err := waitUntilReady(ctx, conn, perAttemptTimeout); err != nil {
+			_ = conn.Close()
+
+			slog.Warn("gRPC client not ready before timeout",
+				"attempt", attempt,
+				"maxRetries", maxRetries,
+				"error", err,
+			)
+
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+
+			return nil, fmt.Errorf("gRPC client not ready after retries: %w", err)
+		}
+
+		slog.Info("Successfully connected to platform connector", "attempt", attempt)
+
+		return conn, nil
+	}
+
+	// Unreachable, but keeps compiler happy.
+	return nil, fmt.Errorf("exhausted retries without creating gRPC client")
+}
+
+// waitUntilReady triggers connection establishment and blocks until the ClientConn
+// reaches connectivity.Ready or the timeout/context expires.
+func waitUntilReady(parent context.Context, conn *grpc.ClientConn, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+
+	conn.Connect()
+
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return nil
+		}
+
+		// Wait for a state change or context expiry.
+		if !conn.WaitForStateChange(ctx, state) {
+			// Context expired or canceled.
+			return ctx.Err()
+		}
+	}
+}

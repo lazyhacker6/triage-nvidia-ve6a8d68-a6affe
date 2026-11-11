@@ -1,0 +1,198 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package parser
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/go-retryablehttp"
+
+	"github.com/nvidia/nvsentinel/health-monitors/syslog-health-monitor/pkg/xid/metrics"
+)
+
+// SidecarParser implements Parser interface using external sidecar service
+type SidecarParser struct {
+	url             string
+	client          *retryablehttp.Client
+	nodeName        string
+	driverVersionFn func() string
+}
+
+// NewSidecarParser creates a new sidecar parser.
+//
+// driverVersionFn is invoked on every Parse call so the driver version is
+// resolved live rather than snapshotted at construction. This matters because
+// the sidecar selects its NVL5 (R575+) decode table based on the driver version;
+// snapshotting an empty value at startup (before metadata-collector has written
+// the file) would permanently send an empty driver_version to the sidecar.
+func NewSidecarParser(endpoint, nodeName string, driverVersionFn func() string) *SidecarParser {
+	c := retryablehttp.NewClient()
+	c.Logger = slog.With("http", "retryablehttp-client")
+
+	if driverVersionFn == nil {
+		driverVersionFn = func() string { return "" }
+	}
+
+	return &SidecarParser{
+		url:             fmt.Sprintf("%s/decode-xid", endpoint),
+		client:          c,
+		nodeName:        nodeName,
+		driverVersionFn: driverVersionFn,
+	}
+}
+
+// WaitUntilReady blocks until the sidecar HTTP endpoint is accepting TCP connections.
+// This is the application-level fallback for Kubernetes < 1.29 where native sidecar
+// containers are not available to guarantee startup ordering.
+func (p *SidecarParser) WaitUntilReady(ctx context.Context, maxRetries int, retryDelay time.Duration) error {
+	host := strings.TrimPrefix(p.url, "http://")
+	host = strings.TrimPrefix(host, "https://")
+
+	if idx := strings.Index(host, "/"); idx != -1 {
+		host = host[:idx]
+	}
+
+	slog.Info("Waiting for XID analyzer sidecar to become ready", "host", host)
+
+	dialer := &net.Dialer{Timeout: 1 * time.Second}
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		conn, err := dialer.DialContext(ctx, "tcp", host)
+		if err == nil {
+			conn.Close()
+			slog.Info("XID analyzer sidecar is ready", "attempt", attempt)
+
+			return nil
+		}
+
+		slog.Warn("XID analyzer sidecar not ready yet",
+			"attempt", attempt,
+			"maxRetries", maxRetries,
+			"error", err,
+		)
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled while waiting for sidecar: %w", ctx.Err())
+		case <-time.After(retryDelay):
+		}
+	}
+
+	return fmt.Errorf("XID analyzer sidecar at %s not ready after %d attempts", host, maxRetries)
+}
+
+// resolveDriverVersion returns the driver version to send to the sidecar,
+// emitting a warning and metric when it is empty (which forces the sidecar to
+// fall back to the wrong NVL5 decode table for R575+ drivers).
+func (p *SidecarParser) resolveDriverVersion() string {
+	driverVersion := p.driverVersionFn()
+	if driverVersion == "" {
+		slog.Warn("Sending XID decode request with empty driver version; "+
+			"sidecar NVL5 decode may fall back to the wrong table",
+			"node", p.nodeName)
+		metrics.XidEmptyDriverVersion.WithLabelValues(p.nodeName).Inc()
+	}
+
+	return driverVersion
+}
+
+// Parse sends the message to sidecar service for XID parsing
+func (p *SidecarParser) Parse(message string) (*Response, error) {
+	reqBody := Request{XIDMessage: message, DriverVersion: p.resolveDriverVersion()}
+
+	jsonBody, err := json.Marshal(reqBody)
+	if err != nil {
+		slog.Error("Error marshalling XID message", "error", err.Error())
+		metrics.XidProcessingErrors.WithLabelValues("json_marshal_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("error marshalling xid message: %w", err)
+	}
+
+	req, err := retryablehttp.NewRequest("POST", p.url, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		slog.Error("Error creating request", "error", err.Error())
+		metrics.XidProcessingErrors.WithLabelValues("request_creation_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		slog.Error("Error sending request", "error", err.Error())
+		metrics.XidProcessingErrors.WithLabelValues("request_sending_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("error sending request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		slog.Debug("HTTP request failed", "statusCode", resp.StatusCode)
+		metrics.XidProcessingErrors.WithLabelValues("http_status_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("HTTP request failed with status code: %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Error("Error reading response body", "error", err.Error())
+		metrics.XidProcessingErrors.WithLabelValues("response_reading_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	slog.Debug("Response received", "body", string(bodyBytes))
+
+	var xidResp Response
+
+	err = json.Unmarshal(bodyBytes, &xidResp)
+	if err != nil {
+		slog.Error("Error decoding XID response", "error", err.Error())
+		metrics.XidProcessingErrors.WithLabelValues("response_decoding_error", p.nodeName).Inc()
+
+		return nil, fmt.Errorf("error decoding xid response: %w", err)
+	}
+
+	xidResp.Result.Resolution = mapRecoveryActionWording(xidResp.Result.Resolution)
+
+	return &xidResp, nil
+}
+
+// mapRecoveryActionWording maps a recommendation that the side car returns as is from the XID
+// error message to a well known resolution string from the proto. Drivers up to R595 print
+// "GPU Reset Required" and "Node Reboot Required"; R610 and later print "PF FLR" and
+// "OS Reboot" for the same recovery actions. The other wordings map as in the CSV parser
+// (getRecommendedActionForXid in csv.go). Any other resolution is returned unchanged.
+func mapRecoveryActionWording(resolution string) string {
+	switch resolution {
+	case "GPU Reset Required", "PF FLR", "Drain and Reset":
+		return "COMPONENT_RESET"
+	case "Node Reboot Required", "OS Reboot", "Bus Reset", "System Reboot":
+		return "RESTART_BM"
+	case "Drain P2P", "Recover IMEX Domain":
+		return "CONTACT_SUPPORT"
+	default:
+		return resolution
+	}
+}

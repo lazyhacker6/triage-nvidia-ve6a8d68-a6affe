@@ -1,0 +1,573 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package queue
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+)
+
+// TestWorkqueueDeduplication_WithoutEventID tests the CURRENT behavior (without EventID)
+// This demonstrates the problem we're trying to solve
+func TestWorkqueueDeduplication_WithoutEventID(t *testing.T) {
+	t.Skip("Skipping test for current behavior - demonstrates the problem")
+
+	// Create queue manager
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// Event 1: Quarantine event
+	event1 := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439011",
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Quarantined",
+	}
+
+	// Event 2: Cancelled event (different _id, same node)
+	event2 := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439012", // Different!
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Cancelled",
+	}
+
+	// Enqueue first event
+	err := mgr.EnqueueEventGeneric(ctx, "node-1", event1, mockDB, mockHealthEventStore, event1["_id"])
+	require.NoError(t, err)
+
+	// Simulate: Worker gets the event but doesn't call Done yet (simulates processing)
+	queueImpl := mgr.(*eventQueueManager)
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "node-1", item1.NodeName)
+
+	// Now enqueue second event WHILE first is being processed
+	err = mgr.EnqueueEventGeneric(ctx, "node-1", event2, mockDB, mockHealthEventStore, event2["_id"])
+	require.NoError(t, err)
+
+	// Without EventID: Both events might get deduplicated because NodeEvent
+	// only has NodeName as the distinguishing field (Event pointer changes each time)
+	// The actual behavior depends on pointer comparison
+
+	// Clean up
+	queueImpl.queue.Done(item1)
+}
+
+// TestWorkqueueDeduplication_WithEventID tests the NEW behavior (with EventID)
+// This demonstrates that the fix works correctly
+func TestWorkqueueDeduplication_WithEventID(t *testing.T) {
+	// Create queue manager
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// Event 1: Quarantine event
+	event1 := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439011",
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Quarantined",
+	}
+
+	// Event 2: Cancelled event (different _id, same node)
+	event2 := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439012", // Different _id!
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Cancelled",
+	}
+
+	// Enqueue first event (EventID extracted from event map)
+	err := mgr.EnqueueEventGeneric(ctx, "node-1", event1, mockDB, mockHealthEventStore, event1["_id"])
+	require.NoError(t, err)
+
+	// Get the event but DON'T call Done (simulates processing)
+	queueImpl := mgr.(*eventQueueManager)
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "node-1", item1.NodeName)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item1.EventID)
+
+	// Queue should be empty now (item is being processed)
+	assert.Equal(t, 0, queueImpl.queue.Len())
+
+	// Now enqueue second event WHILE first is being processed
+	err = mgr.EnqueueEventGeneric(ctx, "node-1", event2, mockDB, mockHealthEventStore, event2["_id"])
+	require.NoError(t, err)
+
+	// With EventID: Second event should be in the queue (different EventID!)
+	assert.Equal(t, 1, queueImpl.queue.Len(), "Second event should be queued (different EventID)")
+
+	// Get the second event
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "node-1", item2.NodeName)
+	assert.Equal(t, "507f1f77bcf86cd799439012", item2.EventID)
+
+	// Clean up
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+}
+
+// TestWorkqueueDeduplication_SameEventDifferentStatus tests that updates to the SAME event
+// are correctly deduplicated — the same document ID is not processed twice concurrently.
+// With DocumentID-based deduplication, re-enqueuing an event that is already being
+// processed marks it "dirty" in the workqueue rather than adding a new queue entry.
+// The item only becomes available again after Done() is called on the in-flight item.
+func TestWorkqueueDeduplication_SameEventDifferentStatus(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// Event with status NotStarted
+	event1 := datastore.Event{
+		"_id":                    "507f1f77bcf86cd799439011",
+		"nodeName":               "node-1",
+		"userPodsEvictionStatus": "NotStarted",
+	}
+
+	// Same event, status updated to Succeeded (same _id)
+	event2 := datastore.Event{
+		"_id":                    "507f1f77bcf86cd799439011",
+		"nodeName":               "node-1",
+		"userPodsEvictionStatus": "Succeeded",
+	}
+
+	// Enqueue first event
+	err := mgr.EnqueueEventGeneric(ctx, "node-1", event1, mockDB, mockHealthEventStore, event1["_id"])
+	require.NoError(t, err)
+
+	// Get the event but DON'T call Done (simulates in-flight processing)
+	queueImpl := mgr.(*eventQueueManager)
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item1.EventID)
+
+	// Queue should be empty while item1 is in-flight
+	assert.Equal(t, 0, queueImpl.queue.Len())
+
+	// Re-enqueue the SAME event (same DocumentID) while it is still being processed.
+	// The workqueue marks it as "dirty" — it will NOT appear in Len() until Done() is
+	// called, preventing the same event from being processed twice concurrently.
+	err = mgr.EnqueueEventGeneric(ctx, "node-1", event2, mockDB, mockHealthEventStore, event2["_id"])
+	require.NoError(t, err)
+	assert.Equal(t, 0, queueImpl.queue.Len(), "Same event is dirty (not yet queued) while in-flight")
+
+	// Completing the first processing makes the dirty item available
+	queueImpl.queue.Done(item1)
+	assert.Equal(t, 1, queueImpl.queue.Len(), "Updated event is queued after Done()")
+
+	// Clean up
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item2.EventID, "Same EventID")
+	queueImpl.queue.Done(item2)
+}
+
+// TestWorkqueueDeduplication_MultipleFaultsSameNode tests that multiple different faults
+// on the same node can be queued simultaneously
+func TestWorkqueueDeduplication_MultipleFaultsSameNode(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// Fault 1: GPU XID 13
+	event1 := datastore.Event{
+		"_id":       "507f1f77bcf86cd799439011",
+		"nodeName":  "node-gpu-1",
+		"errorCode": []int{13},
+	}
+
+	// Fault 2: GPU XID 48 (different fault, same node)
+	event2 := datastore.Event{
+		"_id":       "507f1f77bcf86cd799439012", // Different _id!
+		"nodeName":  "node-gpu-1",
+		"errorCode": []int{48},
+	}
+
+	// Enqueue first fault
+	err := mgr.EnqueueEventGeneric(ctx, "node-gpu-1", event1, mockDB, mockHealthEventStore, event1["_id"])
+	require.NoError(t, err)
+
+	// Get first fault but DON'T call Done (simulates long drain operation)
+	queueImpl := mgr.(*eventQueueManager)
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item1.EventID)
+
+	// Enqueue second fault WHILE first is being processed
+	err = mgr.EnqueueEventGeneric(ctx, "node-gpu-1", event2, mockDB, mockHealthEventStore, event2["_id"])
+	require.NoError(t, err)
+
+	// Second fault should be in the queue (different EventID!)
+	assert.Equal(t, 1, queueImpl.queue.Len(), "Second fault should be queued")
+
+	// Get second fault
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439012", item2.EventID)
+
+	// Both faults can be processed (sequentially)
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+}
+
+// TestWorkqueueDeduplication_RealWorldScenario tests the exact scenario from the bug report
+func TestWorkqueueDeduplication_RealWorldScenario(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// T+0ms: Quarantine event arrives
+	quarantineEvent := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439011",
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Quarantined",
+	}
+
+	err := mgr.EnqueueEventGeneric(ctx, "node-1", quarantineEvent, mockDB, mockHealthEventStore, quarantineEvent["_id"])
+	require.NoError(t, err)
+
+	queueImpl := mgr.(*eventQueueManager)
+
+	// Worker picks it up immediately
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item1.EventID)
+
+	// Simulate: Worker is processing (drain takes 30 seconds)
+	// But we won't call Done yet
+
+	// T+30ms: Cancelled event arrives (WHILE QUARANTINE IS PROCESSING)
+	cancelledEvent := datastore.Event{
+		"_id":             "507f1f77bcf86cd799439012", // Different event!
+		"nodeName":        "node-1",
+		"nodeQuarantined": "Cancelled",
+	}
+
+	err = mgr.EnqueueEventGeneric(ctx, "node-1", cancelledEvent, mockDB, mockHealthEventStore, cancelledEvent["_id"])
+	require.NoError(t, err)
+
+	// The bug: Without EventID, this would be deduplicated
+	// The fix: With EventID, this should be in the queue
+	assert.Equal(t, 1, queueImpl.queue.Len(), "Cancelled event should be queued (different EventID)")
+
+	// Verify we can get the cancelled event
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "node-1", item2.NodeName)
+	assert.Equal(t, "507f1f77bcf86cd799439012", item2.EventID)
+
+	// Clean up
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+}
+
+// TestWorkqueueDeduplication_DifferentNodes tests that events for different nodes
+// don't interfere with each other
+func TestWorkqueueDeduplication_DifferentNodes(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	// Event for node-1
+	event1 := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439011",
+		"nodeName": "node-1",
+	}
+
+	// Event for node-2
+	event2 := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439012",
+		"nodeName": "node-2",
+	}
+
+	// Enqueue both events
+	err := mgr.EnqueueEventGeneric(ctx, "node-1", event1, mockDB, mockHealthEventStore, event1["_id"])
+	require.NoError(t, err)
+
+	err = mgr.EnqueueEventGeneric(ctx, "node-2", event2, mockDB, mockHealthEventStore, event2["_id"])
+	require.NoError(t, err)
+
+	// Both should be in the queue
+	queueImpl := mgr.(*eventQueueManager)
+	assert.Equal(t, 2, queueImpl.queue.Len(), "Events for different nodes should both be queued")
+
+	// Get both events
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+
+	// Verify they're different
+	assert.NotEqual(t, item1.EventID, item2.EventID)
+	assert.NotEqual(t, item1.NodeName, item2.NodeName)
+
+	// Clean up
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+}
+
+func TestPriorityQueue_GroupedFloodPrioritizesUnrepresentedNodes(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	node1Event1 := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439011",
+		"nodeName": "node-1",
+	}
+	node1Event2 := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439012",
+		"nodeName": "node-1",
+	}
+	node2Event1 := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439013",
+		"nodeName": "node-2",
+	}
+
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-1", node1Event1, mockDB, mockHealthEventStore, node1Event1["_id"]))
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-1", node1Event2, mockDB, mockHealthEventStore, node1Event2["_id"]))
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-2", node2Event1, mockDB, mockHealthEventStore, node2Event1["_id"]))
+
+	queueImpl := mgr.(*eventQueueManager)
+
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439011", item1.EventID)
+
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439013", item2.EventID, "unrepresented node gets the high-priority lane")
+
+	item3, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439012", item3.EventID, "duplicate work for represented node remains low priority")
+
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+	queueImpl.queue.Done(item3)
+}
+
+func TestPriorityQueue_DrainingNodesStayLowPriorityUntilCleared(t *testing.T) {
+	mgr := NewEventQueueManager(0)
+	defer mgr.Shutdown()
+
+	ctx := context.Background()
+	mockDB := &mockDataStore{}
+	mockHealthEventStore := &MockHealthEventStore{}
+
+	queueImpl := mgr.(*eventQueueManager)
+	queueImpl.MarkNodeDraining("node-1")
+
+	node1DrainingEvent := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439021",
+		"nodeName": "node-1",
+	}
+	node2Event := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439022",
+		"nodeName": "node-2",
+	}
+	node1AfterClearEvent := datastore.Event{
+		"_id":      "507f1f77bcf86cd799439023",
+		"nodeName": "node-1",
+	}
+
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-1", node1DrainingEvent, mockDB, mockHealthEventStore, node1DrainingEvent["_id"]))
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-2", node2Event, mockDB, mockHealthEventStore, node2Event["_id"]))
+
+	item1, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439022", item1.EventID, "not-yet-draining node should run before draining duplicate work")
+
+	queueImpl.ClearNodeDraining("node-1")
+	require.NoError(t, mgr.EnqueueEventGeneric(ctx, "node-1", node1AfterClearEvent, mockDB, mockHealthEventStore, node1AfterClearEvent["_id"]))
+
+	item2, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439023", item2.EventID, "cleared node can receive high priority again")
+
+	item3, shutdown := queueImpl.queue.Get()
+	require.False(t, shutdown)
+	assert.Equal(t, "507f1f77bcf86cd799439021", item3.EventID)
+
+	queueImpl.queue.Done(item1)
+	queueImpl.queue.Done(item2)
+	queueImpl.queue.Done(item3)
+}
+
+func TestPriorityQueue_NonComparableDocumentID_DoesNotPanic(t *testing.T) {
+	state := newNodePriorityState()
+	queueImpl := newNodeEventPriorityQueue(state)
+	item := NodeEvent{
+		NodeName:   "node-1",
+		EventID:    "event-1",
+		DocumentID: map[string]string{"id": "non-comparable"},
+	}
+
+	require.NotPanics(t, func() {
+		queueImpl.Push(item)
+		entry := state.nodes[item.NodeName]
+		require.Equal(t, nodePriorityStateRepresented, entry.kind)
+		require.Equal(t, representativeKey(item), entry.representativeKey)
+
+		got := queueImpl.Pop()
+		assert.Equal(t, item.NodeName, got.NodeName)
+		assert.Equal(t, item.EventID, got.EventID)
+
+		state.releaseRepresentative(got)
+		_, represented := state.nodes[item.NodeName]
+		assert.False(t, represented)
+	})
+}
+
+// Mock DataStore for testing
+type mockDataStore struct{}
+
+func (m *mockDataStore) UpdateDocument(ctx context.Context, filter any, update any) (*client.UpdateResult, error) {
+	return &client.UpdateResult{ModifiedCount: 1, MatchedCount: 1}, nil
+}
+
+func (m *mockDataStore) FindDocument(ctx context.Context, filter any, options *client.FindOneOptions) (client.SingleResult, error) {
+	return mockSingleResult{}, nil
+}
+
+type mockSingleResult struct{}
+
+func (m mockSingleResult) Decode(v any) error {
+	return nil
+}
+
+func (m mockSingleResult) Err() error {
+	return nil
+}
+
+type MockHealthEventStore struct {
+	datastore.HealthEventStore
+}
+
+func (m *MockHealthEventStore) FindHealthEventsByQueryBatched(_ context.Context, _ datastore.QueryBuilder, _ int, _ func([]datastore.HealthEventWithStatus) error) error {
+	return nil
+}
+
+func TestNewEventQueueManager_RequeueBackoffBase_CustomValue(t *testing.T) {
+	customBase := 2 * time.Second
+	mgr := NewEventQueueManager(customBase)
+	defer mgr.Shutdown()
+
+	queueImpl, ok := mgr.(*eventQueueManager)
+	require.True(t, ok)
+	require.NotNil(t, queueImpl.rateLimiter)
+
+	event := NodeEvent{
+		NodeName: "test-node",
+		EventID:  "test-event-1",
+	}
+
+	// 1st attempt: delay should equal customBase (2s)
+	assert.Equal(t, customBase, queueImpl.rateLimiter.When(event))
+
+	// 2nd attempt: delay should double (4s)
+	assert.Equal(t, 4*time.Second, queueImpl.rateLimiter.When(event))
+
+	// 3rd attempt: delay should double again (8s)
+	assert.Equal(t, 8*time.Second, queueImpl.rateLimiter.When(event))
+
+	// Reset rate limiter for the item
+	queueImpl.rateLimiter.Forget(event)
+	assert.Equal(t, customBase, queueImpl.rateLimiter.When(event))
+}
+
+func TestNewEventQueueManager_RequeueBackoffBase_DefaultFallback(t *testing.T) {
+	tests := []struct {
+		name        string
+		backoffBase time.Duration
+	}{
+		{name: "zero value", backoffBase: 0},
+		{name: "negative value", backoffBase: -5 * time.Second},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := NewEventQueueManager(tc.backoffBase)
+			defer mgr.Shutdown()
+
+			queueImpl, ok := mgr.(*eventQueueManager)
+			require.True(t, ok)
+			require.NotNil(t, queueImpl.rateLimiter)
+
+			event := NodeEvent{
+				NodeName: "test-node",
+				EventID:  "test-event-default",
+			}
+
+			// 1st attempt: delay should fall back to DefaultRequeueBackoffBase (10s)
+			assert.Equal(t, DefaultRequeueBackoffBase, queueImpl.rateLimiter.When(event))
+
+			// 2nd attempt: delay should double (20s)
+			assert.Equal(t, 20*time.Second, queueImpl.rateLimiter.When(event))
+		})
+	}
+}
+
+func TestNewEventQueueManager_RequeueBackoffBase_CeilingCap(t *testing.T) {
+	mgr := NewEventQueueManager(1 * time.Minute)
+	defer mgr.Shutdown()
+
+	queueImpl, ok := mgr.(*eventQueueManager)
+	require.True(t, ok)
+	require.NotNil(t, queueImpl.rateLimiter)
+
+	event := NodeEvent{
+		NodeName: "test-node",
+		EventID:  "test-event-ceiling",
+	}
+
+	// 1st attempt: 1m
+	assert.Equal(t, 1*time.Minute, queueImpl.rateLimiter.When(event))
+
+	// 2nd attempt: 2m (capped at MaxRequeueBackoff)
+	assert.Equal(t, MaxRequeueBackoff, queueImpl.rateLimiter.When(event))
+
+	// 3rd attempt: still capped at MaxRequeueBackoff
+	assert.Equal(t, MaxRequeueBackoff, queueImpl.rateLimiter.When(event))
+}

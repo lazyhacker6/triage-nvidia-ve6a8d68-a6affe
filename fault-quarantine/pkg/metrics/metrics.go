@@ -1,0 +1,275 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metrics
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+// Status constants for metrics
+const (
+	// labelNode is the node-name label shared by the metrics below.
+	labelNode = "node"
+
+	StatusPassed = "passed"
+	StatusFailed = "failed"
+)
+
+var (
+	// Event Processing Metrics
+	TotalEventsReceived = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_events_received_total",
+			Help: "Total number of events received from the watcher.",
+		},
+	)
+	TotalEventsSuccessfullyProcessed = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_events_successfully_processed_total",
+			Help: "Total number of events successfully processed.",
+		},
+	)
+	ProcessingErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_processing_errors_total",
+			Help: "Total number of errors encountered during event processing.",
+		},
+		[]string{"error_type"},
+	)
+	ColdStartEvents = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_cold_start_events_total",
+			Help: "Health events examined during fault-quarantine cold start.",
+		},
+		[]string{"result"},
+	)
+	ColdStartDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_cold_start_duration_seconds",
+			Help:    "Time spent recovering unresolved events during fault-quarantine startup.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 18),
+		},
+	)
+
+	// Node Quarantine Metrics
+	TotalNodesQuarantined = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_nodes_quarantined_total",
+			Help: "Total number of nodes quarantined.",
+		},
+		[]string{labelNode},
+	)
+	TotalNodesUnquarantined = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_nodes_unquarantined_total",
+			Help: "Total number of nodes unquarantined.",
+		},
+		[]string{labelNode},
+	)
+	TotalNodesManuallyUncordoned = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_nodes_manually_uncordoned_total",
+			Help: "Total number of nodes manually uncordoned.",
+		},
+		[]string{labelNode},
+	)
+
+	TotalNodesManuallyUntainted = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_nodes_manually_untainted_total",
+			Help: "Total number of nodes manually untainted",
+		},
+		[]string{labelNode},
+	)
+	CurrentQuarantinedNodes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "fault_quarantine_current_quarantined_nodes",
+			Help: "Nodes which are currently quarantined and undergoing breakfix",
+		},
+		[]string{labelNode},
+	)
+
+	// Taint and Cordon Metrics
+	TaintsApplied = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_taints_applied_total",
+			Help: "Total number of taints applied to nodes.",
+		},
+		[]string{"taint_key", "taint_effect"},
+	)
+	TaintsRemoved = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_taints_removed_total",
+			Help: "Total number of taints removed from nodes.",
+		},
+		[]string{"taint_key", "taint_effect"},
+	)
+	LabelsApplied = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_labels_applied_total",
+			Help: "Total number of quarantine labels applied to nodes.",
+		},
+		[]string{"label_key"},
+	)
+	LabelsRemoved = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_labels_removed_total",
+			Help: "Total number of quarantine labels removed from nodes.",
+		},
+		[]string{"label_key"},
+	)
+	CordonsApplied = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_cordons_applied_total",
+			Help: "Total number of cordons applied to nodes.",
+		},
+	)
+	CordonsRemoved = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_cordons_removed_total",
+			Help: "Total number of cordons removed from nodes.",
+		},
+	)
+	// DryRunActions counts what dry run would have done. The quarantine metrics above
+	// count only actions actually applied.
+	DryRunActions = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_dry_run_actions_total",
+			Help: "Total number of quarantine and unquarantine actions skipped by dry run.",
+		},
+		[]string{"action"},
+	)
+
+	// Ruleset Evaluation Metrics
+	RulesetEvaluations = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_ruleset_evaluations_total",
+			Help: "Total number of ruleset evaluations.",
+		},
+		[]string{"ruleset", "status"},
+	)
+
+	// Performance Metrics
+	EventHandlingDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_event_handling_duration_seconds",
+			Help:    "Histogram of event handling durations.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	// Node Quarantine Duration Metrics
+	NodeQuarantineDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_node_quarantine_duration_seconds",
+			Help:    "Time from health event generation to node quarantine completion.",
+			Buckets: prometheus.DefBuckets,
+		},
+	)
+
+	// Node Remediation Duration (end-to-end) Metrics
+	NodeRemediationDurationSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_node_remediation_duration_seconds",
+			Help:    "Node remediation time from health event generation to node unquarantine.",
+			Buckets: prometheus.ExponentialBuckets(10, 1.5, 27),
+		},
+		[]string{"recommended_action"},
+	)
+
+	// Node Remediation Duration (excluding node-drainer time) Metrics
+	NodeRemediationDurationExcludingDrainSeconds = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_node_remediation_duration_excluding_drain_seconds",
+			Help:    "Node Remediation time excluding node-drainer duration.",
+			Buckets: prometheus.ExponentialBuckets(10, 1.5, 19),
+		},
+		[]string{"recommended_action"},
+	)
+
+	// Event Processing Metrics
+	EventBacklogSize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "fault_quarantine_event_backlog_count",
+			Help: "Number of health events which fault quarantine is yet to process.",
+		},
+	)
+
+	// Circuit Breaker Metrics
+	FaultQuarantineBreakerState = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "fault_quarantine_breaker_state",
+			Help: "State of the fault quarantine breaker.",
+		},
+		[]string{"state"},
+	)
+	FaultQuarantineBreakerUtilization = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "fault_quarantine_breaker_utilization",
+			Help: "Utilization of the fault quarantine breaker.",
+		},
+	)
+	FaultQuarantineBreakerThresholdNodes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "fault_quarantine_breaker_threshold_nodes",
+			Help: "Effective trip threshold of the fault quarantine breaker in nodes, by binding bound.",
+		},
+		[]string{"bound"},
+	)
+	FaultQuarantineGetTotalNodesDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "fault_quarantine_get_total_nodes_duration_seconds",
+			Help:    "Duration of getTotalNodes calls in seconds.",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"result"},
+	)
+	FaultQuarantineGetTotalNodesErrors = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "fault_quarantine_get_total_nodes_errors_total",
+			Help: "Total number of errors from getTotalNodes.",
+		},
+		[]string{"error_type"},
+	)
+)
+
+const (
+	DryRunActionQuarantine   = "quarantine"
+	DryRunActionUnquarantine = "unquarantine"
+)
+
+// Present at zero from startup, so absence means the exporter is down rather than
+// that dry run has not acted yet.
+func init() {
+	DryRunActions.WithLabelValues(DryRunActionQuarantine)
+	DryRunActions.WithLabelValues(DryRunActionUnquarantine)
+}
+
+func SetFaultQuarantineBreakerUtilization(utilization float64) {
+	FaultQuarantineBreakerUtilization.Set(utilization)
+}
+
+// SetFaultQuarantineBreakerThresholdNodes reports the effective threshold and which bound
+// produced it. Reset first so a change of binding bound leaves no stale series behind.
+func SetFaultQuarantineBreakerThresholdNodes(threshold float64, bound string) {
+	FaultQuarantineBreakerThresholdNodes.Reset()
+	FaultQuarantineBreakerThresholdNodes.WithLabelValues(bound).Set(threshold)
+}
+
+func SetFaultQuarantineBreakerState(state string) {
+	FaultQuarantineBreakerState.Reset()
+	FaultQuarantineBreakerState.WithLabelValues(state).Set(1)
+}

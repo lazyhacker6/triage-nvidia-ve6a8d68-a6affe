@@ -1,0 +1,765 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package healthEventsAnnotation
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"google.golang.org/protobuf/proto"
+)
+
+// EventKey represents the identifying fields of a HealthEvent for entity-level matching
+// IMPORTANT: This struct is used ONLY for matching/comparison.
+// The full event details (including IsFatal, IsHealthy, ErrorCodes, Message) are stored
+// in the annotation for visibility, but matching only uses these identifying fields.
+type HealthEventKey struct {
+	Agent          string // e.g., "gpu-health-monitor"
+	ComponentClass string // e.g., "GPU"
+	CheckName      string // e.g., "GpuXidError"
+	NodeName       string // e.g., "node-123"
+	// Entity-specific fields for granular tracking
+	EntityType  string // e.g., "GPU", "NIC"
+	EntityValue string // e.g., "1", "eth0"
+	// ErrorCode scopes the key to a specific code; empty matches any.
+	ErrorCode string // e.g., "163"
+	// Version is included in the key to distinguish between different versions of the same event
+	Version uint32 // e.g., 1
+}
+
+// HealthEventsAnnotationMap represents a collection of unique health events
+type HealthEventsAnnotationMap struct {
+	Events map[HealthEventKey]*protos.HealthEvent
+}
+
+// NewHealthEventsAnnotationMap creates a new HealthEventsAnnotationMap instance
+func NewHealthEventsAnnotationMap() *HealthEventsAnnotationMap {
+	return &HealthEventsAnnotationMap{
+		Events: make(map[HealthEventKey]*protos.HealthEvent),
+	}
+}
+
+// CreateEventKeyForEntity creates a comparable key for a specific entity in a HealthEvent.
+// ErrorCode is left empty; use createEventKeys for per-(entity, errorCode) fan-out.
+func CreateEventKeyForEntity(
+	event *protos.HealthEvent,
+	entity *protos.Entity,
+) HealthEventKey {
+	key := HealthEventKey{
+		Agent:          event.Agent,
+		ComponentClass: event.ComponentClass,
+		CheckName:      event.CheckName,
+		NodeName:       event.NodeName,
+		Version:        event.Version,
+	}
+
+	// Add entity-specific information if provided
+	if entity != nil {
+		key.EntityType = entity.EntityType
+		key.EntityValue = entity.EntityValue
+	}
+
+	return key
+}
+
+// createEventKeys creates keys for all (entity, errorCode) pairs in a HealthEvent.
+// Either dimension may be empty; an empty ErrorCode key matches any stored code.
+func createEventKeys(event *protos.HealthEvent) []HealthEventKey {
+	entities := event.EntitiesImpacted
+	errorCodes := event.ErrorCode
+
+	if len(entities) == 0 {
+		return createCheckLevelKeys(event, errorCodes)
+	}
+
+	return createEntityKeys(event, entities, errorCodes)
+}
+
+func createCheckLevelKeys(event *protos.HealthEvent, errorCodes []string) []HealthEventKey {
+	if len(errorCodes) == 0 {
+		return []HealthEventKey{CreateEventKeyForEntity(event, nil)}
+	}
+
+	keys := make([]HealthEventKey, 0, len(errorCodes))
+	for _, code := range errorCodes {
+		key := CreateEventKeyForEntity(event, nil)
+		key.ErrorCode = code
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func createEntityKeys(
+	event *protos.HealthEvent,
+	entities []*protos.Entity,
+	errorCodes []string,
+) []HealthEventKey {
+	if len(errorCodes) == 0 {
+		keys := make([]HealthEventKey, 0, len(entities))
+		for _, entity := range entities {
+			keys = append(keys, CreateEventKeyForEntity(event, entity))
+		}
+
+		return keys
+	}
+
+	keys := make([]HealthEventKey, 0, eventKeysCapacity(len(entities), len(errorCodes)))
+
+	for _, entity := range entities {
+		for _, code := range errorCodes {
+			key := CreateEventKeyForEntity(event, entity)
+			key.ErrorCode = code
+			keys = append(keys, key)
+		}
+	}
+
+	return keys
+}
+
+func eventKeysCapacity(entityCount, errorCodeCount int) int {
+	if entityCount == 0 || errorCodeCount == 0 {
+		return 0
+	}
+
+	if entityCount > math.MaxInt/errorCodeCount {
+		return 0
+	}
+
+	return entityCount * errorCodeCount
+}
+
+// AddOrUpdateEvent adds a health event for each impacted entity.
+// Returns true if at least one entity was added or an existing entry's
+// RecommendedAction was refreshed.
+func (he *HealthEventsAnnotationMap) AddOrUpdateEvent(event *protos.HealthEvent) bool {
+	return he.AddOrUpdateEventFiltered(event, nil)
+}
+
+// AddOrUpdateEventFiltered applies only effect keys accepted by keep. When a
+// compound event is partially accepted, or a key that another stored event
+// still covers is overwritten, the stored events are compacted into exact
+// rectangular projections so JSON round trips cannot recreate effects now
+// owned by a different event, without expanding one annotation payload per key.
+func (he *HealthEventsAnnotationMap) AddOrUpdateEventFiltered(
+	event *protos.HealthEvent,
+	keep func(HealthEventKey) bool,
+) bool {
+	keys := createEventKeys(event)
+	partial := false
+
+	if keep != nil {
+		kept := keys[:0]
+		for _, key := range keys {
+			if keep(key) {
+				kept = append(kept, key)
+			}
+		}
+
+		partial = len(kept) != len(keys)
+		keys = kept
+	}
+
+	updated, replaced := he.addEventKeys(withGPUSlotMetadata(event), keys)
+	if updated && (partial || replaced) && len(he.Events) > 0 {
+		// The keys that still point at an older compound event must no longer
+		// serialize effects now owned by the replacement, or the last event
+		// written by UnmarshalJSON would decide which action survives.
+		he.compactStoredValues()
+	}
+
+	return updated
+}
+
+// addEventKeys stores event under keys that are missing or carry a different
+// RecommendedAction; matching ignores RecommendedAction, so an escalated
+// remediation must overwrite the stored event or consumers keep the stale
+// action. replaced reports whether an existing entry was overwritten.
+func (he *HealthEventsAnnotationMap) addEventKeys(
+	event *protos.HealthEvent,
+	keys []HealthEventKey,
+) (updated, replaced bool) {
+	for _, key := range keys {
+		existing, exists := he.Events[key]
+		if !exists || existing.RecommendedAction != event.RecommendedAction {
+			he.Events[key] = event
+			updated = true
+			replaced = replaced || exists
+		}
+	}
+
+	return updated, replaced
+}
+
+type annotationRectangle struct {
+	keys       []HealthEventKey
+	entities   []HealthEventKey
+	errorCodes []string
+}
+
+func projectEventForRectangle(
+	event *protos.HealthEvent,
+	rectangle annotationRectangle,
+) *protos.HealthEvent {
+	projected := proto.Clone(event).(*protos.HealthEvent)
+	if len(rectangle.entities) == 1 &&
+		rectangle.entities[0].EntityType == "" && rectangle.entities[0].EntityValue == "" {
+		projected.EntitiesImpacted = nil
+	} else {
+		projected.EntitiesImpacted = make([]*protos.Entity, 0, len(rectangle.entities))
+		for _, entity := range rectangle.entities {
+			projected.EntitiesImpacted = append(projected.EntitiesImpacted, &protos.Entity{
+				EntityType: entity.EntityType, EntityValue: entity.EntityValue,
+			})
+		}
+	}
+
+	if len(rectangle.errorCodes) == 1 && rectangle.errorCodes[0] == "" &&
+		!slices.Contains(event.GetErrorCode(), "") {
+		projected.ErrorCode = nil
+	} else {
+		projected.ErrorCode = rectangle.errorCodes
+	}
+
+	return projected
+}
+
+func (he *HealthEventsAnnotationMap) compactStoredValues() {
+	keysByEvent := make(map[*protos.HealthEvent][]HealthEventKey)
+	for key, event := range he.Events {
+		keysByEvent[event] = append(keysByEvent[event], key)
+	}
+
+	for event, keys := range keysByEvent {
+		for _, rectangle := range compactAnnotationRectangles(keys) {
+			projected := projectEventForRectangle(event, rectangle)
+			for _, key := range rectangle.keys {
+				he.Events[key] = projected
+			}
+		}
+	}
+}
+
+func compactAnnotationRectangles(keys []HealthEventKey) []annotationRectangle {
+	rows := annotationRowRectangles(keys)
+
+	columns := annotationColumnRectangles(keys)
+	if len(columns) < len(rows) {
+		return columns
+	}
+
+	return rows
+}
+
+func annotationRowRectangles(keys []HealthEventKey) []annotationRectangle {
+	byEntity := make(map[string][]HealthEventKey)
+	for _, key := range keys {
+		byEntity[annotationEntityKey(key)] = append(byEntity[annotationEntityKey(key)], key)
+	}
+
+	byCodes := make(map[string]*annotationRectangle)
+
+	for _, rowKeys := range byEntity {
+		sort.Slice(rowKeys, func(i, j int) bool { return rowKeys[i].ErrorCode < rowKeys[j].ErrorCode })
+
+		codes := make([]string, 0, len(rowKeys))
+		for _, key := range rowKeys {
+			codes = append(codes, key.ErrorCode)
+		}
+
+		groupKey := annotationStringsKey(codes)
+
+		rectangle := byCodes[groupKey]
+		if rectangle == nil {
+			rectangle = &annotationRectangle{errorCodes: codes}
+			byCodes[groupKey] = rectangle
+		}
+
+		rectangle.keys = append(rectangle.keys, rowKeys...)
+		rectangle.entities = append(rectangle.entities, rowKeys[0])
+	}
+
+	return sortedAnnotationRectangles(byCodes)
+}
+
+func annotationColumnRectangles(keys []HealthEventKey) []annotationRectangle {
+	byCode := make(map[string][]HealthEventKey)
+	for _, key := range keys {
+		byCode[key.ErrorCode] = append(byCode[key.ErrorCode], key)
+	}
+
+	byEntities := make(map[string]*annotationRectangle)
+
+	for code, columnKeys := range byCode {
+		sort.Slice(columnKeys, func(i, j int) bool {
+			return annotationEntityKey(columnKeys[i]) < annotationEntityKey(columnKeys[j])
+		})
+
+		entityKeys := make([]string, 0, len(columnKeys))
+		for _, key := range columnKeys {
+			entityKeys = append(entityKeys, annotationEntityKey(key))
+		}
+
+		groupKey := annotationStringsKey(entityKeys)
+
+		rectangle := byEntities[groupKey]
+		if rectangle == nil {
+			rectangle = &annotationRectangle{entities: append([]HealthEventKey(nil), columnKeys...)}
+			byEntities[groupKey] = rectangle
+		}
+
+		rectangle.keys = append(rectangle.keys, columnKeys...)
+		rectangle.errorCodes = append(rectangle.errorCodes, code)
+	}
+
+	return sortedAnnotationRectangles(byEntities)
+}
+
+func sortedAnnotationRectangles(groups map[string]*annotationRectangle) []annotationRectangle {
+	groupKeys := make([]string, 0, len(groups))
+	for key := range groups {
+		groupKeys = append(groupKeys, key)
+	}
+
+	sort.Strings(groupKeys)
+
+	result := make([]annotationRectangle, 0, len(groupKeys))
+	for _, key := range groupKeys {
+		rectangle := groups[key]
+		sort.Strings(rectangle.errorCodes)
+		sort.Slice(rectangle.entities, func(i, j int) bool {
+			return annotationEntityKey(rectangle.entities[i]) < annotationEntityKey(rectangle.entities[j])
+		})
+		result = append(result, *rectangle)
+	}
+
+	return result
+}
+
+func annotationEntityKey(key HealthEventKey) string {
+	return annotationStringsKey([]string{key.EntityType, key.EntityValue})
+}
+
+func annotationStringsKey(values []string) string {
+	var key strings.Builder
+	for _, value := range values {
+		fmt.Fprintf(&key, "%d:", len(value))
+		key.WriteString(value)
+	}
+
+	return key.String()
+}
+
+// GetEvent checks if any entity from the event exists in the map
+// Returns the stored event for the first matching entity
+// If the event has no entities (empty EntitiesImpacted), it performs check-level matching
+// to find any stored event with the same Agent/ComponentClass/CheckName/Version
+//
+// Empty incoming ErrorCode matches any stored code; non-empty matches only listed codes.
+func (he *HealthEventsAnnotationMap) GetEvent(
+	event *protos.HealthEvent,
+) (*protos.HealthEvent, bool) {
+	if storedEvent, ok := he.findFirstMatch(event); ok {
+		return storedEvent, true
+	}
+
+	// If no entities in incoming event (check-level event), do check-level matching
+	// This handles cases where healthy events don't specify entities but mean "all entities for this check are healthy"
+	if len(event.EntitiesImpacted) == 0 {
+		return he.getEventByCheck(event)
+	}
+
+	return nil, false
+}
+
+func (he *HealthEventsAnnotationMap) findFirstMatch(event *protos.HealthEvent) (*protos.HealthEvent, bool) {
+	for storedKey, storedEvent := range he.Events {
+		if keyMatchesEvent(storedKey, storedEvent, event) {
+			return storedEvent, true
+		}
+	}
+
+	return nil, false
+}
+
+// keyMatchesEvent: identifying fields must equal; entity matches if listed
+// (or any when none listed, or via replacedGPUMatches); ErrorCode uses the
+// asymmetric rule on GetEvent.
+func keyMatchesEvent(storedKey HealthEventKey, storedEvent, event *protos.HealthEvent) bool {
+	if storedKey.Agent != event.Agent ||
+		storedKey.ComponentClass != event.ComponentClass ||
+		storedKey.CheckName != event.CheckName ||
+		storedKey.NodeName != event.NodeName ||
+		storedKey.Version != event.Version {
+		return false
+	}
+
+	if !entityMatches(storedKey, storedEvent, event) {
+		return false
+	}
+
+	if len(event.ErrorCode) > 0 && !errorCodeMatches(storedKey.ErrorCode, event.ErrorCode) {
+		return false
+	}
+
+	return true
+}
+
+// entityMatches: any entity matches when the event lists none.
+func entityMatches(storedKey HealthEventKey, storedEvent, event *protos.HealthEvent) bool {
+	return len(event.EntitiesImpacted) == 0 ||
+		entityInEvent(storedKey, event) ||
+		replacedGPUMatches(storedKey, storedEvent, event)
+}
+
+func entityInEvent(key HealthEventKey, event *protos.HealthEvent) bool {
+	for _, e := range event.EntitiesImpacted {
+		if e.EntityType == key.EntityType && e.EntityValue == key.EntityValue {
+			return true
+		}
+	}
+
+	return false
+}
+
+// replacedGPUMatches: a healthy GPU event also clears a GPU_UUID key when it
+// covers every GPU and PCI entity of the stored fault, since a replaced GPU
+// keeps its slot but gets a new UUID.
+func replacedGPUMatches(storedKey HealthEventKey, storedEvent, event *protos.HealthEvent) bool {
+	if !event.IsHealthy || event.ComponentClass != "GPU" || storedKey.EntityType != "GPU_UUID" {
+		return false
+	}
+
+	slot := gpuSlotEntities(storedEvent)
+	if len(slot) == 0 {
+		return false
+	}
+
+	for _, stored := range slot {
+		if !slices.ContainsFunc(event.EntitiesImpacted, func(e *protos.Entity) bool {
+			return e.EntityType == stored.EntityType && e.EntityValue == stored.EntityValue
+		}) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// gpuRecoverySlotKey stores a GPU_UUID fault's slot (its GPU index and PCI entities) in the event
+// metadata. Compaction projects EntitiesImpacted down to the keys an event still owns, which can drop
+// the slot entities from a GPU_UUID entry; keeping the slot in metadata preserves it for replaced-GPU
+// recovery. createEventKeys ignores metadata, so this never recreates an effect on a JSON round trip.
+const gpuRecoverySlotKey = "nvsentinel.dgxc.nvidia.com/gpu-recovery-slot"
+
+type recoverySlotEntity struct {
+	EntityType  string `json:"entityType"`
+	EntityValue string `json:"entityValue"`
+}
+
+// withGPUSlotMetadata returns the event to store: for a GPU_UUID fault that carries its GPU/PCI slot
+// in EntitiesImpacted, a clone with the slot recorded in metadata so it survives compaction. Other
+// events, and events that already carry the slot, are returned unchanged.
+func withGPUSlotMetadata(event *protos.HealthEvent) *protos.HealthEvent {
+	// Only a single-GPU_UUID fault has an unambiguous slot to preserve. A compound event with several
+	// GPU_UUIDs keeps relying on EntitiesImpacted, which compaction shrinks to the slot still unrecovered.
+	if countEntityType(event, "GPU_UUID") != 1 {
+		return event
+	}
+
+	if _, ok := event.GetMetadata()[gpuRecoverySlotKey]; ok {
+		return event
+	}
+
+	impacted := slotEntitiesFromImpacted(event)
+	if len(impacted) == 0 {
+		return event
+	}
+
+	slot := make([]recoverySlotEntity, 0, len(impacted))
+	for _, e := range impacted {
+		slot = append(slot, recoverySlotEntity{EntityType: e.EntityType, EntityValue: e.EntityValue})
+	}
+
+	encoded, err := json.Marshal(slot)
+	if err != nil {
+		return event
+	}
+
+	clone := proto.Clone(event).(*protos.HealthEvent)
+	if clone.Metadata == nil {
+		clone.Metadata = make(map[string]string, 1)
+	}
+
+	clone.Metadata[gpuRecoverySlotKey] = string(encoded)
+
+	return clone
+}
+
+func countEntityType(event *protos.HealthEvent, entityType string) int {
+	count := 0
+
+	for _, e := range event.EntitiesImpacted {
+		if e.EntityType == entityType {
+			count++
+		}
+	}
+
+	return count
+}
+
+// gpuSlotEntities returns the GPU index and PCI entities, which stay the same when a GPU is replaced.
+// It reads the slot recorded in metadata first, so it still works after compaction has projected the
+// slot entities out of EntitiesImpacted, and falls back to EntitiesImpacted for events stored before
+// the slot was recorded.
+func gpuSlotEntities(event *protos.HealthEvent) []*protos.Entity {
+	if raw, ok := event.GetMetadata()[gpuRecoverySlotKey]; ok && raw != "" {
+		var slot []recoverySlotEntity
+		if err := json.Unmarshal([]byte(raw), &slot); err == nil {
+			entities := make([]*protos.Entity, 0, len(slot))
+			for _, s := range slot {
+				entities = append(entities, &protos.Entity{EntityType: s.EntityType, EntityValue: s.EntityValue})
+			}
+
+			return entities
+		}
+	}
+
+	return slotEntitiesFromImpacted(event)
+}
+
+func slotEntitiesFromImpacted(event *protos.HealthEvent) []*protos.Entity {
+	var slot []*protos.Entity
+
+	for _, e := range event.EntitiesImpacted {
+		if e.EntityType == "GPU" || e.EntityType == "PCI" {
+			slot = append(slot, e)
+		}
+	}
+
+	return slot
+}
+
+func errorCodeMatches(stored string, incoming []string) bool {
+	return slices.Contains(incoming, stored)
+}
+
+// getEventByCheck finds any stored event matching the check (ignoring entities)
+// Used for check-level healthy events that clear all entities for a check
+func (he *HealthEventsAnnotationMap) getEventByCheck(
+	event *protos.HealthEvent,
+) (*protos.HealthEvent, bool) {
+	for key, storedEvent := range he.Events {
+		if key.Agent == event.Agent &&
+			key.ComponentClass == event.ComponentClass &&
+			key.CheckName == event.CheckName &&
+			key.Version == event.Version &&
+			key.NodeName == event.NodeName {
+			return storedEvent, true
+		}
+	}
+
+	return nil, false
+}
+
+// HasMatchingEntities checks if the event has any entities that match stored events
+// (using the same matching rules as GetEvent).
+func (he *HealthEventsAnnotationMap) HasMatchingEntities(event *protos.HealthEvent) bool {
+	for storedKey, storedEvent := range he.Events {
+		if keyMatchesEvent(storedKey, storedEvent, event) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// IsEmpty checks if there are no events in the collection
+func (he *HealthEventsAnnotationMap) IsEmpty() bool {
+	return len(he.Events) == 0
+}
+
+// Count returns the number of events in the collection
+func (he *HealthEventsAnnotationMap) Count() int {
+	return len(he.Events)
+}
+
+// RemoveEvent removes all matching entities from the collection
+// This is used when a healthy event clears specific entity failures
+// If the event has no entities (empty EntitiesImpacted), it removes ALL entities for that check
+// This handles check-level healthy events that mean "all entities for this check are healthy"
+//
+// Matching follows GetEvent's rules: empty incoming ErrorCode clears every code on the entity.
+func (he *HealthEventsAnnotationMap) RemoveEvent(event *protos.HealthEvent) int {
+	return he.RemoveEventFiltered(event, nil)
+}
+
+// RemoveEventFiltered removes only matching stored effect keys accepted by
+// keep. This lets cold-start replay a compound recovery without clearing
+// identities that have a newer known failure.
+func (he *HealthEventsAnnotationMap) RemoveEventFiltered(
+	event *protos.HealthEvent,
+	keep func(HealthEventKey) bool,
+) int {
+	// If no entities specified (check-level healthy event), remove all entities for this check
+	if len(event.EntitiesImpacted) == 0 {
+		return he.removeAllEntitiesForCheck(event, keep)
+	}
+
+	keysToRemove := make([]HealthEventKey, 0)
+
+	for storedKey, storedEvent := range he.Events {
+		if keyMatchesEvent(storedKey, storedEvent, event) && (keep == nil || keep(storedKey)) {
+			keysToRemove = append(keysToRemove, storedKey)
+		}
+	}
+
+	for _, key := range keysToRemove {
+		delete(he.Events, key)
+	}
+
+	if len(keysToRemove) > 0 && len(he.Events) > 0 {
+		he.compactStoredValues()
+	}
+
+	return len(keysToRemove)
+}
+
+// removeAllEntitiesForCheck removes all entities for a specific check
+// Used when a healthy event has no entities, meaning "all entities for this check are healthy"
+//
+// A non-empty incoming ErrorCode narrows removal to keys with a matching code.
+func (he *HealthEventsAnnotationMap) removeAllEntitiesForCheck(
+	event *protos.HealthEvent,
+	keep func(HealthEventKey) bool,
+) int {
+	keysToRemove := []HealthEventKey{}
+
+	// Find all keys matching this check (regardless of entity)
+	for key := range he.Events {
+		if !keyMatchesCheckRecovery(key, event, keep) {
+			continue
+		}
+
+		keysToRemove = append(keysToRemove, key)
+	}
+
+	for _, key := range keysToRemove {
+		delete(he.Events, key)
+	}
+
+	if len(keysToRemove) > 0 && len(he.Events) > 0 {
+		he.compactStoredValues()
+	}
+
+	return len(keysToRemove)
+}
+
+func keyMatchesCheckRecovery(
+	key HealthEventKey,
+	event *protos.HealthEvent,
+	keep func(HealthEventKey) bool,
+) bool {
+	if key.Agent != event.Agent ||
+		key.ComponentClass != event.ComponentClass ||
+		key.CheckName != event.CheckName ||
+		key.Version != event.Version ||
+		key.NodeName != event.NodeName {
+		return false
+	}
+
+	if len(event.ErrorCode) > 0 && !errorCodeMatches(key.ErrorCode, event.ErrorCode) {
+		return false
+	}
+
+	return keep == nil || keep(key)
+}
+
+// RemoveEntitiesForCheck removes specific entities for a check
+func (he *HealthEventsAnnotationMap) RemoveEntitiesForCheck(event *protos.HealthEvent) {
+	keys := createEventKeys(event)
+	for _, key := range keys {
+		delete(he.Events, key)
+	}
+}
+
+// GetAllCheckNames returns all unique check names from stored events
+func (he *HealthEventsAnnotationMap) GetAllCheckNames() []string {
+	checkNamesMap := make(map[string]bool)
+
+	for _, event := range he.Events {
+		if event != nil && event.CheckName != "" {
+			checkNamesMap[event.CheckName] = true
+		}
+	}
+
+	checkNames := make([]string, 0, len(checkNamesMap))
+
+	for name := range checkNamesMap {
+		checkNames = append(checkNames, name)
+	}
+
+	return checkNames
+}
+
+// MarshalJSON converts the map to a JSON-serializable format (slice of events)
+// Deduplicates events since multiple entity keys may point to the same event object
+func (he *HealthEventsAnnotationMap) MarshalJSON() ([]byte, error) {
+	// Use a map to deduplicate event pointers
+	// Multiple entities can reference the same event object, we only want unique events
+	seen := make(map[*protos.HealthEvent]bool)
+	events := make([]*protos.HealthEvent, 0, len(he.Events))
+
+	for _, event := range he.Events {
+		if !seen[event] {
+			seen[event] = true
+
+			events = append(events, event)
+		}
+	}
+
+	return json.Marshal(events)
+}
+
+// UnmarshalJSON reconstructs the map from JSON data (slice of events)
+func (he *HealthEventsAnnotationMap) UnmarshalJSON(data []byte) error {
+	var events []*protos.HealthEvent
+	if err := json.Unmarshal(data, &events); err != nil {
+		return fmt.Errorf("failed to unmarshal health events: %w", err)
+	}
+
+	if he.Events == nil {
+		he.Events = make(map[HealthEventKey]*protos.HealthEvent)
+	}
+
+	for k := range he.Events {
+		delete(he.Events, k)
+	}
+
+	for _, event := range events {
+		// Re-create entity-level tracking from the stored events
+		keys := createEventKeys(event)
+		for _, key := range keys {
+			he.Events[key] = event
+		}
+	}
+
+	return nil
+}

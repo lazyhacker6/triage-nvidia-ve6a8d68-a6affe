@@ -1,0 +1,117 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package metrics
+
+import (
+	"github.com/prometheus/client_golang/prometheus"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
+)
+
+// ExtRR observability metrics. Schema per ADR-040.
+
+// Metric label names.
+const (
+	labelResult            = "result"
+	labelRecommendedAction = "recommended_action"
+)
+
+const (
+	ExtRRPhaseCreated          = "created"
+	ExtRRPhaseReleased         = "released"
+	ExtRRPhaseExternalResponse = "external_response"
+	ExtRRPhaseClosed           = "closed"
+)
+
+const (
+	ExtRRResultSuccess         = "success"
+	ExtRRResultOperatorDeleted = "operator_deleted"
+	// ExtRRResultNodeDeleted is recorded when an open ExtRR is deleted and its
+	// target Node is gone, is terminating, or was replaced by a Node with a
+	// different UID.
+	ExtRRResultNodeDeleted = "node_deleted"
+	// ExtRRResultNodeNotFound is recorded when the apply path fails because
+	// the target Node is absent or was replaced. Terminal — no retry.
+	ExtRRResultNodeNotFound = "node_not_found"
+	// ExtRRResultNone is the explicit sentinel for phases without an outcome.
+	ExtRRResultNone = ""
+)
+
+const (
+	ExtRROpenStateAwaiting = "awaiting"
+)
+
+var (
+	// ExtRRTotal phases:
+	//   created           — fresh ExtRR initialised.
+	//   released          — NVSentinelOwnershipReleased transitioned:
+	//                       result=success (taint applied) or
+	//                       result=node_not_found (target Node instance unavailable).
+	//   external_response — ExternalRemediationComplete=True observed. result=success.
+	//   closed            — cleanup ran. result=success | operator_deleted | node_deleted.
+	ExtRRTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "nvsentinel_external_remediation_total",
+		Help: "Lifecycle transitions of ExternalRemediationRequest objects, labeled by phase and outcome.",
+	}, []string{"phase", labelResult})
+
+	ExtRROpen = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "nvsentinel_external_remediation_open",
+		Help: "Currently-open ExternalRemediationRequest objects by node, action, and substate.",
+	}, []string{labelNode, labelRecommendedAction, "state"})
+
+	ExtRRAgeSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "nvsentinel_external_remediation_age_seconds",
+		Help:    "Age of an ExternalRemediationRequest at close time.",
+		Buckets: prometheus.ExponentialBuckets(10, 4, 8), // 10s, 40s, 160s, ~10m, ~43m, ~3h, ~11h, ~46h
+	}, []string{labelRecommendedAction, labelResult})
+)
+
+func (m *ActionMetrics) IncExtRRTotal(phase, result string) {
+	ExtRRTotal.With(prometheus.Labels{
+		"phase":     phase,
+		labelResult: result,
+	}).Inc()
+}
+
+// SetExtRROpen sets the absolute open state (1 or 0) instead of adding a
+// delta, so a missed transition or a janitor restart cannot skew the gauge.
+// One series per node is enough: the node lock allows only one open ExtRR
+// per node at a time.
+func (m *ActionMetrics) SetExtRROpen(node, recommendedAction, state string, open bool) {
+	value := 0.0
+	if open {
+		value = 1.0
+	}
+
+	ExtRROpen.With(prometheus.Labels{
+		labelNode:              node,
+		labelRecommendedAction: recommendedAction,
+		"state":                state,
+	}).Set(value)
+}
+
+func (m *ActionMetrics) ObserveExtRRAge(recommendedAction, result string, ageSeconds float64) {
+	ExtRRAgeSeconds.With(prometheus.Labels{
+		labelRecommendedAction: recommendedAction,
+		labelResult:            result,
+	}).Observe(ageSeconds)
+}
+
+func registerExtRRMetrics() {
+	metrics.Registry.MustRegister(
+		ExtRRTotal,
+		ExtRROpen,
+		ExtRRAgeSeconds,
+	)
+}

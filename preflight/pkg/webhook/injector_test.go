@@ -1,0 +1,1864 @@
+// Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package webhook
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/nvidia/nvsentinel/preflight/pkg/config"
+	"github.com/nvidia/nvsentinel/preflight/pkg/gang"
+	"github.com/nvidia/nvsentinel/preflight/pkg/gang/types"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+)
+
+func TestCollectMatchingEnvVars(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{
+		NCCLEnvPatterns: []string{"NCCL_*", "FI_*", "LD_LIBRARY_PATH"},
+	}}
+
+	containers := []corev1.Container{
+		{Env: []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "INFO"},
+			{Name: "FI_PROVIDER", Value: "efa"},
+			{Name: "HOME", Value: "/root"}, // should NOT match
+		}},
+		{Env: []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "WARN"}, // duplicate — first wins
+			{Name: "NCCL_SOCKET_IFNAME", Value: "eth0"},
+		}},
+	}
+
+	result := injector.collectMatchingEnvVars(containers)
+
+	assert.Len(t, result, 3) // NCCL_DEBUG, FI_PROVIDER, NCCL_SOCKET_IFNAME
+	assert.Equal(t, "INFO", findEnv(result, "NCCL_DEBUG"))
+	assert.Equal(t, "", findEnv(result, "HOME"))
+}
+
+func TestCollectMatchingVolumeMounts(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{
+		VolumeMountPatterns: []string{"nvtcpxo-*", "host-opt-*"},
+	}}
+
+	containers := []corev1.Container{
+		{VolumeMounts: []corev1.VolumeMount{
+			{Name: "nvtcpxo-libraries", MountPath: "/usr/local/nvidia"},
+			{Name: "kube-api-access", MountPath: "/var/run/secrets"},
+		}},
+		{VolumeMounts: []corev1.VolumeMount{
+			{Name: "nvtcpxo-libraries", MountPath: "/usr/local/nvidia"}, // dup
+			{Name: "host-opt-amazon", MountPath: "/opt/amazon"},
+		}},
+	}
+
+	result := injector.collectMatchingVolumeMounts(containers)
+
+	assert.Len(t, result, 2)
+	assert.Equal(t, "nvtcpxo-libraries", result[0].Name)
+	assert.Equal(t, "host-opt-amazon", result[1].Name)
+}
+
+func TestMergeEnvVars_ExistingTakesPrecedence(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{}}
+	container := &corev1.Container{
+		Env: []corev1.EnvVar{{Name: "NCCL_DEBUG", Value: "WARN"}},
+	}
+
+	injector.mergeEnvVars(container, []corev1.EnvVar{
+		{Name: "NCCL_DEBUG", Value: "INFO"}, // should NOT override
+		{Name: "FI_PROVIDER", Value: "efa"}, // should be added
+	})
+
+	assert.Len(t, container.Env, 2)
+	assert.Equal(t, "WARN", findEnv(container.Env, "NCCL_DEBUG"))
+}
+
+func TestMergeVolumeMounts_SkipsExistingNameOrPath(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{}}
+	container := &corev1.Container{
+		VolumeMounts: []corev1.VolumeMount{{Name: "vol-a", MountPath: "/mnt/a"}},
+	}
+
+	injector.mergeVolumeMounts(container, []corev1.VolumeMount{
+		{Name: "vol-a", MountPath: "/mnt/b"}, // skip: name exists
+		{Name: "vol-b", MountPath: "/mnt/a"}, // skip: path exists
+		{Name: "vol-c", MountPath: "/mnt/c"}, // add
+	})
+
+	assert.Len(t, container.VolumeMounts, 2)
+	assert.Equal(t, "vol-c", container.VolumeMounts[1].Name)
+}
+
+func TestFindMaxResources(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{
+		GPUResourceNames:     []string{"nvidia.com/gpu"},
+		NetworkResourceNames: []string{"vpc.amazonaws.com/efa"},
+	}}
+
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{
+		{Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			"nvidia.com/gpu":        resource.MustParse("4"),
+			"vpc.amazonaws.com/efa": resource.MustParse("2"),
+		}}},
+		{Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+			"nvidia.com/gpu":        resource.MustParse("8"),
+			"vpc.amazonaws.com/efa": resource.MustParse("4"),
+		}}},
+	}}}
+
+	result := injector.findMaxResources(pod)
+	assert.Equal(t, resource.MustParse("8"), result["nvidia.com/gpu"])
+	assert.Equal(t, resource.MustParse("4"), result["vpc.amazonaws.com/efa"])
+}
+
+func TestFindMaxResources_NoGPU_ReturnsNil(t *testing.T) {
+	injector := &Injector{cfg: &config.Config{
+		GPUResourceNames: []string{"nvidia.com/gpu"},
+	}}
+	pod := &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{}}}}
+	assert.Nil(t, injector.findMaxResources(pod))
+}
+
+// TestInjectInitContainers covers the main entry point: GPU detection,
+// gang context extraction, init container / volume patch generation,
+// and append-vs-create behavior for existing init containers and volumes.
+func TestInjectInitContainers(t *testing.T) {
+	tests := []struct {
+		name             string
+		cfg              *config.Config
+		discoverer       *mockDiscoverer
+		pod              *corev1.Pod
+		expectPatches    bool
+		expectGangCtx    bool
+		expectGangID     string
+		expectCheckNames string
+		expectError      bool
+		validatePatches  func(t *testing.T, patches []PatchOperation)
+	}{
+		{
+			name:          "no GPU resources returns nil",
+			cfg:           testConfig(),
+			pod:           &corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "nginx"}}}},
+			expectPatches: false,
+			expectGangCtx: false,
+		},
+		{
+			name:          "GPU pod with gang disabled",
+			cfg:           testConfig(),
+			discoverer:    nil,
+			pod:           gpuPod(),
+			expectPatches: true,
+			expectGangCtx: false,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				initPatch := findPatchByPath(patches, "/spec/initContainers")
+				require.NotNil(t, initPatch, "expected /spec/initContainers patch")
+				assert.Equal(t, "add", initPatch.Op)
+
+				containers, ok := initPatch.Value.([]corev1.Container)
+				require.True(t, ok)
+				assert.Len(t, containers, 1)
+				assert.Equal(t, "preflight-dcgm-diag", containers[0].Name)
+
+				// No gang volumes should be present (check both single-volume
+				// appends and the initial slice-valued /spec/volumes patch).
+				for _, p := range patches {
+					switch v := p.Value.(type) {
+					case corev1.Volume:
+						assert.NotEqual(t, types.GangConfigVolumeName, v.Name)
+						assert.NotEqual(t, dshmVolumeName, v.Name)
+					case []corev1.Volume:
+						for _, vol := range v {
+							assert.NotEqual(t, types.GangConfigVolumeName, vol.Name)
+							assert.NotEqual(t, dshmVolumeName, vol.Name)
+						}
+					}
+				}
+			},
+		},
+		{
+			name:          "GPU pod with gang enabled but not a gang member",
+			cfg:           testGangConfig(),
+			discoverer:    &mockDiscoverer{name: "test", canHandle: false},
+			pod:           gpuPod(),
+			expectPatches: true,
+			expectGangCtx: false,
+		},
+		{
+			name:             "GPU pod with gang enabled and is gang member",
+			cfg:              testGangConfig(),
+			discoverer:       &mockDiscoverer{name: "volcano", canHandle: true, gangID: "volcano-default-pg1"},
+			pod:              gpuEFAPod(),
+			expectPatches:    true,
+			expectGangCtx:    true,
+			expectGangID:     "volcano-default-pg1",
+			expectCheckNames: "preflight-dcgm-diag",
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				initPatch := findPatchByPath(patches, "/spec/initContainers")
+				require.NotNil(t, initPatch)
+				containers, ok := initPatch.Value.([]corev1.Container)
+				require.True(t, ok)
+				require.Len(t, containers, 1)
+
+				c := containers[0]
+				assert.True(t, hasEnvVar(c, "GANG_ID"))
+				assert.True(t, hasEnvVar(c, "GANG_CONFIG_DIR"))
+				assert.True(t, hasEnvVar(c, "GANG_TIMEOUT_SECONDS"))
+				assert.True(t, hasEnvVar(c, "MASTER_PORT"))
+				assert.True(t, hasEnvVar(c, "POD_NAME"))
+				assert.True(t, hasEnvVar(c, "POD_IP"))
+				assert.True(t, hasVolumeMount(c, types.GangConfigVolumeName))
+				assert.True(t, hasVolumeMount(c, dshmVolumeName))
+			},
+		},
+		{
+			name: "existing init containers are appended not replaced",
+			cfg:  testConfig(),
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Spec.InitContainers = []corev1.Container{{Name: "user-init", Image: "busybox"}}
+				return p
+			}(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				assert.Nil(t, findPatchByPath(patches, "/spec/initContainers"), "should not replace init containers array")
+				appendCount := countPatchesByPath(patches, "/spec/initContainers/-")
+				assert.Equal(t, 1, appendCount, "should append 1 init container")
+			},
+		},
+		{
+			name: "placement prepend inserts init containers before existing",
+			cfg: func() *config.Config {
+				c := testConfig()
+				c.InitContainerPlacement = config.PlacementPrepend
+				return c
+			}(),
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Spec.InitContainers = []corev1.Container{{Name: "user-init", Image: "busybox"}}
+				return p
+			}(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				assert.Nil(t, findPatchByPath(patches, "/spec/initContainers"), "should not replace init containers array")
+				assert.Zero(t, countPatchesByPath(patches, "/spec/initContainers/-"), "should not use append path")
+
+				p := findPatchByPath(patches, "/spec/initContainers/0")
+				require.NotNil(t, p, "should insert at index 0")
+				assert.Equal(t, "add", p.Op)
+			},
+		},
+		{
+			name: "placement prepend with multiple init containers uses sequential indices",
+			cfg: func() *config.Config {
+				c := testConfig()
+				c.InitContainerPlacement = config.PlacementPrepend
+				c.InitContainers = []config.InitContainerSpec{
+					{Name: "preflight-dcgm-diag", Image: "dcgm:latest"},
+					{Name: "preflight-nccl-loopback", Image: "nccl:latest"},
+				}
+				return c
+			}(),
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Spec.InitContainers = []corev1.Container{{Name: "user-init", Image: "busybox"}}
+				return p
+			}(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				p0 := findPatchByPath(patches, "/spec/initContainers/0")
+				require.NotNil(t, p0, "should insert first container at index 0")
+				p1 := findPatchByPath(patches, "/spec/initContainers/1")
+				require.NotNil(t, p1, "should insert second container at index 1")
+			},
+		},
+		{
+			name: "placement prepend with no existing init containers creates array",
+			cfg: func() *config.Config {
+				c := testConfig()
+				c.InitContainerPlacement = config.PlacementPrepend
+				return c
+			}(),
+			pod:           gpuPod(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				p := findPatchByPath(patches, "/spec/initContainers")
+				require.NotNil(t, p, "should create init containers array")
+				assert.Equal(t, "add", p.Op)
+			},
+		},
+		{
+			name:          "no existing init containers creates array",
+			cfg:           testConfig(),
+			pod:           gpuPod(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				p := findPatchByPath(patches, "/spec/initContainers")
+				require.NotNil(t, p, "should create init containers array")
+				assert.Equal(t, "add", p.Op)
+			},
+		},
+		{
+			name:             "existing volumes are not duplicated",
+			cfg:              testGangConfig(),
+			discoverer:       &mockDiscoverer{name: "test", canHandle: true, gangID: "test-gang"},
+			expectCheckNames: "preflight-dcgm-diag",
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Spec.Volumes = []corev1.Volume{
+					{Name: dshmVolumeName},
+					{Name: types.GangConfigVolumeName},
+				}
+				return p
+			}(),
+			expectPatches: true,
+			expectGangCtx: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				for _, p := range patches {
+					if p.Path == "/spec/volumes/-" {
+						if vol, ok := p.Value.(corev1.Volume); ok {
+							assert.NotEqual(t, dshmVolumeName, vol.Name, "should not duplicate dshm")
+							assert.NotEqual(t, types.GangConfigVolumeName, vol.Name, "should not duplicate gang config")
+						}
+					}
+				}
+			},
+		},
+		{
+			name: "existing volumes appended with /-",
+			cfg:  testConfig(),
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Spec.Volumes = []corev1.Volume{{Name: "user-vol"}}
+				return p
+			}(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				assert.Nil(t, findPatchByPath(patches, "/spec/volumes"), "should not replace volumes array")
+				assert.Greater(t, countPatchesByPath(patches, "/spec/volumes/-"), 0, "should append volumes")
+			},
+		},
+		{
+			name:          "empty volumes creates array",
+			cfg:           testConfig(),
+			pod:           gpuPod(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				p := findPatchByPath(patches, "/spec/volumes")
+				require.NotNil(t, p, "should create volumes array")
+				assert.Equal(t, "add", p.Op)
+			},
+		},
+		{
+			name: "annotation selects subset and populates GangContext.CheckNames",
+			cfg: func() *config.Config {
+				cfg := testGangConfig()
+				cfg.InitContainers = []config.InitContainerSpec{
+					{Name: "preflight-dcgm-diag", Image: "dcgm:latest"},
+					{Name: "preflight-nccl-loopback", Image: "nccl:latest"},
+					{Name: "preflight-nccl-allreduce", Image: "nccl:latest"},
+				}
+				return cfg
+			}(),
+			discoverer: &mockDiscoverer{name: "test", canHandle: true, gangID: "test-gang"},
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Annotations = map[string]string{
+					PreflightChecksAnnotation: "preflight-nccl-allreduce,preflight-dcgm-diag",
+				}
+				return p
+			}(),
+			expectPatches:    true,
+			expectGangCtx:    true,
+			expectGangID:     "test-gang",
+			expectCheckNames: "preflight-nccl-allreduce,preflight-dcgm-diag",
+		},
+		{
+			name:       "empty annotation with gang returns empty CheckNames",
+			cfg:        testGangConfig(),
+			discoverer: &mockDiscoverer{name: "test", canHandle: true, gangID: "test-gang"},
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Annotations = map[string]string{
+					PreflightChecksAnnotation: "",
+				}
+				return p
+			}(),
+			expectPatches: false,
+			expectGangCtx: true,
+			expectGangID:  "test-gang",
+		},
+		{
+			name: "no annotation populates CheckNames from defaultEnabled",
+			cfg: func() *config.Config {
+				cfg := testGangConfig()
+				f := false
+				cfg.InitContainers = []config.InitContainerSpec{
+					{Name: "preflight-dcgm-diag", Image: "dcgm:latest"},
+					{Name: "preflight-nccl-allreduce", Image: "nccl:latest", DefaultEnabled: &f},
+				}
+				return cfg
+			}(),
+			discoverer:       &mockDiscoverer{name: "test", canHandle: true, gangID: "test-gang"},
+			pod:              gpuPod(),
+			expectPatches:    true,
+			expectGangCtx:    true,
+			expectGangID:     "test-gang",
+			expectCheckNames: "preflight-dcgm-diag",
+		},
+		{
+			name: "imagePullSecrets injected into target pod",
+			cfg: func() *config.Config {
+				c := testConfig()
+				c.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "gcr-pull"}}
+				return c
+			}(),
+			pod:           gpuPod(),
+			expectPatches: true,
+			validatePatches: func(t *testing.T, patches []PatchOperation) {
+				t.Helper()
+				p := findPatchByPath(patches, "/spec/imagePullSecrets")
+				require.NotNil(t, p, "expected /spec/imagePullSecrets patch")
+				assert.Equal(t, "add", p.Op)
+
+				secrets, ok := p.Value.([]corev1.LocalObjectReference)
+				require.True(t, ok)
+				require.Len(t, secrets, 1)
+				assert.Equal(t, "gcr-pull", secrets[0].Name)
+			},
+		},
+		{
+			name: "unknown check name returns error",
+			cfg:  testConfig(),
+			pod: func() *corev1.Pod {
+				p := gpuPod()
+				p.Annotations = map[string]string{
+					PreflightChecksAnnotation: "preflight-dcgm-diag,nonexistent",
+				}
+				return p
+			}(),
+			expectPatches: false,
+			expectError:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var resolver *gang.DiscovererResolver
+			if tt.discoverer != nil {
+				resolver = gang.NewResolver(tt.discoverer, nil)
+			}
+			injector := NewInjector(tt.cfg, resolver, nil)
+
+			patches, gangCtx, err := injector.InjectInitContainers(context.Background(), tt.pod)
+			if tt.expectError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+
+			if tt.expectPatches {
+				assert.NotEmpty(t, patches)
+			} else {
+				assert.Empty(t, patches)
+			}
+
+			if tt.expectGangCtx {
+				require.NotNil(t, gangCtx)
+				if tt.expectGangID != "" {
+					assert.Equal(t, tt.expectGangID, gangCtx.GangID)
+					assert.NotEmpty(t, gangCtx.ConfigMapName)
+				}
+				assert.Equal(t, tt.expectCheckNames, gangCtx.CheckNames)
+			} else {
+				assert.Nil(t, gangCtx)
+			}
+
+			if tt.validatePatches != nil && len(patches) > 0 {
+				tt.validatePatches(t, patches)
+			}
+		})
+	}
+}
+
+// TestBuildInitContainers covers per-container logic: resource mirroring,
+// CPU/memory floor defaults, env injection ordering (common > DCGM > gang > user),
+// user env/mount inheritance, and DRA claim mirroring.
+func TestBuildInitContainers(t *testing.T) {
+	t.Run("resources mirrored to init containers", func(t *testing.T) {
+		cfg := testConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuEFAPod()
+
+		maxResources := corev1.ResourceList{
+			"nvidia.com/gpu":        resource.MustParse("8"),
+			"vpc.amazonaws.com/efa": resource.MustParse("4"),
+		}
+
+		containers := injector.buildInitContainers(pod, maxResources, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		c := containers[0]
+		assert.Equal(t, resource.MustParse("8"), c.Resources.Requests["nvidia.com/gpu"])
+		assert.Equal(t, resource.MustParse("8"), c.Resources.Limits["nvidia.com/gpu"])
+		assert.Equal(t, resource.MustParse("4"), c.Resources.Requests["vpc.amazonaws.com/efa"])
+		assert.Equal(t, resource.MustParse("4"), c.Resources.Limits["vpc.amazonaws.com/efa"])
+	})
+
+	t.Run("CPU and memory floor applied when not set", func(t *testing.T) {
+		cfg := testConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		assert.Equal(t, resource.MustParse("100m"), containers[0].Resources.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("500Mi"), containers[0].Resources.Requests[corev1.ResourceMemory])
+	})
+
+	t.Run("CPU and memory floor not applied when already set", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.InitContainers = []config.InitContainerSpec{
+			{
+				Name:  "preflight-dcgm-diag",
+				Image: "dcgm:latest",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("200m"),
+						corev1.ResourceMemory: resource.MustParse("1Gi"),
+					},
+				}},
+		}
+		injector := NewInjector(cfg, nil, nil)
+
+		containers := injector.buildInitContainers(gpuPod(), corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		assert.Equal(t, resource.MustParse("200m"), containers[0].Resources.Requests[corev1.ResourceCPU])
+		assert.Equal(t, resource.MustParse("1Gi"), containers[0].Resources.Requests[corev1.ResourceMemory])
+	})
+
+	t.Run("common env injected", func(t *testing.T) {
+		cfg := testConfig()
+		injector := NewInjector(cfg, nil, nil)
+
+		containers := injector.buildInitContainers(gpuPod(), corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		assert.True(t, hasEnvVar(containers[0], "NODE_NAME"))
+		assert.True(t, hasEnvVar(containers[0], "PLATFORM_CONNECTOR_SOCKET"))
+		assert.True(t, hasEnvVar(containers[0], "PROCESSING_STRATEGY"))
+	})
+
+	t.Run("gang env not injected without context", func(t *testing.T) {
+		cfg := testGangConfig()
+		injector := NewInjector(cfg, nil, nil)
+
+		containers := injector.buildInitContainers(gpuPod(), corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		assert.False(t, hasEnvVar(containers[0], "GANG_ID"))
+		assert.False(t, hasEnvVar(containers[0], "GANG_CONFIG_DIR"))
+		assert.False(t, hasEnvVar(containers[0], "POD_NAME"))
+		assert.False(t, hasEnvVar(containers[0], "POD_IP"))
+	})
+
+	t.Run("gang env injected with context", func(t *testing.T) {
+		cfg := testGangConfig()
+		injector := NewInjector(cfg, nil, nil)
+
+		gangCtx := &GangContext{GangID: "test-gang", ConfigMapName: "preflight-test-gang"}
+		containers := injector.buildInitContainers(gpuPod(), corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, gangCtx, cfg.InitContainers)
+		require.Len(t, containers, 1)
+
+		c := containers[0]
+		assert.Equal(t, "test-gang", findEnv(c.Env, "GANG_ID"))
+		assert.Equal(t, "/etc/preflight", findEnv(c.Env, "GANG_CONFIG_DIR"))
+		assert.Equal(t, "600", findEnv(c.Env, "GANG_TIMEOUT_SECONDS"))
+		assert.Equal(t, "29500", findEnv(c.Env, "MASTER_PORT"))
+		assert.True(t, hasEnvVar(c, "POD_NAME"))
+		assert.True(t, hasEnvVar(c, "POD_IP"))
+	})
+
+	t.Run("user NCCL env inherited", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.NCCLEnvPatterns = []string{"NCCL_*"}
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].Env = []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "INFO"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.Equal(t, "INFO", findEnv(containers[0].Env, "NCCL_DEBUG"))
+	})
+
+	t.Run("user NCCL env not inherited when disabled", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.NCCLEnvPatterns = []string{"NCCL_*"}
+		cfg.InitContainers[0].InheritUserEnv = new(false)
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].Env = []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "INFO"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.False(t, hasEnvVar(containers[0], "NCCL_DEBUG"))
+	})
+
+	t.Run("user env lower precedence than template", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.NCCLEnvPatterns = []string{"NCCL_*"}
+		cfg.InitContainers = []config.InitContainerSpec{
+			{
+				Name:  "preflight-dcgm-diag",
+				Image: "dcgm:latest",
+				Env:   []corev1.EnvVar{{Name: "NCCL_DEBUG", Value: "WARN"}}},
+		}
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].Env = []corev1.EnvVar{
+			{Name: "NCCL_DEBUG", Value: "INFO"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.Equal(t, "WARN", findEnv(containers[0].Env, "NCCL_DEBUG"))
+	})
+
+	t.Run("user volume mounts inherited", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.VolumeMountPatterns = []string{"nvtcpxo-*"}
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+			{Name: "nvtcpxo-libraries", MountPath: "/usr/local/nvidia"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.True(t, hasVolumeMount(containers[0], "nvtcpxo-libraries"))
+	})
+
+	t.Run("user volume mounts not inherited when disabled", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.VolumeMountPatterns = []string{"nvtcpxo-*"}
+		cfg.InitContainers[0].InheritUserVolumeMounts = new(false)
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+			{Name: "nvtcpxo-libraries", MountPath: "/usr/local/nvidia"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.False(t, hasVolumeMount(containers[0], "nvtcpxo-libraries"))
+	})
+
+	t.Run("DRA claims mirrored when enabled", func(t *testing.T) {
+		cfg := testGangConfig()
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: "gpu-claim"},
+			{Name: "rdma-claim"},
+		}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, gangCtx, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		require.Len(t, containers[0].Resources.Claims, 2)
+		assert.Equal(t, "gpu-claim", containers[0].Resources.Claims[0].Name)
+		assert.Equal(t, "rdma-claim", containers[0].Resources.Claims[1].Name)
+	})
+
+	t.Run("DRA claims not mirrored when disabled", func(t *testing.T) {
+		cfg := testGangConfig()
+		cfg.GangCoordination.MirrorResourceClaims = new(false)
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: "gpu-claim"},
+		}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, gangCtx, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.Empty(t, containers[0].Resources.Claims)
+	})
+
+	t.Run("DRA claims not mirrored without gang context", func(t *testing.T) {
+		cfg := testGangConfig()
+		injector := NewInjector(cfg, nil, nil)
+
+		pod := gpuPod()
+		pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+			{Name: "gpu-claim"},
+		}
+
+		containers := injector.buildInitContainers(pod, corev1.ResourceList{
+			"nvidia.com/gpu": resource.MustParse("8"),
+		}, nil, cfg.InitContainers)
+		require.Len(t, containers, 1)
+		assert.Empty(t, containers[0].Resources.Claims)
+	})
+}
+
+// extractVolumes pulls the []corev1.Volume out of the first /spec/volumes
+// or /spec/volumes/- patch, failing the test if none is found.
+func extractVolumes(t *testing.T, patches []PatchOperation) []corev1.Volume {
+	t.Helper()
+	p := findPatchByPath(patches, "/spec/volumes")
+	require.NotNil(t, p, "expected /spec/volumes patch")
+	volumes, ok := p.Value.([]corev1.Volume)
+	require.True(t, ok, "patch value should be []corev1.Volume")
+	return volumes
+}
+
+// findVolume returns the first volume with the given name, or nil.
+func findVolume(volumes []corev1.Volume, name string) *corev1.Volume {
+	for i := range volumes {
+		if volumes[i].Name == name {
+			return &volumes[i]
+		}
+	}
+	return nil
+}
+
+// requireVolume returns the volume with the given name, failing if absent.
+func requireVolume(t *testing.T, volumes []corev1.Volume, name string) *corev1.Volume {
+	t.Helper()
+	vol := findVolume(volumes, name)
+	require.NotNil(t, vol, "expected volume %q", name)
+	return vol
+}
+
+func TestSelectInitContainers(t *testing.T) {
+	multiConfig := func() *config.Config {
+		cfg := testConfig()
+		f := false
+		cfg.InitContainers = []config.InitContainerSpec{
+			{Name: "preflight-dcgm-diag", Image: "dcgm:latest"},
+			{Name: "preflight-nccl-loopback", Image: "nccl:latest"},
+			{Name: "preflight-nccl-allreduce", Image: "nccl:latest", DefaultEnabled: &f},
+		}
+		return cfg
+	}
+
+	t.Run("no annotation uses defaultEnabled", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		assert.Len(t, selected, 2)
+		assert.Equal(t, "preflight-dcgm-diag", selected[0].Name)
+		assert.Equal(t, "preflight-nccl-loopback", selected[1].Name)
+	})
+
+	t.Run("annotation selects subset", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "preflight-dcgm-diag",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		require.Len(t, selected, 1)
+		assert.Equal(t, "preflight-dcgm-diag", selected[0].Name)
+	})
+
+	t.Run("annotation overrides defaultEnabled false", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "preflight-nccl-allreduce",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		require.Len(t, selected, 1)
+		assert.Equal(t, "preflight-nccl-allreduce", selected[0].Name)
+	})
+
+	t.Run("empty annotation disables all checks", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		assert.Empty(t, selected)
+	})
+
+	t.Run("unknown check name rejects admission", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "preflight-dcgm-diag,bogus-check",
+		}
+
+		_, err := injector.selectInitContainers(pod)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "bogus-check")
+		assert.Contains(t, err.Error(), "unknown checks")
+	})
+
+	t.Run("annotation order controls injection order", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		// Reverse of chart order — should inject in annotation order.
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "preflight-nccl-loopback,preflight-dcgm-diag",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		require.Len(t, selected, 2)
+		assert.Equal(t, "preflight-nccl-loopback", selected[0].Name)
+		assert.Equal(t, "preflight-dcgm-diag", selected[1].Name)
+	})
+
+	t.Run("comma-only annotation disables all checks", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: " , , ",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		assert.Empty(t, selected)
+	})
+
+	t.Run("annotation with spaces and trailing commas", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: " , preflight-dcgm-diag , preflight-nccl-loopback , ",
+		}
+
+		selected, err := injector.selectInitContainers(pod)
+		require.NoError(t, err)
+		assert.Len(t, selected, 2)
+	})
+
+	t.Run("annotation with duplicates returns error", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "preflight-dcgm-diag,preflight-dcgm-diag",
+		}
+
+		_, err := injector.selectInitContainers(pod)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+		assert.Contains(t, err.Error(), "preflight-dcgm-diag")
+	})
+
+	t.Run("unknown check name lists configured checks in error", func(t *testing.T) {
+		cfg := multiConfig()
+		injector := NewInjector(cfg, nil, nil)
+		pod := gpuPod()
+		pod.Annotations = map[string]string{
+			PreflightChecksAnnotation: "typo-check",
+		}
+
+		_, err := injector.selectInitContainers(pod)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "preflight-dcgm-diag")
+		assert.Contains(t, err.Error(), "preflight-nccl-loopback")
+		assert.Contains(t, err.Error(), "preflight-nccl-allreduce")
+	})
+}
+
+func TestParseCheckNames(t *testing.T) {
+	t.Run("preserves order", func(t *testing.T) {
+		names, err := ParseCheckNames("b, a, c")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"b", "a", "c"}, names)
+	})
+
+	t.Run("empty string returns empty", func(t *testing.T) {
+		names, err := ParseCheckNames("")
+		require.NoError(t, err)
+		assert.Empty(t, names)
+	})
+
+	t.Run("whitespace only returns empty", func(t *testing.T) {
+		names, err := ParseCheckNames("  ,  , ")
+		require.NoError(t, err)
+		assert.Empty(t, names)
+	})
+
+	t.Run("duplicate name returns error", func(t *testing.T) {
+		_, err := ParseCheckNames("a, b, a")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duplicate")
+		assert.Contains(t, err.Error(), "a")
+	})
+}
+
+// TestInjectVolumes covers volume patch generation: nvsentinel socket,
+// gang ConfigMap (optional), /dev/shm, NCCL topology, extra hostPaths,
+// and dedup against existing pod volumes.
+func TestInjectConnectorToken(t *testing.T) {
+	t.Run("volume, mount and env injected when audience configured", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ConnectorTokenAudience = "nvsentinel-platform-connector"
+		cfg.ConnectorTokenMountPath = "/var/run/secrets/nvsentinel/platform-connector"
+		cfg.ConnectorTokenExpirationSeconds = 3600
+		injector := &Injector{cfg: cfg}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, nil))
+		vol := requireVolume(t, volumes, connectorTokenVolumeName)
+		require.NotNil(t, vol.Projected)
+		require.Len(t, vol.Projected.Sources, 1)
+		sat := vol.Projected.Sources[0].ServiceAccountToken
+		require.NotNil(t, sat)
+		assert.Equal(t, "nvsentinel-platform-connector", sat.Audience)
+		assert.Equal(t, "token", sat.Path)
+		require.NotNil(t, sat.ExpirationSeconds)
+		assert.Equal(t, int64(3600), *sat.ExpirationSeconds)
+
+		container := &corev1.Container{}
+		injector.injectCommonEnv(container)
+		injector.injectConnectorTokenMount(container)
+
+		var tokenEnv string
+		for _, e := range container.Env {
+			if e.Name == "PLATFORM_CONNECTOR_TOKEN_PATH" {
+				tokenEnv = e.Value
+			}
+		}
+		assert.Equal(t, "/var/run/secrets/nvsentinel/platform-connector/token", tokenEnv)
+
+		require.Len(t, container.VolumeMounts, 1)
+		assert.Equal(t, connectorTokenVolumeName, container.VolumeMounts[0].Name)
+		assert.Equal(t, "/var/run/secrets/nvsentinel/platform-connector", container.VolumeMounts[0].MountPath)
+		assert.True(t, container.VolumeMounts[0].ReadOnly)
+
+		// Idempotent: a second pass must not duplicate the mount.
+		injector.injectConnectorTokenMount(container)
+		assert.Len(t, container.VolumeMounts, 1)
+	})
+
+	t.Run("nothing injected when audience is empty", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+
+		for _, p := range injector.injectVolumes(&corev1.Pod{}, nil) {
+			if vol, ok := p.Value.(corev1.Volume); ok {
+				assert.NotEqual(t, connectorTokenVolumeName, vol.Name)
+			}
+		}
+
+		container := &corev1.Container{}
+		injector.injectCommonEnv(container)
+		injector.injectConnectorTokenMount(container)
+
+		for _, e := range container.Env {
+			assert.NotEqual(t, "PLATFORM_CONNECTOR_TOKEN_PATH", e.Name)
+		}
+		assert.Empty(t, container.VolumeMounts)
+	})
+
+	t.Run("pod-supplied volume with the same name is not duplicated", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ConnectorTokenAudience = "nvsentinel-platform-connector"
+		cfg.ConnectorTokenMountPath = "/var/run/secrets/nvsentinel/platform-connector"
+		cfg.ConnectorTokenExpirationSeconds = 3600
+		injector := &Injector{cfg: cfg}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{Name: connectorTokenVolumeName}},
+			},
+		}
+
+		for _, p := range injector.injectVolumes(pod, nil) {
+			if vol, ok := p.Value.(corev1.Volume); ok {
+				assert.NotEqual(t, connectorTokenVolumeName, vol.Name)
+			}
+		}
+	})
+}
+
+// healthPublishConfig is testConfig with the projected token and a direct
+// publishing target that verifies the server with the CA ConfigMap copy.
+func healthPublishConfig() *config.Config {
+	cfg := testConfig()
+	cfg.ConnectorTokenAudience = "nvsentinel-platform-connector"
+	cfg.ConnectorTokenMountPath = "/var/run/secrets/nvsentinel/platform-connector"
+	cfg.ConnectorTokenExpirationSeconds = 3600
+	cfg.HealthPublishTarget = "platform-connector-deployment.nvsentinel.svc.cluster.local:50051"
+	cfg.HealthPublishCAFile = "/etc/nvsentinel/platform-connector-deployment-ca/ca.crt"
+
+	return cfg
+}
+
+// healthPublishInsecureConfig is the same target in the insecure development
+// mode, so no CA is involved.
+func healthPublishInsecureConfig() *config.Config {
+	cfg := healthPublishConfig()
+	cfg.HealthPublishCAFile = ""
+	cfg.HealthPublishInsecure = true
+
+	return cfg
+}
+
+// injectedContainers runs the full injection on pod and returns the injected
+// init containers and every patch.
+func injectedContainers(t *testing.T, cfg *config.Config, pod *corev1.Pod) ([]corev1.Container, []PatchOperation) {
+	t.Helper()
+
+	patches, _, err := NewInjector(cfg, nil, nil).InjectInitContainers(context.Background(), pod)
+	require.NoError(t, err)
+
+	p := findPatchByPath(patches, "/spec/initContainers")
+	require.NotNil(t, p, "expected /spec/initContainers patch")
+	containers, ok := p.Value.([]corev1.Container)
+	require.True(t, ok)
+	require.NotEmpty(t, containers)
+
+	return containers, patches
+}
+
+// TestInjectHealthPublish covers direct publishing: the HEALTH_PUBLISH_* env,
+// the CA ConfigMap mount and volume, the NetworkPolicy label, and that none of
+// it appears in socket mode.
+func TestInjectHealthPublish(t *testing.T) {
+	const labelPath = "/metadata/labels/nvsentinel.nvidia.com~1health-publisher"
+
+	t.Run("nothing injected when the target is empty", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ConnectorTokenAudience = "nvsentinel-platform-connector"
+		cfg.ConnectorTokenMountPath = "/var/run/secrets/nvsentinel/platform-connector"
+		cfg.ConnectorTokenExpirationSeconds = 3600
+
+		containers, patches := injectedContainers(t, cfg, gpuPod())
+
+		for _, e := range containers[0].Env {
+			assert.NotContains(t, e.Name, "HEALTH_PUBLISH_", "socket mode must not see direct mode env")
+		}
+
+		assert.False(t, hasVolumeMount(containers[0], HealthPublishCAConfigMapName))
+		assert.Nil(t, findVolume(extractVolumes(t, patches), HealthPublishCAConfigMapName))
+		assert.Nil(t, findPatchByPath(patches, "/metadata/labels"))
+		assert.Nil(t, findPatchByPath(patches, labelPath))
+		// The socket env and volume stay in place.
+		assert.Equal(t, "/var/run/nvsentinel/nvsentinel.sock", findEnv(containers[0].Env, "PLATFORM_CONNECTOR_SOCKET"))
+		assert.NotNil(t, findVolume(extractVolumes(t, patches), nvsentinelSocketVolumeName))
+	})
+
+	t.Run("env, CA mount, CA volume and label with a CA", func(t *testing.T) {
+		containers, patches := injectedContainers(t, healthPublishConfig(), gpuPod())
+		c := containers[0]
+
+		assert.Equal(t, "platform-connector-deployment.nvsentinel.svc.cluster.local:50051",
+			findEnv(c.Env, "HEALTH_PUBLISH_TARGET"))
+		assert.Equal(t, "/var/run/secrets/nvsentinel/platform-connector/token",
+			findEnv(c.Env, "HEALTH_PUBLISH_TOKEN_PATH"))
+		assert.Equal(t, "/etc/nvsentinel/platform-connector-deployment-ca/ca.crt",
+			findEnv(c.Env, "HEALTH_PUBLISH_TLS_CA_FILE"))
+		assert.False(t, hasEnvVar(c, "HEALTH_PUBLISH_INSECURE"))
+		// The socket env is still injected: the chart mounts the socket in both modes.
+		assert.Equal(t, "/var/run/nvsentinel/nvsentinel.sock", findEnv(c.Env, "PLATFORM_CONNECTOR_SOCKET"))
+		assert.Equal(t, "/var/run/secrets/nvsentinel/platform-connector/token",
+			findEnv(c.Env, "PLATFORM_CONNECTOR_TOKEN_PATH"))
+
+		var caMount *corev1.VolumeMount
+
+		for i := range c.VolumeMounts {
+			if c.VolumeMounts[i].Name == HealthPublishCAConfigMapName {
+				caMount = &c.VolumeMounts[i]
+			}
+		}
+
+		require.NotNil(t, caMount, "expected the CA ConfigMap mount")
+		assert.Equal(t, "/etc/nvsentinel/platform-connector-deployment-ca", caMount.MountPath)
+		assert.True(t, caMount.ReadOnly)
+		// The CA mount follows the token mount so inherited user mounts at
+		// that path are skipped later.
+		assert.Equal(t, connectorTokenVolumeName, c.VolumeMounts[0].Name)
+		assert.Equal(t, HealthPublishCAConfigMapName, c.VolumeMounts[1].Name)
+
+		vol := requireVolume(t, extractVolumes(t, patches), HealthPublishCAConfigMapName)
+		require.NotNil(t, vol.ConfigMap)
+		assert.Equal(t, "nvsentinel-platform-connector-ca", vol.ConfigMap.Name)
+		assert.Nil(t, vol.ConfigMap.Optional, "the CA copy must not be optional")
+		require.Len(t, vol.ConfigMap.Items, 1)
+		assert.Equal(t, "ca.crt", vol.ConfigMap.Items[0].Key)
+		assert.Equal(t, "ca.crt", vol.ConfigMap.Items[0].Path)
+
+		labels := findPatchByPath(patches, "/metadata/labels")
+		require.NotNil(t, labels, "expected the labels map to be added")
+		assert.Equal(t, "add", labels.Op)
+		assert.Equal(t, map[string]string{"nvsentinel.nvidia.com/health-publisher": "true"}, labels.Value)
+		assert.Nil(t, findPatchByPath(patches, labelPath))
+	})
+
+	t.Run("insecure env and no CA pieces when insecure", func(t *testing.T) {
+		containers, patches := injectedContainers(t, healthPublishInsecureConfig(), gpuPod())
+		c := containers[0]
+
+		assert.Equal(t, "platform-connector-deployment.nvsentinel.svc.cluster.local:50051",
+			findEnv(c.Env, "HEALTH_PUBLISH_TARGET"))
+		assert.Equal(t, "/var/run/secrets/nvsentinel/platform-connector/token",
+			findEnv(c.Env, "HEALTH_PUBLISH_TOKEN_PATH"))
+		assert.Equal(t, "true", findEnv(c.Env, "HEALTH_PUBLISH_INSECURE"))
+		assert.False(t, hasEnvVar(c, "HEALTH_PUBLISH_TLS_CA_FILE"))
+		assert.False(t, hasVolumeMount(c, HealthPublishCAConfigMapName))
+		assert.Nil(t, findVolume(extractVolumes(t, patches), HealthPublishCAConfigMapName))
+		// The label depends on the target, not on the CA.
+		assert.NotNil(t, findPatchByPath(patches, "/metadata/labels"))
+	})
+
+	t.Run("label patch with existing labels targets the escaped key", func(t *testing.T) {
+		pod := gpuPod()
+		pod.Labels = map[string]string{"app": "train"}
+
+		_, patches := injectedContainers(t, healthPublishConfig(), pod)
+
+		assert.Nil(t, findPatchByPath(patches, "/metadata/labels"), "must not replace the labels map")
+		p := findPatchByPath(patches, labelPath)
+		require.NotNil(t, p, "expected a patch on the escaped label key")
+		assert.Equal(t, "add", p.Op)
+		assert.Equal(t, "true", p.Value)
+	})
+
+	t.Run("our own CA volume on the pod is not duplicated", func(t *testing.T) {
+		injector := &Injector{cfg: healthPublishConfig()}
+		pod := &corev1.Pod{Spec: corev1.PodSpec{Volumes: []corev1.Volume{injector.healthPublishCAVolume()}}}
+
+		require.NoError(t, injector.ValidateHealthPublishCAVolume(pod))
+
+		for _, p := range injector.injectVolumes(pod, nil) {
+			if vol, ok := p.Value.(corev1.Volume); ok {
+				assert.NotEqual(t, HealthPublishCAConfigMapName, vol.Name)
+			}
+		}
+	})
+
+	t.Run("CA mount wins over an inherited user mount at the same path", func(t *testing.T) {
+		// injectHealthPublishCAMount runs before inheritUserConfig, so a user
+		// mount at the CA path is dropped by mergeVolumeMounts and the check
+		// reads our copy, not the user's volume.
+		cfg := healthPublishConfig()
+		cfg.VolumeMountPatterns = []string{"nvtcpxo-*"}
+
+		pod := gpuPod()
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
+			{Name: "nvtcpxo-ca", MountPath: healthPublishCAMountPath},
+		}
+
+		containers, _ := injectedContainers(t, cfg, pod)
+		c := containers[0]
+
+		var atCAPath []string
+
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == healthPublishCAMountPath {
+				atCAPath = append(atCAPath, m.Name)
+			}
+		}
+
+		assert.Equal(t, []string{HealthPublishCAConfigMapName}, atCAPath,
+			"only the injected CA mount may sit at the CA path")
+		assert.False(t, hasVolumeMount(c, "nvtcpxo-ca"), "the user mount at the CA path is not inherited")
+	})
+
+	t.Run("CA mount is idempotent", func(t *testing.T) {
+		injector := &Injector{cfg: healthPublishConfig()}
+		container := &corev1.Container{}
+
+		injector.injectHealthPublishCAMount(container)
+		injector.injectHealthPublishCAMount(container)
+		assert.Len(t, container.VolumeMounts, 1)
+	})
+}
+
+func TestValidateHealthPublishCAVolume(t *testing.T) {
+	// Injected checks trust the server named by the bundle in this volume. A
+	// workload that declares its own volume by that name would choose which
+	// server the check trusts, so admission refuses the pod.
+	ours := (&Injector{cfg: healthPublishConfig()}).healthPublishCAVolume()
+
+	tests := []struct {
+		name    string
+		volume  *corev1.Volume
+		wantErr bool
+	}{
+		{name: "no colliding volume", volume: nil},
+		{name: "our own projection is accepted", volume: &ours},
+		{
+			name:    "workload-supplied emptyDir is refused",
+			volume:  &corev1.Volume{Name: HealthPublishCAConfigMapName, EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			wantErr: true,
+		},
+		{
+			name: "ConfigMap with another name is refused",
+			volume: &corev1.Volume{
+				Name: HealthPublishCAConfigMapName,
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					Name:  "workload-supplied",
+					Items: []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "ConfigMap projecting other keys is refused",
+			volume: &corev1.Volume{
+				Name: HealthPublishCAConfigMapName,
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					Name:  "nvsentinel-platform-connector-ca",
+					Items: []corev1.KeyToPath{{Key: "other.crt", Path: "ca.crt"}},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "ConfigMap without items is refused",
+			volume: &corev1.Volume{
+				Name:      HealthPublishCAConfigMapName,
+				ConfigMap: &corev1.ConfigMapVolumeSource{Name: "nvsentinel-platform-connector-ca"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "optional projection is refused",
+			volume: &corev1.Volume{
+				Name: HealthPublishCAConfigMapName,
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					Name:     "nvsentinel-platform-connector-ca",
+					Items:    []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+					Optional: new(true),
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			injector := &Injector{cfg: healthPublishConfig()}
+
+			pod := &corev1.Pod{}
+			if tt.volume != nil {
+				pod.Spec.Volumes = []corev1.Volume{*tt.volume}
+			}
+
+			err := injector.ValidateHealthPublishCAVolume(pod)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), HealthPublishCAConfigMapName)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+
+	t.Run("the full injection refuses a foreign volume by that name", func(t *testing.T) {
+		pod := gpuPod()
+		pod.Spec.Volumes = []corev1.Volume{
+			{Name: HealthPublishCAConfigMapName, EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		}
+
+		_, _, err := NewInjector(healthPublishConfig(), nil, nil).InjectInitContainers(context.Background(), pod)
+		require.Error(t, err)
+	})
+
+	t.Run("no check at all in insecure mode", func(t *testing.T) {
+		injector := &Injector{cfg: healthPublishInsecureConfig()}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: HealthPublishCAConfigMapName}}},
+		}
+
+		require.NoError(t, injector.ValidateHealthPublishCAVolume(pod))
+	})
+
+	t.Run("no check at all in socket mode", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: HealthPublishCAConfigMapName}}},
+		}
+
+		require.NoError(t, injector.ValidateHealthPublishCAVolume(pod))
+	})
+}
+
+func TestValidateConnectorTokenVolume(t *testing.T) {
+	// Injected checks read their credential out of the volume with this name.
+	// A workload that declares its own volume by that name would otherwise
+	// choose what the check reads, so admission refuses the pod.
+	const audience = "nvsentinel-platform-connector"
+
+	ours := corev1.Volume{
+		Name: connectorTokenVolumeName,
+		Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{{
+				ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+					Audience:          audience,
+					ExpirationSeconds: new(int64(3600)),
+					Path:              "token",
+				},
+			}},
+		},
+	}
+
+	tests := []struct {
+		name    string
+		volume  *corev1.Volume
+		wantErr bool
+	}{
+		{name: "no colliding volume", volume: nil},
+		{name: "our own projection is accepted", volume: &ours},
+		{
+			name:    "workload-supplied emptyDir is refused",
+			volume:  &corev1.Volume{Name: connectorTokenVolumeName, EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			wantErr: true,
+		},
+		{
+			name: "workload-supplied secret is refused",
+			volume: &corev1.Volume{
+				Name:   connectorTokenVolumeName,
+				Secret: &corev1.SecretVolumeSource{SecretName: "workload-supplied"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "projection for a different audience is refused",
+			volume: &corev1.Volume{
+				Name: connectorTokenVolumeName,
+				Projected: &corev1.ProjectedVolumeSource{
+					Sources: []corev1.VolumeProjection{{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Audience:          "something-else",
+							ExpirationSeconds: new(int64(3600)),
+							Path:              "token",
+						},
+					}},
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.ConnectorTokenAudience = audience
+			cfg.ConnectorTokenMountPath = "/var/run/secrets/nvsentinel/platform-connector"
+			cfg.ConnectorTokenExpirationSeconds = 3600
+			injector := &Injector{cfg: cfg}
+
+			pod := &corev1.Pod{}
+			if tt.volume != nil {
+				pod.Spec.Volumes = []corev1.Volume{*tt.volume}
+			}
+
+			err := injector.ValidateConnectorTokenVolume(pod)
+
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), connectorTokenVolumeName)
+
+				return
+			}
+
+			require.NoError(t, err)
+		})
+	}
+
+	t.Run("no check at all when token injection is disabled", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{Volumes: []corev1.Volume{{Name: connectorTokenVolumeName}}},
+		}
+
+		require.NoError(t, injector.ValidateConnectorTokenVolume(pod))
+	})
+}
+
+func TestConnectorTokenSettingsFollowTheChart(t *testing.T) {
+	// The docs promise these are global and cannot drift between publishers,
+	// so preflight must use the configured values rather than its own copy.
+	cfg := testConfig()
+	cfg.ConnectorTokenAudience = "custom-audience"
+	cfg.ConnectorTokenMountPath = "/custom/creds"
+	cfg.ConnectorTokenExpirationSeconds = 900
+	injector := &Injector{cfg: cfg}
+
+	volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, nil))
+	sat := requireVolume(t, volumes, connectorTokenVolumeName).Projected.Sources[0].ServiceAccountToken
+	require.NotNil(t, sat)
+	assert.Equal(t, "custom-audience", sat.Audience)
+	require.NotNil(t, sat.ExpirationSeconds)
+	assert.Equal(t, int64(900), *sat.ExpirationSeconds)
+
+	container := &corev1.Container{}
+	injector.injectCommonEnv(container)
+	injector.injectConnectorTokenMount(container)
+
+	require.Len(t, container.VolumeMounts, 1)
+	assert.Equal(t, "/custom/creds", container.VolumeMounts[0].MountPath)
+
+	var tokenEnv string
+
+	for _, e := range container.Env {
+		if e.Name == "PLATFORM_CONNECTOR_TOKEN_PATH" {
+			tokenEnv = e.Value
+		}
+	}
+
+	assert.Equal(t, "/custom/creds/token", tokenEnv)
+}
+
+func TestInjectVolumes(t *testing.T) {
+	t.Run("nvsentinel socket volume added", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, nil))
+		vol := requireVolume(t, volumes, nvsentinelSocketVolumeName)
+		require.NotNil(t, vol.HostPath)
+		assert.Equal(t, "/var/run/nvsentinel", vol.HostPath.Path)
+	})
+
+	t.Run("nvsentinel socket volume skipped if exists", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{Name: nvsentinelSocketVolumeName}},
+			},
+		}
+
+		patches := injector.injectVolumes(pod, nil)
+		for _, p := range patches {
+			if vol, ok := p.Value.(corev1.Volume); ok {
+				assert.NotEqual(t, nvsentinelSocketVolumeName, vol.Name)
+			}
+		}
+	})
+
+	t.Run("gang ConfigMap volume is optional", func(t *testing.T) {
+		injector := &Injector{cfg: testGangConfig()}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		vol := requireVolume(t, volumes, types.GangConfigVolumeName)
+		require.NotNil(t, vol.ConfigMap)
+		require.NotNil(t, vol.ConfigMap.Optional)
+		assert.True(t, *vol.ConfigMap.Optional)
+		assert.Equal(t, "preflight-test", vol.ConfigMap.Name)
+	})
+
+	t.Run("dshm volume specs", func(t *testing.T) {
+		injector := &Injector{cfg: testGangConfig()}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		vol := requireVolume(t, volumes, dshmVolumeName)
+		require.NotNil(t, vol.EmptyDir)
+		assert.Equal(t, corev1.StorageMediumMemory, vol.EmptyDir.Medium)
+		assert.Equal(t, resource.MustParse("64Gi"), *vol.EmptyDir.SizeLimit)
+	})
+
+	t.Run("NCCL topo volume added when configured", func(t *testing.T) {
+		cfg := testGangConfig()
+		cfg.GangCoordination.NCCLTopoConfigMap = "nccl-topo-ndv4"
+		injector := &Injector{cfg: cfg}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		vol := requireVolume(t, volumes, ncclTopoVolumeName)
+		require.NotNil(t, vol.ConfigMap)
+		assert.Equal(t, "nccl-topo-ndv4", vol.ConfigMap.Name)
+		require.NotNil(t, vol.ConfigMap.Optional)
+		assert.True(t, *vol.ConfigMap.Optional)
+	})
+
+	t.Run("NCCL topo volume not added when not configured", func(t *testing.T) {
+		cfg := testGangConfig()
+		cfg.GangCoordination.NCCLTopoConfigMap = ""
+		injector := &Injector{cfg: cfg}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		assert.Nil(t, findVolume(volumes, ncclTopoVolumeName), "nccl-topo volume should not be present")
+	})
+
+	t.Run("extra hostPath volumes added", func(t *testing.T) {
+		cfg := testGangConfig()
+		cfg.GangCoordination.ExtraHostPathMounts = []config.HostPathMount{
+			{Name: "host-efa", HostPath: "/opt/amazon/efa", MountPath: "/opt/amazon/efa", HostPathType: "Directory"},
+		}
+		injector := &Injector{cfg: cfg}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		vol := requireVolume(t, volumes, "host-efa")
+		require.NotNil(t, vol.HostPath)
+		assert.Equal(t, "/opt/amazon/efa", vol.HostPath.Path)
+	})
+
+	t.Run("extra hostPath with invalid type skipped", func(t *testing.T) {
+		cfg := testGangConfig()
+		cfg.GangCoordination.ExtraHostPathMounts = []config.HostPathMount{
+			{Name: "bad-type", HostPath: "/bad", MountPath: "/bad", HostPathType: "Bogus"},
+			{Name: "good-type", HostPath: "/good", MountPath: "/good", HostPathType: "Directory"},
+		}
+		injector := &Injector{cfg: cfg}
+		gangCtx := &GangContext{GangID: "test", ConfigMapName: "preflight-test"}
+
+		volumes := extractVolumes(t, injector.injectVolumes(&corev1.Pod{}, gangCtx))
+		assert.Nil(t, findVolume(volumes, "bad-type"), "bogus hostPathType should be skipped")
+		assert.NotNil(t, findVolume(volumes, "good-type"), "valid hostPath should be included")
+	})
+}
+
+func TestInjectImagePullSecrets(t *testing.T) {
+	t.Run("no config secrets returns nil", func(t *testing.T) {
+		injector := &Injector{cfg: testConfig()}
+		patches := injector.injectImagePullSecrets(&corev1.Pod{})
+		assert.Nil(t, patches)
+	})
+
+	t.Run("creates array when pod has none", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "gcr-pull"}}
+		injector := &Injector{cfg: cfg}
+
+		patches := injector.injectImagePullSecrets(&corev1.Pod{})
+		require.Len(t, patches, 1)
+		assert.Equal(t, "add", patches[0].Op)
+		assert.Equal(t, "/spec/imagePullSecrets", patches[0].Path)
+
+		secrets, ok := patches[0].Value.([]corev1.LocalObjectReference)
+		require.True(t, ok)
+		require.Len(t, secrets, 1)
+		assert.Equal(t, "gcr-pull", secrets[0].Name)
+	})
+
+	t.Run("appends when pod already has secrets", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "gcr-pull"}}
+		injector := &Injector{cfg: cfg}
+
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				ImagePullSecrets: []corev1.LocalObjectReference{{Name: "existing"}},
+			},
+		}
+
+		patches := injector.injectImagePullSecrets(pod)
+		require.Len(t, patches, 1)
+		assert.Equal(t, "add", patches[0].Op)
+		assert.Equal(t, "/spec/imagePullSecrets/-", patches[0].Path)
+	})
+
+	t.Run("skips duplicates", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ImagePullSecrets = []corev1.LocalObjectReference{
+			{Name: "already-there"},
+			{Name: "new-one"},
+		}
+		injector := &Injector{cfg: cfg}
+
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				ImagePullSecrets: []corev1.LocalObjectReference{{Name: "already-there"}},
+			},
+		}
+
+		patches := injector.injectImagePullSecrets(pod)
+		require.Len(t, patches, 1)
+
+		secret, ok := patches[0].Value.(corev1.LocalObjectReference)
+		require.True(t, ok)
+		assert.Equal(t, "new-one", secret.Name)
+	})
+
+	t.Run("all secrets already present returns nil", func(t *testing.T) {
+		cfg := testConfig()
+		cfg.ImagePullSecrets = []corev1.LocalObjectReference{{Name: "existing"}}
+		injector := &Injector{cfg: cfg}
+
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				ImagePullSecrets: []corev1.LocalObjectReference{{Name: "existing"}},
+			},
+		}
+
+		patches := injector.injectImagePullSecrets(pod)
+		assert.Nil(t, patches)
+	})
+}
+
+// TestParseHostPathType covers all 7 valid K8s HostPathType values,
+// empty string (nil), and invalid strings (rejected).
+func TestParseHostPathType(t *testing.T) {
+	tests := []struct {
+		input   string
+		wantNil bool
+		wantOk  bool
+		wantVal corev1.HostPathType
+	}{
+		{input: "", wantNil: true, wantOk: true},
+		{input: "Directory", wantOk: true, wantVal: corev1.HostPathDirectory},
+		{input: "DirectoryOrCreate", wantOk: true, wantVal: corev1.HostPathDirectoryOrCreate},
+		{input: "File", wantOk: true, wantVal: corev1.HostPathFile},
+		{input: "FileOrCreate", wantOk: true, wantVal: corev1.HostPathFileOrCreate},
+		{input: "Socket", wantOk: true, wantVal: corev1.HostPathSocket},
+		{input: "CharDevice", wantOk: true, wantVal: corev1.HostPathCharDev},
+		{input: "BlockDevice", wantOk: true, wantVal: corev1.HostPathBlockDev},
+		{input: "Bogus", wantOk: false},
+		{input: "directory", wantOk: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, ok := parseHostPathType(tt.input)
+			assert.Equal(t, tt.wantOk, ok)
+			if tt.wantNil {
+				assert.Nil(t, got)
+			} else if tt.wantOk {
+				require.NotNil(t, got)
+				assert.Equal(t, tt.wantVal, *got)
+			}
+		})
+	}
+}
+
+// findEnv returns the value for a named env var, or "" if not found.
+func findEnv(envs []corev1.EnvVar, name string) string {
+	for _, e := range envs {
+		if e.Name == name {
+			return e.Value
+		}
+	}
+	return ""
+}
+
+type mockDiscoverer struct {
+	name      string
+	canHandle bool
+	gangID    string
+}
+
+func (m *mockDiscoverer) Name() string                       { return m.name }
+func (m *mockDiscoverer) CanHandle(_ *corev1.Pod) bool       { return m.canHandle }
+func (m *mockDiscoverer) ExtractGangID(_ *corev1.Pod) string { return m.gangID }
+func (m *mockDiscoverer) DiscoverPeers(_ context.Context, _ *corev1.Pod) (*types.GangInfo, error) {
+	return nil, nil
+}
+
+// TestInjectInitContainers_NamespaceScopedDiscovery verifies the injector
+// selects the gang discoverer that applies to the pod's namespace, using the
+// resolver's per-namespace overrides and falling back to the default otherwise.
+func TestInjectInitContainers_NamespaceScopedDiscovery_SelectsNamespaceDiscoverer(t *testing.T) {
+	cfg := testGangConfig()
+
+	defaultDisc := &mockDiscoverer{name: "kubernetes", canHandle: true, gangID: "kubernetes-gang"}
+	volcanoDisc := &mockDiscoverer{name: "volcano", canHandle: true, gangID: "volcano-gang"}
+
+	resolver := gang.NewResolver(defaultDisc, map[string]gang.GangDiscoverer{
+		"team-a": volcanoDisc,
+	})
+	injector := NewInjector(cfg, resolver, nil)
+
+	tests := []struct {
+		name         string
+		namespace    string
+		expectGangID string
+	}{
+		{name: "override namespace uses volcano discoverer", namespace: "team-a", expectGangID: "volcano-gang"},
+		{name: "other namespace uses default discoverer", namespace: "team-b", expectGangID: "kubernetes-gang"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pod := gpuPod()
+			pod.Namespace = tt.namespace
+
+			_, gangCtx, err := injector.InjectInitContainers(context.Background(), pod)
+			require.NoError(t, err)
+			require.NotNil(t, gangCtx)
+			assert.Equal(t, tt.expectGangID, gangCtx.GangID)
+		})
+	}
+}
+
+func testConfig() *config.Config {
+	return &config.Config{
+		InitContainers: []config.InitContainerSpec{
+			{Name: "preflight-dcgm-diag", Image: "nvcr.io/nvidia/dcgm:latest"},
+		},
+		GPUResourceNames:       []string{"nvidia.com/gpu"},
+		NetworkResourceNames:   []string{"vpc.amazonaws.com/efa"},
+		InitContainerPlacement: config.PlacementAppend,
+		ConnectorSocket:        "/var/run/nvsentinel/nvsentinel.sock",
+		ProcessingStrategy:     "EXECUTE_REMEDIATION",
+	}
+}
+
+func testGangConfig() *config.Config {
+	cfg := testConfig()
+	cfg.GangCoordination = config.GangCoordinationConfig{
+		Enabled:              true,
+		Timeout:              "10m",
+		TimeoutDuration:      10 * time.Minute,
+		MasterPort:           29500,
+		ConfigMapMountPath:   "/etc/preflight",
+		MirrorResourceClaims: new(true),
+	}
+	return cfg
+}
+
+func gpuPod() *corev1.Pod {
+	return &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "train",
+					Image: "training:latest",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							"nvidia.com/gpu": resource.MustParse("8"),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func gpuEFAPod() *corev1.Pod {
+	return &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "train",
+					Image: "training:latest",
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							"nvidia.com/gpu":        resource.MustParse("8"),
+							"vpc.amazonaws.com/efa": resource.MustParse("4"),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func findPatchByPath(patches []PatchOperation, path string) *PatchOperation {
+	for i := range patches {
+		if patches[i].Path == path {
+			return &patches[i]
+		}
+	}
+	return nil
+}
+
+func countPatchesByPath(patches []PatchOperation, path string) int {
+	count := 0
+	for _, p := range patches {
+		if p.Path == path {
+			count++
+		}
+	}
+	return count
+}
+
+func hasEnvVar(container corev1.Container, name string) bool {
+	for _, e := range container.Env {
+		if e.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasVolumeMount(container corev1.Container, name string) bool {
+	for _, vm := range container.VolumeMounts {
+		if vm.Name == name {
+			return true
+		}
+	}
+	return false
+}

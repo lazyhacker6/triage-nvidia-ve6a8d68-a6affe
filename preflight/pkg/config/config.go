@@ -1,0 +1,488 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/yaml"
+)
+
+type Config struct {
+	Port    int
+	CertDir string
+
+	FileConfig
+}
+
+// InitContainerPlacement controls where preflight init containers are
+// inserted relative to existing init containers in the pod spec.
+type InitContainerPlacement string
+
+const (
+	// PlacementAppend appends preflight init containers after existing ones.
+	// This is the default and ensures provider-injected setup containers
+	// (e.g., GCP TCPXO daemon) complete before preflight checks run.
+	PlacementAppend InitContainerPlacement = "append"
+
+	// PlacementPrepend prepends preflight init containers before existing ones.
+	// Use this when preflight checks must run before other init containers,
+	// for example to gate workload setup on GPU health validation.
+	PlacementPrepend InitContainerPlacement = "prepend"
+)
+
+// InitContainerSpec wraps corev1.Container with preflight-specific fields.
+type InitContainerSpec struct {
+	corev1.Container        `yaml:",inline"`
+	DefaultEnabled          *bool `yaml:"defaultEnabled,omitempty"`
+	InheritUserEnv          *bool `yaml:"inheritUserEnv,omitempty"`
+	InheritUserVolumeMounts *bool `yaml:"inheritUserVolumeMounts,omitempty"`
+}
+
+// IsDefaultEnabled returns true when DefaultEnabled is nil or explicitly true.
+func (s *InitContainerSpec) IsDefaultEnabled() bool {
+	return s.DefaultEnabled == nil || *s.DefaultEnabled
+}
+
+// InheritsUserEnv returns true when matching env vars from user containers
+// should be copied into this init container. Omitted values preserve the
+// historical behavior of inheriting matching env vars.
+func (s *InitContainerSpec) InheritsUserEnv() bool {
+	return s.InheritUserEnv == nil || *s.InheritUserEnv
+}
+
+// InheritsUserVolumeMounts returns true when matching volume mounts from user
+// containers should be copied into this init container. Omitted values preserve
+// the historical behavior of inheriting matching volume mounts.
+func (s *InitContainerSpec) InheritsUserVolumeMounts() bool {
+	return s.InheritUserVolumeMounts == nil || *s.InheritUserVolumeMounts
+}
+
+type FileConfig struct {
+	InitContainers       []InitContainerSpec `yaml:"initContainers"`
+	GPUResourceNames     []string            `yaml:"gpuResourceNames"`
+	NetworkResourceNames []string            `yaml:"networkResourceNames"`
+	ConnectorSocket      string              `yaml:"connectorSocket"`
+	ProcessingStrategy   string              `yaml:"processingStrategy"`
+
+	// ConnectorTokenAudience, when set, has the webhook add a projected
+	// ServiceAccount token volume (minted for this audience against the
+	// workload pod's own ServiceAccount) to injected check containers, with
+	// its path exported as PLATFORM_CONNECTOR_TOKEN_PATH. platform-connector
+	// uses the token's node claim to confirm the check is reporting from the
+	// node it runs on. Empty disables the injection and the checks publish
+	// without a token, which pins them to their own node the same way.
+	ConnectorTokenAudience string `yaml:"connectorTokenAudience,omitempty"`
+
+	// ConnectorTokenMountPath and ConnectorTokenExpirationSeconds mirror the
+	// chart's global platformConnectorAuth settings so preflight checks use the
+	// same mount path and token lifetime as every other publisher.
+	//
+	// The three connector-token fields are atomic: either all are set and
+	// valid, or none is. Substituting a built-in path or lifetime for a missing
+	// one would mean injecting a credential shaped by an assumption nobody
+	// wrote down, and a mount path that disagrees with the chart's yields a
+	// token the check cannot find at the path it was told to read.
+	ConnectorTokenMountPath         string `yaml:"connectorTokenMountPath,omitempty"`
+	ConnectorTokenExpirationSeconds int64  `yaml:"connectorTokenExpirationSeconds,omitempty"`
+
+	// HealthPublishTarget, when set, is the host:port of the deployment
+	// platform connector Service. The injected checks then publish their
+	// health events there over TLS with the projected token instead of the
+	// node-local socket. Empty keeps the socket mode.
+	HealthPublishTarget string `yaml:"healthPublishTarget,omitempty"`
+
+	// HealthPublishCAFile is the CA bundle path inside the preflight
+	// controller pod. The controller copies it into a ConfigMap in every
+	// namespace it injects into, and the checks read that copy to verify the
+	// server.
+	HealthPublishCAFile string `yaml:"healthPublishCAFile,omitempty"`
+
+	// HealthPublishInsecure lets the checks send plaintext to the target.
+	// Development only; it replaces the CA settings.
+	HealthPublishInsecure bool `yaml:"healthPublishInsecure,omitempty"`
+
+	// GangDiscovery is the cluster-wide default gang discovery configuration.
+	// Per-namespace overrides are expressed as PreflightConfig custom
+	// resources (preflight.nvsentinel.nvidia.com/v1alpha1) via
+	// spec.gangDiscovery, reconciled at runtime into the discoverer resolver.
+	GangDiscovery    GangDiscoveryConfig    `yaml:"gangDiscovery"`
+	GangCoordination GangCoordinationConfig `yaml:"gangCoordination"`
+
+	// InitContainerPlacement controls where preflight init containers are
+	// placed relative to existing init containers in the pod spec.
+	// Valid values: "prepend", "append". Default: "append".
+	InitContainerPlacement InitContainerPlacement `yaml:"initContainerPlacement,omitempty"`
+
+	// ImagePullSecrets are added to the target pod's spec.imagePullSecrets
+	// when init containers are injected. This is needed when the init
+	// container images are stored in a private registry.
+	ImagePullSecrets []corev1.LocalObjectReference `yaml:"imagePullSecrets,omitempty"`
+
+	// NCCLEnvPatterns are glob patterns for environment variable names to copy
+	// from the pod's main containers to preflight init containers.
+	// This allows the init container to inherit fabric-specific NCCL config
+	// (e.g. NCCL_*, FI_*, LD_LIBRARY_PATH) from the user's training container.
+	NCCLEnvPatterns []string `yaml:"ncclEnvPatterns,omitempty"`
+
+	// VolumeMountPatterns are glob patterns for volume mount names to copy
+	// from the pod's main containers to preflight init containers.
+	// This allows the init container to inherit fabric-specific mounts
+	// (e.g. host EFA libs, TCPXO plugin volumes) from the user's container.
+	VolumeMountPatterns []string `yaml:"volumeMountPatterns,omitempty"`
+}
+
+// GangDiscoveryConfig configures gang discovery for PodGroup-based schedulers.
+// If empty (no Name set), defaults to native K8s gang APIs: 1.36+ schedulingGroup,
+// falling back to 1.35 workloadRef when PodGroup is unavailable.
+type GangDiscoveryConfig struct {
+	// Name is the discoverer identifier (used in gangID prefix and logging).
+	Name string `yaml:"name,omitempty"`
+
+	// AnnotationKeys are pod annotation keys to check for the PodGroup name (checked in order).
+	AnnotationKeys []string `yaml:"annotationKeys,omitempty"`
+
+	// LabelKeys are optional pod label keys to check as fallback (checked in order).
+	LabelKeys []string `yaml:"labelKeys,omitempty"`
+
+	// PodGroupGVR specifies the PodGroup CustomResource location.
+	PodGroupGVR GVRConfig `yaml:"podGroupGVR,omitempty"`
+
+	// MinCountExpr is a CEL expression to extract the minimum member count from the PodGroup.
+	// The expression receives 'podGroup' as the unstructured object.
+	// Examples: "podGroup.spec.minMember", "podGroup.spec.minReplicas"
+	// Default: "podGroup.spec.minMember"
+	MinCountExpr string `yaml:"minCountExpr,omitempty"`
+}
+
+// GVRConfig specifies a Kubernetes GroupVersionResource.
+type GVRConfig struct {
+	Group    string `yaml:"group"`
+	Version  string `yaml:"version"`
+	Resource string `yaml:"resource"`
+}
+
+// GangCoordinationConfig contains configuration for gang coordination.
+type GangCoordinationConfig struct {
+	// Enabled enables gang coordination for multi-node checks.
+	Enabled bool `yaml:"enabled"`
+
+	// Timeout is the maximum time to wait for all gang members to register.
+	// Accepts duration strings like "10m", "5m30s", etc.
+	// Default: 10m
+	Timeout string `yaml:"timeout,omitempty"`
+
+	// TimeoutDuration is the parsed Timeout value. Set by Load().
+	TimeoutDuration time.Duration `yaml:"-"`
+
+	// MasterPort is the port used for PyTorch distributed TCP bootstrap.
+	// Default: 29500
+	MasterPort int `yaml:"masterPort,omitempty"`
+
+	// ConfigMapMountPath is the path where gang ConfigMap is mounted in init containers.
+	// Default: /etc/preflight
+	ConfigMapMountPath string `yaml:"configMapMountPath,omitempty"`
+
+	// NCCLTopoConfigMap is the name of the ConfigMap containing the NCCL topology file.
+	// Required for Azure NDv4/v5 - without it, NCCL cannot map GPUs to IB NICs.
+	// If NCCLTopoData is set, the controller auto-creates this ConfigMap in the
+	// pod's namespace; otherwise it must already exist.
+	NCCLTopoConfigMap string `yaml:"ncclTopoConfigMap,omitempty"`
+
+	// NCCLTopoData is the raw NCCL topology XML content.
+	// When set, the controller creates a ConfigMap with this data in the pod's
+	// namespace alongside the gang ConfigMap. This avoids manual ConfigMap
+	// creation per namespace for Azure IB topology files.
+	NCCLTopoData string `yaml:"ncclTopoData,omitempty"`
+
+	// ExtraHostPathMounts defines optional hostPath mounts to inject into
+	// gang-aware preflight init containers. This is useful for environments
+	// where NCCL/OFI/CUDA libraries must be sourced from host paths.
+	ExtraHostPathMounts []HostPathMount `yaml:"extraHostPathMounts,omitempty"`
+
+	// ExtraVolumeMounts references volumes that already exist in the pod
+	// (e.g. injected by another webhook) and adds mounts to init containers.
+	// Unlike ExtraHostPathMounts, this does NOT create new volumes — it only
+	// adds volumeMounts for volumes that are expected to be present.
+	// Primary use-case: GCP TCPXO daemon writes the FastRak NCCL plugin into
+	// a shared emptyDir; this option lets preflight init containers access it.
+	ExtraVolumeMounts []ExtraVolumeMount `yaml:"extraVolumeMounts,omitempty"`
+
+	// MirrorResourceClaims controls whether pod-level DRA resource claims
+	// (spec.resourceClaims) are automatically copied to preflight init
+	// containers' resources.claims. This ensures init containers get the
+	// same device access as the main containers (GPUs, RDMA, IMEX channels).
+	// Defaults to true when gang coordination is enabled.
+	// It applies to gang members that get their GPUs from the device plugin.
+	// A pod whose claims request a gpu.nvidia.com device (a DRA GPU pod)
+	// always gets its claims mirrored, because the checks cannot see its GPUs
+	// without them.
+	// See ADR-026 §DRA Integration.
+	MirrorResourceClaims *bool `yaml:"mirrorResourceClaims,omitempty"`
+}
+
+// HostPathMount defines a hostPath volume and corresponding container mount.
+type HostPathMount struct {
+	// Name is the Kubernetes volume name.
+	Name string `yaml:"name"`
+
+	// HostPath is the node filesystem path to mount.
+	HostPath string `yaml:"hostPath"`
+
+	// MountPath is the path inside the init container.
+	MountPath string `yaml:"mountPath"`
+
+	// ReadOnly controls whether the mount is read-only. Defaults to true.
+	ReadOnly *bool `yaml:"readOnly,omitempty"`
+
+	// HostPathType is an optional Kubernetes HostPathType string.
+	// Supported values include: Directory, DirectoryOrCreate, File, FileOrCreate,
+	// Socket, CharDevice, and BlockDevice.
+	HostPathType string `yaml:"hostPathType,omitempty"`
+}
+
+// ExtraVolumeMount references an existing pod volume and defines where
+// to mount it inside preflight init containers. The volume itself must
+// already exist in the pod spec (typically injected by a platform webhook).
+type ExtraVolumeMount struct {
+	// Name is the volume name that already exists in the pod spec.
+	Name string `yaml:"name"`
+
+	// MountPath is the path inside the init container.
+	MountPath string `yaml:"mountPath"`
+
+	// ReadOnly controls whether the mount is read-only. Defaults to true.
+	ReadOnly *bool `yaml:"readOnly,omitempty"`
+}
+
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var fileConfig FileConfig
+	if err := yaml.Unmarshal(data, &fileConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	fileConfig.setDefaults()
+
+	if err := fileConfig.validate(); err != nil {
+		return nil, fmt.Errorf("invalid file config: %w", err)
+	}
+
+	return &Config{FileConfig: fileConfig}, nil
+}
+
+func (c *FileConfig) setDefaults() {
+	if len(c.GPUResourceNames) == 0 {
+		c.GPUResourceNames = []string{"nvidia.com/gpu"}
+	}
+
+	if c.InitContainerPlacement == "" {
+		c.InitContainerPlacement = PlacementAppend
+	}
+
+	if c.ProcessingStrategy == "" {
+		c.ProcessingStrategy = "EXECUTE_REMEDIATION"
+	}
+
+	c.GangCoordination.setDefaults()
+}
+
+func (c *GangCoordinationConfig) setDefaults() {
+	if !c.Enabled {
+		return
+	}
+
+	if c.Timeout == "" {
+		c.Timeout = "10m"
+	}
+
+	if c.MasterPort == 0 {
+		c.MasterPort = 29500
+	}
+
+	if c.ConfigMapMountPath == "" {
+		c.ConfigMapMountPath = "/etc/preflight"
+	}
+
+	// Default to mirroring DRA claims when gang coordination is enabled.
+	// Init containers need the same device access (GPUs, RDMA, IMEX) as
+	// main containers for multi-node NCCL tests.
+	if c.MirrorResourceClaims == nil {
+		t := true
+		c.MirrorResourceClaims = &t
+	}
+
+	trueVal := true
+
+	for i := range c.ExtraHostPathMounts {
+		if c.ExtraHostPathMounts[i].ReadOnly == nil {
+			c.ExtraHostPathMounts[i].ReadOnly = &trueVal
+		}
+	}
+
+	for i := range c.ExtraVolumeMounts {
+		if c.ExtraVolumeMounts[i].ReadOnly == nil {
+			c.ExtraVolumeMounts[i].ReadOnly = &trueVal
+		}
+	}
+}
+
+func (c *FileConfig) validate() error {
+	seen := make(map[string]struct{}, len(c.InitContainers))
+	for i, spec := range c.InitContainers {
+		if spec.Name == "" {
+			return fmt.Errorf("initContainers[%d].name must be set", i)
+		}
+
+		if _, exists := seen[spec.Name]; exists {
+			return fmt.Errorf("duplicate init container name %q", spec.Name)
+		}
+
+		seen[spec.Name] = struct{}{}
+	}
+
+	switch c.InitContainerPlacement {
+	case PlacementPrepend, PlacementAppend:
+	default:
+		return fmt.Errorf("invalid initContainerPlacement %q: must be %q or %q",
+			c.InitContainerPlacement, PlacementPrepend, PlacementAppend)
+	}
+
+	if err := c.validateConnectorToken(); err != nil {
+		return err
+	}
+
+	if err := c.validateHealthPublish(); err != nil {
+		return err
+	}
+
+	if c.GangCoordination.Enabled {
+		timeout, err := time.ParseDuration(c.GangCoordination.Timeout)
+		if err != nil {
+			return fmt.Errorf("invalid gangCoordination.timeout %q: %w", c.GangCoordination.Timeout, err)
+		}
+
+		c.GangCoordination.TimeoutDuration = timeout
+	}
+
+	return nil
+}
+
+// validateConnectorToken enforces that the connector-token settings are all
+// present or all absent. Filling in a default mount path or lifetime for a
+// half-configured block is how a credential ends up injected at a path the
+// chart never agreed to.
+func (c *FileConfig) validateConnectorToken() error {
+	set := map[string]bool{
+		"connectorTokenAudience":          c.ConnectorTokenAudience != "",
+		"connectorTokenMountPath":         c.ConnectorTokenMountPath != "",
+		"connectorTokenExpirationSeconds": c.ConnectorTokenExpirationSeconds != 0,
+	}
+
+	present := make([]string, 0, len(set))
+	missing := make([]string, 0, len(set))
+
+	for _, name := range []string{
+		"connectorTokenAudience", "connectorTokenMountPath", "connectorTokenExpirationSeconds",
+	} {
+		if set[name] {
+			present = append(present, name)
+		} else {
+			missing = append(missing, name)
+		}
+	}
+
+	if len(present) > 0 && len(missing) > 0 {
+		return fmt.Errorf(
+			"connector token settings are all-or-nothing: %s set but %s missing. "+
+				"Set every one of connectorTokenAudience, connectorTokenMountPath and "+
+				"connectorTokenExpirationSeconds, or none of them",
+			strings.Join(present, ", "), strings.Join(missing, ", "))
+	}
+
+	// Kubernetes refuses a projected ServiceAccount token lifetime under 10
+	// minutes or over 2^32 seconds. Accepting one here would inject a volume the
+	// API server rejects, so the workload never starts and the reason surfaces
+	// as an admission error a long way from this config.
+	const (
+		minTokenExpirationSeconds int64 = 10 * 60
+		maxTokenExpirationSeconds int64 = 1 << 32
+	)
+
+	if c.ConnectorTokenExpirationSeconds != 0 &&
+		(c.ConnectorTokenExpirationSeconds < minTokenExpirationSeconds ||
+			c.ConnectorTokenExpirationSeconds > maxTokenExpirationSeconds) {
+		return fmt.Errorf(
+			"connectorTokenExpirationSeconds must be between %d and %d, got %d: "+
+				"Kubernetes rejects projected token lifetimes outside that range",
+			minTokenExpirationSeconds, maxTokenExpirationSeconds,
+			c.ConnectorTokenExpirationSeconds)
+	}
+
+	if c.ConnectorTokenMountPath != "" && !strings.HasPrefix(c.ConnectorTokenMountPath, "/") {
+		return fmt.Errorf("connectorTokenMountPath must be an absolute path, got %q",
+			c.ConnectorTokenMountPath)
+	}
+
+	return nil
+}
+
+// validateHealthPublish checks the direct publishing settings. Without a
+// target none of the other healthPublish* settings may be set. With a target
+// the checks need the projected token, and exactly one way to trust the
+// server: the CA file, or the insecure development mode.
+func (c *FileConfig) validateHealthPublish() error {
+	caFileSet := c.HealthPublishCAFile != ""
+
+	if c.HealthPublishTarget == "" {
+		if caFileSet || c.HealthPublishInsecure {
+			return errors.New(
+				"healthPublish* settings need healthPublishTarget: set it to the deployment " +
+					"platform connector address, or remove healthPublishCAFile and " +
+					"healthPublishInsecure")
+		}
+
+		return nil
+	}
+
+	if c.ConnectorTokenAudience == "" || c.ConnectorTokenMountPath == "" ||
+		c.ConnectorTokenExpirationSeconds == 0 {
+		return errors.New(
+			"healthPublishTarget is set but the connector token settings are not: direct " +
+				"publishing needs the projected token, so set connectorTokenAudience, " +
+				"connectorTokenMountPath and connectorTokenExpirationSeconds")
+	}
+
+	if caFileSet == c.HealthPublishInsecure {
+		return errors.New(
+			"healthPublishTarget needs exactly one of healthPublishCAFile or healthPublishInsecure: true")
+	}
+
+	if caFileSet && !strings.HasPrefix(c.HealthPublishCAFile, "/") {
+		return fmt.Errorf("healthPublishCAFile must be an absolute path, got %q",
+			c.HealthPublishCAFile)
+	}
+
+	return nil
+}

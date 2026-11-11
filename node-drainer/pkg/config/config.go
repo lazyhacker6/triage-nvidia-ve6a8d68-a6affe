@@ -1,0 +1,246 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package config
+
+import (
+	"fmt"
+	"strconv"
+	"time"
+
+	"github.com/BurntSushi/toml"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/statemanager"
+	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/config"
+)
+
+type EvictMode string
+
+const (
+	ModeImmediateEvict     EvictMode = "Immediate"
+	ModeAllowCompletion    EvictMode = "AllowCompletion"
+	ModeDeleteAfterTimeout EvictMode = "DeleteAfterTimeout"
+)
+
+type Duration struct {
+	time.Duration
+}
+
+type UserNamespace struct {
+	Name string    `toml:"name"`
+	Mode EvictMode `toml:"mode"`
+}
+
+type CustomDrainConfig struct {
+	Enabled bool `toml:"enabled"`
+	// NodeSelector restricts custom drain to the nodes it matches, using standard
+	// label selector syntax. Nodes that do not match keep the built-in eviction path.
+	// An empty selector sends every node through custom drain.
+	NodeSelector          string   `toml:"nodeSelector"`
+	TemplateMountPath     string   `toml:"templateMountPath"`
+	TemplateFileName      string   `toml:"templateFileName"`
+	Namespace             string   `toml:"namespace"`
+	Timeout               Duration `toml:"timeout"`
+	ApiGroup              string   `toml:"apiGroup"`
+	Version               string   `toml:"version"`
+	Kind                  string   `toml:"kind"`
+	StatusConditionType   string   `toml:"statusConditionType"`
+	StatusConditionStatus string   `toml:"statusConditionStatus"`
+}
+
+type TomlConfig struct {
+	EvictionTimeoutInSeconds  Duration `toml:"evictionTimeoutInSeconds"`
+	SystemNamespaces          string   `toml:"systemNamespaces"`
+	DeleteAfterTimeoutMinutes int      `toml:"deleteAfterTimeoutMinutes"`
+	// NotReadyTimeoutMinutes is the time after which a pod in NotReady state is considered stuck
+	NotReadyTimeoutMinutes int               `toml:"notReadyTimeoutMinutes"`
+	DrainGPUPods           bool              `toml:"drainGPUPods"`
+	UserNamespaces         []UserNamespace   `toml:"userNamespaces"`
+	PodDrainPolicies       []PodDrainPolicy  `toml:"podDrainPolicies"`
+	CustomDrain            CustomDrainConfig `toml:"customDrain"`
+	PartialDrainEnabled    bool              `toml:"partialDrainEnabled"`
+	// Registers node_drainer_partial_drains_total, which labels partial drains with the
+	// entity they targeted. Off by default because entity_value is a GPU UUID.
+	PartialDrainEntityMetricEnabled bool `toml:"partialDrainEntityMetricEnabled"`
+}
+
+func (d *Duration) UnmarshalTOML(text any) error {
+	if v, ok := text.(string); ok {
+		seconds, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid duration format: %v", text)
+		}
+
+		if seconds <= 0 {
+			return fmt.Errorf("eviction timeout must be a positive integer")
+		}
+
+		d.Duration = time.Duration(seconds) * time.Second
+
+		return nil
+	}
+
+	return fmt.Errorf("invalid duration format: %v", text)
+}
+
+func LoadTomlConfig(path string) (*TomlConfig, error) {
+	var config TomlConfig
+	if _, err := toml.DecodeFile(path, &config); err != nil {
+		return nil, fmt.Errorf("failed to decode TOML config from %s: %w", path, err)
+	}
+
+	return validateAndSetDefaults(&config)
+}
+
+func LoadTomlConfigFromString(configString string) (*TomlConfig, error) {
+	var config TomlConfig
+	if _, err := toml.Decode(configString, &config); err != nil {
+		return nil, fmt.Errorf("failed to decode TOML config string: %w", err)
+	}
+
+	return validateAndSetDefaults(&config)
+}
+
+// validateCustomDrainScope makes sure exactly one drain path owns every node.
+//
+// Without a node selector custom drain owns them all, so the built-in eviction rules would
+// never run and configuring them is a mistake. With a selector the unmatched nodes fall back
+// to those rules, and leaving both of them empty is worse than a misconfiguration: the
+// evaluator finds no namespace and no policy to act on, so it marks the node drained and
+// reports "All pods evicted successfully" without having evicted anything.
+func validateCustomDrainScope(config *TomlConfig, scoped bool) error {
+	if scoped {
+		if len(config.UserNamespaces) == 0 && len(config.PodDrainPolicies) == 0 {
+			return fmt.Errorf("customDrain.nodeSelector requires userNamespaces or podDrainPolicies " +
+				"to be configured: nodes outside the selector take the built-in eviction path and " +
+				"would be marked drained without evicting any pod")
+		}
+
+		return nil
+	}
+
+	if len(config.UserNamespaces) > 0 {
+		return fmt.Errorf("cannot use both customDrain.enabled=true and userNamespaces configuration " +
+			"unless customDrain.nodeSelector is set")
+	}
+
+	if len(config.PodDrainPolicies) > 0 {
+		return fmt.Errorf("cannot use both customDrain.enabled=true and podDrainPolicies configuration " +
+			"unless customDrain.nodeSelector is set")
+	}
+
+	return nil
+}
+
+// validateCustomDrainConfig checks required custom-drain fields, rejects conflicting
+// drain policies, and supplies the default timeout when custom draining is enabled.
+func validateCustomDrainConfig(config *TomlConfig) error {
+	if !config.CustomDrain.Enabled {
+		return nil
+	}
+
+	matcher, err := CompileCustomDrainNodeSelector(config.CustomDrain)
+	if err != nil {
+		return err
+	}
+
+	if err := validateCustomDrainScope(config, matcher.IsScoped()); err != nil {
+		return err
+	}
+
+	requiredFields := map[string]string{
+		"templateMountPath":     config.CustomDrain.TemplateMountPath,
+		"templateFileName":      config.CustomDrain.TemplateFileName,
+		"namespace":             config.CustomDrain.Namespace,
+		"apiGroup":              config.CustomDrain.ApiGroup,
+		"version":               config.CustomDrain.Version,
+		"kind":                  config.CustomDrain.Kind,
+		"statusConditionType":   config.CustomDrain.StatusConditionType,
+		"statusConditionStatus": config.CustomDrain.StatusConditionStatus,
+	}
+
+	for field, value := range requiredFields {
+		if value == "" {
+			return fmt.Errorf("customDrain.%s is required when customDrain.enabled=true", field)
+		}
+	}
+
+	if config.CustomDrain.Timeout.Duration == 0 {
+		config.CustomDrain.Timeout.Duration = 3600 * time.Second
+	}
+
+	return nil
+}
+
+// validateAndSetDefaults validates drain policies and fills in omitted timeouts.
+func validateAndSetDefaults(config *TomlConfig) (*TomlConfig, error) {
+	if len(config.UserNamespaces) > 0 && len(config.PodDrainPolicies) > 0 {
+		return nil, fmt.Errorf("cannot use both userNamespaces and podDrainPolicies configuration")
+	}
+
+	if _, err := CompilePodDrainPolicies(config.PodDrainPolicies); err != nil {
+		return nil, fmt.Errorf("validate pod drain policies: %w", err)
+	}
+
+	if err := validateCustomDrainConfig(config); err != nil {
+		return nil, err
+	}
+
+	if config.DeleteAfterTimeoutMinutes == 0 {
+		config.DeleteAfterTimeoutMinutes = 60 // Default: 60 minutes
+	}
+
+	if config.DeleteAfterTimeoutMinutes <= 0 {
+		return nil, fmt.Errorf("deleteAfterTimeout must be a positive integer")
+	}
+
+	if config.NotReadyTimeoutMinutes == 0 {
+		config.NotReadyTimeoutMinutes = 5 // Default: 5 minutes
+	}
+
+	if config.NotReadyTimeoutMinutes <= 0 {
+		return nil, fmt.Errorf("notReadyTimeoutMinutes must be a positive integer")
+	}
+
+	return config, nil
+}
+
+type ReconcilerConfig struct {
+	TomlConfig         TomlConfig
+	DatabaseConfig     config.DatabaseConfig
+	TokenConfig        client.TokenConfig
+	StateManager       statemanager.StateManager
+	RequeueBackoffBase time.Duration
+}
+
+// EnvConfig holds configuration loaded from environment variables
+type EnvConfig struct {
+	DatabaseURI               string
+	DatabaseName              string
+	DatabaseCollection        string
+	TokenDatabase             string
+	TokenCollection           string
+	TotalTimeoutSeconds       int
+	IntervalSeconds           int
+	TotalCACertTimeoutSeconds int
+	IntervalCACertSeconds     int
+}
+
+// NewQuarantinePipeline creates the database change stream pipeline for watching quarantine events
+// This uses the provider-specific pipeline builder for optimal performance with both MongoDB and PostgreSQL
+func NewQuarantinePipeline() any {
+	builder := client.GetPipelineBuilder()
+	return builder.BuildNodeQuarantineStatusPipeline()
+}

@@ -1,0 +1,296 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package config provides configuration structures and validation for fault remediation.
+// It defines the TOML configuration schema for multi-template support, maintenance resources,
+// and action-specific remediation settings.
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+)
+
+// MaintenanceResource holds configuration for maintenance custom resources
+type MaintenanceResource struct {
+	Namespace             string `toml:"namespace"`
+	Version               string `toml:"version"`
+	ApiGroup              string `toml:"apiGroup"`
+	Kind                  string `toml:"kind"`
+	CompleteConditionType string `toml:"completeConditionType"`
+
+	// Scope determines if the resource is cluster-scoped or namespaced
+	Scope string `toml:"scope"` // "Cluster" or "Namespaced"
+
+	// Template file path relative to the mount path
+	TemplateFileName string `toml:"templateFileName"`
+
+	// EquivalenceGroup defines which actions are considered equivalent for deduplication
+	// Actions in the same group will deduplicate against each other regardless of CRD type
+	// Example: "restart" group may contain RESTART_BM (Atlas) and COMPONENT_RESET (NVIDIA)
+	EquivalenceGroup string `toml:"equivalenceGroup"`
+	// Note that if an ImpactedEntityScope is defined, the EffectiveEquivalenceGroup will
+	// use the EquivalenceGroup as the prefix and the suffix will be the EntityValue for
+	// the EntityType referenced in ImpactedEntityScope. For example, if the EquivalenceGroup
+	// is "reset" and the ImpactedEntityScope is GPU_UUID, the EffectiveEquivalenceGroup
+	// will be reset-GPU-123 where GPU-123 is the EntityValue for the GPU_UUID EntityType.
+	// If no ImpactedEntityScope is defined, we will use the EquivalenceGroup as the
+	// EffectiveEquivalenceGroup.
+	ImpactedEntityScope string `toml:"impactedEntityScope"`
+	// SupersedingEquivalenceGroups allow EquivalenceGroups to have membership
+	// in other EquivalenceGroups. For example, we will count GPU resets
+	// EquivalenceGroups like reset-GPU-123 as being a member in restart because a
+	// node reboot has the same effect as a GPU reset.
+	SupersedingEquivalenceGroups []string `toml:"supersedingEquivalenceGroups"`
+}
+
+// Template holds configuration for template files mount
+type Template struct {
+	MountPath string `toml:"mountPath"`
+	FileName  string `toml:"fileName"`
+}
+
+// UpdateRetry holds configuration for update retry behavior
+type UpdateRetry struct {
+	MaxRetries        int `toml:"maxRetries"`
+	RetryDelaySeconds int `toml:"retryDelaySeconds"`
+}
+
+// TomlConfig holds the complete TOML configuration for fault remediation
+type TomlConfig struct {
+	// Template mount configuration
+	Template Template `toml:"template"`
+
+	// Multi-template configuration - map from RecommendedAction string to MaintenanceResource
+	RemediationActions map[string]MaintenanceResource `toml:"remediationActions"`
+
+	// Templates contains the actual template content keyed by filename
+	Templates map[string]string `toml:"templates"`
+
+	// Common configuration
+	UpdateRetry UpdateRetry `toml:"updateRetry"`
+
+	// MaxRemediationAttempts caps how many remediation attempts a single equivalence group
+	// may accumulate before the node returns to service. Attempts are counted, not retries: a
+	// value of 1 allows one attempt and no retry, 3 allows two retries after the first
+	// attempt. The count is reset when the node returns to service, which with post-remediation
+	// validation is when validation releases the node. Explicit cancellation resets it. It is
+	// unrelated to updateRetry.maxRetries, which retries a failing API update.
+	// Zero disables the cap (legacy behavior).
+	MaxRemediationAttempts int `toml:"maxRemediationAttempts"`
+}
+
+// Validate checks the configuration for consistency and completeness.
+//
+// Validation is performed in two deterministic passes over the remediation
+// actions (iterated in sorted order by action name) so that error reporting is
+// stable regardless of Go's randomized map iteration:
+//  1. Per-action validation: individual constraints that do not depend on other
+//     actions (EquivalenceGroup, template, scope, ImpactedEntityScope validity).
+//  2. Cross-action validation: constraints that require inspecting other
+//     actions (SupersedingEquivalenceGroups references).
+//
+// Running per-action checks first ensures that individually-invalid actions
+// surface their own error before any cross-reference error they may also
+// participate in.
+func (c *TomlConfig) Validate() error {
+	if c.MaxRemediationAttempts < 0 {
+		return fmt.Errorf("maxRemediationAttempts must be non-negative (got %d); use 0 to disable the cap",
+			c.MaxRemediationAttempts)
+	}
+
+	if err := c.validateTemplate(); err != nil {
+		return err
+	}
+
+	actionNames := sortedActionNames(c.RemediationActions)
+
+	for _, actionName := range actionNames {
+		if err := c.validateRemediationAction(actionName, c.RemediationActions[actionName]); err != nil {
+			return err
+		}
+	}
+
+	for _, actionName := range actionNames {
+		if err := c.validateSupersedingGroups(actionName, c.RemediationActions[actionName]); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func sortedActionNames(actions map[string]MaintenanceResource) []string {
+	names := make([]string, 0, len(actions))
+	for name := range actions {
+		names = append(names, name)
+	}
+
+	sort.Strings(names)
+
+	return names
+}
+
+func (c *TomlConfig) validateTemplate() error {
+	if c.Template.MountPath == "" {
+		return fmt.Errorf("template mountPath must be non-empty")
+	}
+
+	return nil
+}
+
+/*
+Per-action validation. Checks constraints that do not depend on other actions:
+- EquivalenceGroup must be non-empty.
+- templateFileName must be non-empty and reference an existing template file.
+- Scope must be valid and consistent with the namespace field.
+- If ImpactedEntityScope is set, the action must be COMPONENT_RESET or a
+custom (non-built-in) action, and the entity type must be in
+EntityTypeToResourceNames (i.e. partial draining is enabled for it).
+*/
+func (c *TomlConfig) validateRemediationAction(actionName string, resource MaintenanceResource) error {
+	if len(resource.EquivalenceGroup) == 0 {
+		return fmt.Errorf("action '%s' must have a non-empty EquivalenceGroup", actionName)
+	}
+
+	if err := validateResourceImpactedEntityScope(actionName, resource); err != nil {
+		return err
+	}
+
+	if resource.TemplateFileName == "" {
+		return fmt.Errorf("action '%s' must have a non-empty templateFileName", actionName)
+	}
+
+	if err := c.validateTemplateFileExists(actionName, resource.TemplateFileName); err != nil {
+		return err
+	}
+
+	return validateScope(actionName, resource.Scope, resource.Namespace)
+}
+
+/*
+Cross-action validation of SupersedingEquivalenceGroups:
+- Any SupersedingEquivalenceGroup must have a corresponding MaintenanceResource
+which cannot include an ImpactedEntityScope. In the future, we could update our
+SupersedingEquivalenceGroup logic to match the EquivalenceGroup (rather than
+require an exact EffectiveEquivalenceGroup match), however we will punt on this
+complexity since there's not a use-case for it.
+- The SupersedingEquivalenceGroups cannot include the EquivalenceGroup for the
+same MaintenanceResource.
+*/
+func (c *TomlConfig) validateSupersedingGroups(actionName string, resource MaintenanceResource) error {
+	for _, group := range resource.SupersedingEquivalenceGroups {
+		if err := validateOneSupersedingGroup(actionName, group, resource, c.RemediationActions); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func validateOneSupersedingGroup(actionName, group string, resource MaintenanceResource,
+	remediationActions map[string]MaintenanceResource,
+) error {
+	if group == resource.EquivalenceGroup {
+		return fmt.Errorf("action '%s': SupersedingEquivalenceGroup cannot include the EquivalenceGroup itself: %s",
+			actionName, group)
+	}
+
+	foundGroup := false
+
+	for _, name := range sortedActionNames(remediationActions) {
+		maintenanceResource := remediationActions[name]
+		if group != maintenanceResource.EquivalenceGroup {
+			continue
+		}
+
+		if len(maintenanceResource.ImpactedEntityScope) != 0 {
+			return fmt.Errorf("action '%s': superseding EquivalenceGroup %s cannot have an ImpactedEntityScope defined: %s",
+				actionName, maintenanceResource.EquivalenceGroup, maintenanceResource.ImpactedEntityScope)
+		}
+
+		foundGroup = true
+	}
+
+	if !foundGroup {
+		return fmt.Errorf("action '%s': superseding EquivalenceGroup %s must be defined in config",
+			actionName, group)
+	}
+
+	return nil
+}
+
+func validateResourceImpactedEntityScope(actionName string, resource MaintenanceResource) error {
+	if len(resource.ImpactedEntityScope) == 0 {
+		return nil
+	}
+
+	_, isBuiltinAction := protos.RecommendedAction_value[actionName]
+	if isBuiltinAction && actionName != protos.RecommendedAction_COMPONENT_RESET.String() {
+		return fmt.Errorf(
+			"built-in action '%s' cannot have an ImpactedEntityScope; "+
+				"only COMPONENT_RESET and custom actions support this", actionName)
+	}
+
+	if _, ok := model.EntityTypeToResourceNames[resource.ImpactedEntityScope]; !ok {
+		return fmt.Errorf("action '%s' cannot use ImpactedEntityScope '%s': entity type does not support partial draining",
+			actionName, resource.ImpactedEntityScope)
+	}
+
+	return nil
+}
+
+func (c *TomlConfig) validateTemplateFileExists(actionName, templateFileName string) error {
+	templatePath := filepath.Join(c.Template.MountPath, templateFileName)
+
+	_, err := os.Stat(templatePath)
+	if err == nil {
+		return nil
+	}
+
+	if os.IsNotExist(err) {
+		return fmt.Errorf(
+			"action '%s' references template file '%s' which does not exist at path '%s'",
+			actionName, templateFileName, templatePath,
+		)
+	}
+
+	return fmt.Errorf(
+		"action '%s' cannot access template file '%s' at path '%s': %w",
+		actionName, templateFileName, templatePath, err,
+	)
+}
+
+func validateScope(actionName, scope, namespace string) error {
+	switch scope {
+	case "", "Cluster":
+		return nil
+	case "Namespaced":
+		if namespace == "" {
+			return fmt.Errorf("action '%s' is Namespaced but no namespace is specified", actionName)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf(
+			"action '%s' has invalid scope '%s', must be 'Cluster' or 'Namespaced'",
+			actionName, scope,
+		)
+	}
+}

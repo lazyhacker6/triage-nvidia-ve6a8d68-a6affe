@@ -1,0 +1,2652 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package kubernetes
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"math"
+	"net/url"
+	"os"
+	"slices"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/platform-connectors/pkg/ringbuffer"
+)
+
+var (
+	k8sConnector *K8sConnector
+	clientSet    *fake.Clientset
+	ctx          context.Context
+
+	// One envtest API server for the whole package: the tests that assert on
+	// what the API server recorded (node resourceVersion, Event objects and
+	// counts) share it and keep to nodes of their own. Started in TestMain;
+	// a start failure is kept so those tests fail with the reason instead of
+	// a nil pointer.
+	sharedEnvtestCli *kubernetes.Clientset
+	sharedEnvtestErr error
+)
+
+// envtestClient returns the package's shared envtest client.
+func envtestClient(t *testing.T) *kubernetes.Clientset {
+	t.Helper()
+	require.NoError(t, sharedEnvtestErr, "envtest is not available; run make dev-env-setup and export KUBEBUILDER_ASSETS")
+
+	return sharedEnvtestCli
+}
+
+func TestMain(m *testing.M) {
+	clientSet = fake.NewSimpleClientset()
+	ctx = context.Background()
+	stopCh := make(chan struct{})
+	ringBuffer := ringbuffer.NewRingBuffer("k8sRingBuffer", ctx)
+	cfg := K8sConnectorConfig{
+		MaxNodeConditionMessageLength: 1024,
+		CompactedHealthEventMsgLen:    72,
+	}
+	k8sConnector = NewK8sConnector(clientSet, ringBuffer, stopCh, ctx, cfg)
+
+	sharedEnv := &envtest.Environment{}
+	if restCfg, err := sharedEnv.Start(); err != nil {
+		sharedEnvtestErr = err
+	} else if sharedEnvtestCli, err = kubernetes.NewForConfig(restCfg); err != nil {
+		sharedEnvtestErr = err
+	}
+
+	exitVal := m.Run()
+
+	if sharedEnvtestErr == nil {
+		_ = sharedEnv.Stop()
+	}
+
+	os.Exit(exitVal)
+}
+
+type healthConditionList struct {
+	healthEvent                 *protos.HealthEvent
+	ExpectedOutputReason        string
+	ExpectedOutputMessage       string
+	ExpectedHealthFailureStatus string
+	ExpectedOutputConditionType string
+}
+
+func getNode() *corev1.Node {
+	// Create a fake node
+	fakeNode := &corev1.Node{
+		Name: "testnode",
+		Status: corev1.NodeStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+			Conditions: []corev1.NodeCondition{
+				{
+					Type:               corev1.NodeReady,
+					Status:             corev1.ConditionTrue,
+					LastHeartbeatTime:  metav1.Now(),
+					LastTransitionTime: metav1.Now(),
+					Reason:             "KubeletReady",
+					Message:            "kubelet is posting ready status",
+				},
+				{
+					Type:               corev1.NodeMemoryPressure,
+					Status:             corev1.ConditionFalse,
+					LastHeartbeatTime:  metav1.Now(),
+					LastTransitionTime: metav1.Now(),
+					Reason:             "KubeletHasSufficientMemory",
+					Message:            "kubelet has sufficient memory available",
+				},
+				{
+					Type:               corev1.NodeDiskPressure,
+					Status:             corev1.ConditionFalse,
+					LastHeartbeatTime:  metav1.Now(),
+					LastTransitionTime: metav1.Now(),
+					Reason:             "KubeletHasNoDiskPressure",
+					Message:            "kubelet has no disk pressure",
+				},
+				{
+					Type:               corev1.NodeConditionType("GpuThermalWatch"),
+					Status:             corev1.ConditionFalse,
+					LastHeartbeatTime:  metav1.Now(),
+					LastTransitionTime: metav1.Now(),
+					Reason:             "GpuThermalWatchIsHealthy",
+					Message:            "No Health Failures",
+				},
+				{
+					Type:               corev1.NodeConditionType("GpuPcieWatch"),
+					Status:             corev1.ConditionFalse,
+					LastHeartbeatTime:  metav1.Now(),
+					LastTransitionTime: metav1.Now(),
+					Reason:             "GpuPcieWatchIsHealthy",
+					Message:            "No Health Failures",
+				},
+			},
+		},
+	}
+	return fakeNode
+}
+
+func TestK8sNodeConditions(t *testing.T) {
+	healthEventsList := []*healthConditionList{
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuPcieWatch",
+				IsHealthy:          true,
+				EntitiesImpacted:   []*protos.Entity{},
+				ErrorCode:          []string{},
+				IsFatal:            false,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "Pcie watch error on GPU 0",
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "No Health Failures",
+			ExpectedOutputReason:        "GpuPcieWatchIsHealthy",
+			ExpectedOutputConditionType: "GpuPcieWatch",
+			ExpectedHealthFailureStatus: "False",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          true,
+				Message:            "",
+				EntitiesImpacted:   []*protos.Entity{},
+				ErrorCode:          []string{},
+				IsFatal:            false,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_NONE,
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "No Health Failures",
+			ExpectedOutputReason:        "GpuXidErrorIsHealthy",
+			ExpectedOutputConditionType: "GpuXidError",
+			ExpectedHealthFailureStatus: "False",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuPcieWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"DCGM_FR_PCI_REPLAY_RATE"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "Pcie error on GPU 0",
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:DCGM_FR_PCI_REPLAY_RATE GPU:0 Pcie error on GPU 0 Recommended Action=UNKNOWN;",
+			ExpectedOutputReason:        "GpuPcieWatchIsNotHealthy",
+			ExpectedOutputConditionType: "GpuPcieWatch",
+			ExpectedHealthFailureStatus: "True",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				Message:            "",
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"44"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:44 GPU:0 Recommended Action=CONTACT_SUPPORT;",
+			ExpectedOutputReason:        "GpuXidErrorIsNotHealthy",
+			ExpectedOutputConditionType: "GpuXidError",
+			ExpectedHealthFailureStatus: "True",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				Message:            "",
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"45"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_NONE,
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:44 GPU:0 Recommended Action=CONTACT_SUPPORT;ErrorCode:45 GPU:0 Recommended Action=NONE;",
+			ExpectedOutputReason:        "GpuXidErrorIsNotHealthy",
+			ExpectedOutputConditionType: "GpuXidError",
+			ExpectedHealthFailureStatus: "True",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuThermalWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"DCGM_FR_CLOCK_THROTTLE_THERMAL"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "Thermal watch error on GPU 0",
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:DCGM_FR_CLOCK_THROTTLE_THERMAL GPU:0 Thermal watch error on GPU 0 Recommended Action=UNKNOWN;",
+			ExpectedOutputReason:        "GpuThermalWatchIsNotHealthy",
+			ExpectedOutputConditionType: "GpuThermalWatch",
+			ExpectedHealthFailureStatus: "True",
+		},
+	}
+	fakeNode := getNode()
+	_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to create node", "error", err)
+		os.Exit(1)
+	}
+	for testCase, healthEvent := range healthEventsList {
+		healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+		healthEvents.Events = append(healthEvents.Events, healthEvent.healthEvent)
+		err := k8sConnector.ProcessBatch(ctx, &healthEvents)
+		if err != nil {
+			t.Errorf("Failed to process healthEvent for testCase %d with err %s", testCase, err)
+		}
+		node, err := clientSet.CoreV1().Nodes().Get(ctx, fakeNode.Name, metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Failed to get node for testCase %d with err %s", testCase, err)
+		}
+
+		conditions := node.Status.Conditions
+		conditionFound := false
+		for _, condition := range conditions {
+			if string(condition.Type) == healthEvent.ExpectedOutputConditionType {
+				conditionFound = true
+				if healthEvent.ExpectedHealthFailureStatus != string(condition.Status) {
+					t.Errorf("Testcase %d. Node Condition Status %s is not matching with expectedConditionStatus %s", testCase, string(condition.Status), healthEvent.ExpectedHealthFailureStatus)
+				}
+				if healthEvent.ExpectedOutputMessage != string(condition.Message) {
+					t.Errorf("Testcase %d. Node Condition Message  %s is not matching with expectedConditionMessage %s", testCase, string(condition.Message), healthEvent.ExpectedOutputMessage)
+				}
+				if healthEvent.ExpectedOutputReason != string(condition.Reason) {
+					t.Errorf("Testcase %d. Node Condition Reason %s is not matching with expectedConditionReason %s", testCase, string(condition.Reason), healthEvent.ExpectedOutputReason)
+				}
+				break
+			}
+		}
+		if conditionFound == false {
+			t.Errorf("Testcase %d nodeCondition is missing", testCase)
+		}
+	}
+	err = clientSet.CoreV1().Nodes().Delete(ctx, fakeNode.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Errorf("Failed to delete  node with err %s", err)
+	}
+}
+
+func TestK8sNodeEvents(t *testing.T) {
+	healthEventsList := []*healthConditionList{
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuPcieWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"DCGM_FR_PCI_REPLAY_RATE"},
+				IsFatal:            false,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "PCI Replay Rate error on GPU 0",
+			},
+			ExpectedOutputMessage:       "ErrorCode:DCGM_FR_PCI_REPLAY_RATE GPU:0 PCI Replay Rate error on GPU 0 Recommended Action=UNKNOWN;",
+			ExpectedOutputReason:        "GpuPcieWatchIsNotHealthy",
+			ExpectedOutputConditionType: "GpuPcieWatch",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuThermalWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"DCGM_FR_CLOCK_THROTTLE_THERMAL"},
+				IsFatal:            false,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "Thermal error on GPU 0",
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:DCGM_FR_CLOCK_THROTTLE_THERMAL GPU:0 Thermal error on GPU 0 Recommended Action=UNKNOWN;",
+			ExpectedOutputReason:        "GpuThermalWatchIsNotHealthy",
+			ExpectedOutputConditionType: "GpuThermalWatch",
+		},
+		{
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuThermalWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"DCGM_FR_CLOCK_THROTTLE_THERMAL"},
+				IsFatal:            false,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_UNKNOWN,
+				Message:            "Thermal error on GPU 0",
+				NodeName:           "testnode",
+			},
+			ExpectedOutputMessage:       "ErrorCode:DCGM_FR_CLOCK_THROTTLE_THERMAL GPU:0 Thermal error on GPU 0 Recommended Action=UNKNOWN;",
+			ExpectedOutputReason:        "GpuThermalWatchIsNotHealthy",
+			ExpectedOutputConditionType: "GpuThermalWatch",
+		},
+	}
+	fakeNode := getNode()
+	_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+	if err != nil {
+		slog.ErrorContext(ctx, "Failed to create node", "error", err)
+		os.Exit(1)
+	}
+
+	healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+	for _, event := range healthEventsList {
+		healthEvents.Events = append(healthEvents.Events, event.healthEvent)
+	}
+	err = k8sConnector.ProcessBatch(ctx, &healthEvents)
+	if err != nil {
+		t.Errorf("Failed to process healthEvents with err %s", err)
+	}
+	events, _ := clientSet.CoreV1().Events("").List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("involvedObject.kind=Node,involvedObject.name=%s", fakeNode.Name),
+	})
+
+	for testCase, healthEvent := range healthEventsList {
+		conditionFound := false
+		for _, event := range events.Items {
+			if event.Type == healthEvent.ExpectedOutputConditionType {
+				conditionFound = true
+
+				if healthEvent.ExpectedOutputMessage != string(event.Message) {
+					t.Errorf("Testcase %d. Node event Message  %s is not matching with expectedEventMessage %s", testCase, string(event.Message), healthEvent.ExpectedOutputMessage)
+				}
+				if healthEvent.ExpectedOutputReason != string(event.Reason) {
+					t.Errorf("Testcase %d. Node event Reason %s is not matching with expectedEventReason %s", testCase, string(event.Reason), healthEvent.ExpectedOutputReason)
+				}
+			}
+		}
+		if conditionFound == false {
+			t.Errorf("Testcase %d nodeEvent is missing", testCase)
+		}
+	}
+	err = clientSet.CoreV1().Nodes().Delete(ctx, fakeNode.Name, metav1.DeleteOptions{})
+	if err != nil {
+		t.Errorf("Failed to delete  node with err %s", err)
+	}
+}
+
+func TestParseMessages(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected []string
+	}{
+		{"", nil},
+		{"message1;", []string{"message1"}},
+		{"message1;message2;", []string{"message1", "message2"}},
+		{"message1;message2;...", []string{"message1", "message2"}},
+		// Recovery sentinel must be recognized in any form so a non-canonical
+		// recovery message is never resurrected as a phantom fault.
+		{NoHealthFailureMsg, nil},
+		{"No health failures", nil},
+		{"No health failures;", nil},
+		{"no health failures", nil},
+		{"  No Health Failures  ", nil},
+		{"No health failures;message2;", []string{"message2"}},
+	}
+
+	for i, test := range tests {
+		result := parseMessages(test.input)
+		assert.Equal(t, test.expected, result, "Test %d", i)
+	}
+}
+
+func TestAddMessageIfNotExist(t *testing.T) {
+	tests := []struct {
+		messages []string
+		event    *protos.HealthEvent
+		expected []string
+	}{
+		{
+			messages: []string{},
+			event: &protos.HealthEvent{
+				ErrorCode:         []string{"E001"},
+				EntitiesImpacted:  []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				Message:           "msg1",
+				RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+				NodeName:          "testnode",
+			},
+			expected: []string{"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET"},
+		},
+		{
+			messages: []string{"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET"},
+			event: &protos.HealthEvent{
+				ErrorCode:         []string{"E002"},
+				EntitiesImpacted:  []*protos.Entity{{EntityType: "GPU", EntityValue: "1"}},
+				Message:           "msg2",
+				RecommendedAction: protos.RecommendedAction_RESTART_VM,
+				NodeName:          "testnode",
+			},
+			expected: []string{
+				"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET",
+				"ErrorCode:E002 GPU:1 msg2 Recommended Action=RESTART_VM",
+			},
+		},
+		{
+			messages: []string{"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET"},
+			event: &protos.HealthEvent{
+				ErrorCode:         []string{"E001"},
+				EntitiesImpacted:  []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				Message:           "msg1",
+				RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+				NodeName:          "testnode",
+			},
+			expected: []string{"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET"},
+		},
+		{
+			messages: []string{
+				"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET",
+				"ErrorCode:E002 GPU:1 msg2 Recommended Action=RESTART_VM",
+			},
+			event: &protos.HealthEvent{
+				ErrorCode:         []string{"E002"},
+				EntitiesImpacted:  []*protos.Entity{{EntityType: "GPU", EntityValue: "1"}},
+				Message:           "msg2",
+				RecommendedAction: protos.RecommendedAction_RESTART_VM,
+				NodeName:          "testnode",
+			},
+			expected: []string{
+				"ErrorCode:E001 GPU:0 msg1 Recommended Action=COMPONENT_RESET",
+				"ErrorCode:E002 GPU:1 msg2 Recommended Action=RESTART_VM",
+			},
+		},
+	}
+
+	for i, test := range tests {
+		result := k8sConnector.addMessageIfNotExist(test.messages, test.event)
+		assert.Equal(t, test.expected, result, "Test %d", i)
+	}
+}
+
+func convertToEntityPointers(entities []protos.Entity) []*protos.Entity {
+	entityPointers := make([]*protos.Entity, len(entities))
+	for i := range entities {
+		entityPointers[i] = &entities[i]
+	}
+	return entityPointers
+}
+
+func TestRemoveImpactedEntitiesMessages(t *testing.T) {
+	tests := []struct {
+		messages         []string
+		EntitiesImpacted []protos.Entity
+		checkName        string
+		expected         []string
+		componentClass   string
+		NodeName         string
+	}{
+		{
+			messages:         []string{" GPU:0 error", " GPU:1 error"},
+			EntitiesImpacted: []protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			checkName:        "GpuErrorCheck",
+			expected:         []string{" GPU:1 error"},
+			componentClass:   "GPU",
+			NodeName:         "testnode",
+		},
+		{
+			messages:         []string{"NIC:eth0 error", "NIC:eth1 error"},
+			EntitiesImpacted: []protos.Entity{{EntityType: "NIC", EntityValue: "eth0"}},
+			checkName:        "InfiniBandErrorCheck",
+			expected:         []string{"NIC:eth1 error"},
+			componentClass:   "NIC",
+			NodeName:         "testnode",
+		},
+		{
+			messages:         []string{" NVSWITCH:0 error", " NVSWITCH:1 error"},
+			EntitiesImpacted: []protos.Entity{{EntityType: "NVSWITCH", EntityValue: "0"}},
+			checkName:        "NvswitchErrorFromKmsgWatch",
+			expected:         []string{" NVSWITCH:1 error"},
+			componentClass:   "NVSWITCH",
+			NodeName:         "testnode",
+		},
+		{
+			messages:         []string{" GPU:0 error", " GPU:1 error"},
+			EntitiesImpacted: []protos.Entity{{EntityType: "GPU", EntityValue: "1"}},
+			checkName:        "SomeOtherCheck",
+			expected:         []string{" GPU:0 error"},
+			componentClass:   "GPU",
+			NodeName:         "testnode",
+		},
+
+		{
+			messages:         []string{" GPU:0 error", " GPU:1 error"},
+			EntitiesImpacted: []protos.Entity{{EntityType: "GPU", EntityValue: "2"}},
+			checkName:        "GpuErrorCheck",
+			expected:         []string{" GPU:0 error", " GPU:1 error"},
+			componentClass:   "GPU",
+			NodeName:         "testnode",
+		},
+	}
+
+	for i, test := range tests {
+		result := k8sConnector.removeImpactedEntitiesMessagesScoped(
+			test.messages, convertToEntityPointers(test.EntitiesImpacted), nil,
+		)
+		assert.Equal(t, test.expected, result, "Test %d", i)
+	}
+}
+
+// TestRemoveImpactedEntitiesMessagesScoped covers the cancellation path where
+// a healthy event carries an ErrorCode that should narrow the clearer to a
+// specific fault, leaving unrelated faults on the same entity intact.
+func TestRemoveImpactedEntitiesMessagesScoped(t *testing.T) {
+	tests := []struct {
+		name       string
+		messages   []string
+		entities   []protos.Entity
+		errorCodes []string
+		expected   []string
+	}{
+		{
+			name: "empty errorCodes preserves legacy behaviour: clear all matching entities",
+			messages: []string{
+				"ErrorCode:163 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+				"ErrorCode:163 GPU:1 boom Recommended Action=RESTART_VM;",
+			},
+			entities:   []protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			errorCodes: nil,
+			expected: []string{
+				"ErrorCode:163 GPU:1 boom Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "scoped clear: only matching ErrorCode on matching entity is removed",
+			messages: []string{
+				"ErrorCode:163 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+				"ErrorCode:163 GPU:1 boom Recommended Action=RESTART_VM;",
+			},
+			entities:   []protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			errorCodes: []string{"163"},
+			expected: []string{
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+				"ErrorCode:163 GPU:1 boom Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "scoped clear: non-matching ErrorCode keeps every message",
+			messages: []string{
+				"ErrorCode:163 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+			},
+			entities:   []protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			errorCodes: []string{"999"},
+			expected: []string{
+				"ErrorCode:163 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "scoped clear: multiple errorCodes all considered",
+			messages: []string{
+				"ErrorCode:163 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:43 GPU:0 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+			},
+			entities:   []protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			errorCodes: []string{"163", "43"},
+			expected: []string{
+				"ErrorCode:98 GPU:0 unrelated Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "composite NIC identity: shared port on different NIC is not cleared",
+			messages: []string{
+				"NIC:mlx5_0 NICPort:1 link down Recommended Action=RESTART_VM;",
+				"NIC:mlx5_1 NICPort:1 link down Recommended Action=RESTART_VM;",
+			},
+			entities: []protos.Entity{
+				{EntityType: "NIC", EntityValue: "mlx5_1"},
+				{EntityType: "NICPort", EntityValue: "1"},
+			},
+			errorCodes: nil,
+			expected: []string{
+				"NIC:mlx5_0 NICPort:1 link down Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "scoped clear: composite entity identity preserves unrelated code",
+			messages: []string{
+				"ErrorCode:163 PCI:0000:03:00 GPU_UUID:GPU-1 boom Recommended Action=RESTART_VM;",
+				"ErrorCode:98 PCI:0000:03:00 GPU_UUID:GPU-1 unrelated Recommended Action=RESTART_VM;",
+				"ErrorCode:163 PCI:0000:04:00 GPU_UUID:GPU-2 boom Recommended Action=RESTART_VM;",
+			},
+			entities: []protos.Entity{
+				{EntityType: "PCI", EntityValue: "0000:03:00"},
+				{EntityType: "GPU_UUID", EntityValue: "GPU-1"},
+			},
+			errorCodes: []string{"163"},
+			expected: []string{
+				"ErrorCode:98 PCI:0000:03:00 GPU_UUID:GPU-1 unrelated Recommended Action=RESTART_VM;",
+				"ErrorCode:163 PCI:0000:04:00 GPU_UUID:GPU-2 boom Recommended Action=RESTART_VM;",
+			},
+		},
+		{
+			name: "Tier 1 truncated entity cleared by healthy event",
+			messages: []string{
+				"ErrorCode:POD_STUCK_AFTER_DELETION v1/Pod:prod/61f345d08c9a432a-134... Recommended Action=RESTART_VM;",
+				"ErrorCode:48 GPU:1 some error Recommended Action=DRAIN;",
+			},
+			entities:   []protos.Entity{{EntityType: "v1/Pod", EntityValue: "prod/61f345d08c9a432a-134a464884734f90"}},
+			errorCodes: []string{"POD_STUCK_AFTER_DELETION"},
+			expected: []string{
+				"ErrorCode:48 GPU:1 some error Recommended Action=DRAIN;",
+			},
+		},
+		{
+			name: "Tier 2 byte-truncated entity cleared by healthy event",
+			messages: []string{
+				"ErrorCode:POD_STUCK v1/Pod:prod/61f345d08c9a432a-134",
+			},
+			entities:   []protos.Entity{{EntityType: "v1/Pod", EntityValue: "prod/61f345d08c9a432a-134a464884734f90"}},
+			errorCodes: nil,
+			expected:   nil,
+		},
+		{
+			name: "complete shorter entity NOT falsely cleared by longer entity healthy event",
+			messages: []string{
+				"ErrorCode:48 v1/Pod:prod/app-a error Recommended Action=DRAIN;",
+				"ErrorCode:48 v1/Pod:prod/app-abcdef error Recommended Action=DRAIN;",
+			},
+			entities:   []protos.Entity{{EntityType: "v1/Pod", EntityValue: "prod/app-abcdef"}},
+			errorCodes: nil,
+			expected: []string{
+				"ErrorCode:48 v1/Pod:prod/app-a error Recommended Action=DRAIN;",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := k8sConnector.removeImpactedEntitiesMessagesScoped(
+				tc.messages, convertToEntityPointers(tc.entities), tc.errorCodes,
+			)
+			assert.Equal(t, tc.expected, result)
+		})
+	}
+}
+
+func TestRecoveryEntities(t *testing.T) {
+	tests := []struct {
+		name     string
+		event    *protos.HealthEvent
+		expected []string
+	}{
+		{
+			name: "GPU replacement uses stable slot identity",
+			event: &protos.HealthEvent{
+				ComponentClass: "GPU",
+				EntitiesImpacted: []*protos.Entity{
+					{EntityType: "GPU", EntityValue: "0"},
+					{EntityType: "PCI", EntityValue: "0000:18:00.0"},
+					{EntityType: "GPU_UUID", EntityValue: "GPU-new"},
+				},
+			},
+			expected: []string{"GPU:0", "PCI:0000:18:00.0"},
+		},
+		{
+			name: "UUID remains when no stable GPU identity exists",
+			event: &protos.HealthEvent{
+				ComponentClass: "GPU",
+				EntitiesImpacted: []*protos.Entity{
+					{EntityType: "GPU_UUID", EntityValue: "GPU-new"},
+				},
+			},
+			expected: []string{"GPU_UUID:GPU-new"},
+		},
+		{
+			name: "non-GPU entities are unchanged",
+			event: &protos.HealthEvent{
+				ComponentClass: "NIC",
+				EntitiesImpacted: []*protos.Entity{
+					{EntityType: "PCI", EntityValue: "0000:18:00.0"},
+					{EntityType: "GPU_UUID", EntityValue: "GPU-new"},
+				},
+			},
+			expected: []string{"PCI:0000:18:00.0", "GPU_UUID:GPU-new"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			entities := recoveryEntities(tc.event)
+			actual := make([]string, 0, len(entities))
+			for _, entity := range entities {
+				actual = append(actual, entity.EntityType+":"+entity.EntityValue)
+			}
+			assert.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func TestGPUReplacementRecoveryClearsOldUUIDCondition(t *testing.T) {
+	messages := []string{
+		"ErrorCode:DCGM_FR_POWER_UN GPU:0 PCI:0000:18:00.0 GPU_UUID:GPU-old Recommended Action=CONTACT_SUPPORT",
+	}
+	events := []*protos.HealthEvent{
+		{
+			ComponentClass: "GPU",
+			IsHealthy:      true,
+			ErrorCode:      []string{"DCGM_FR_POWER_UN"},
+			EntitiesImpacted: []*protos.Entity{
+				{EntityType: "GPU", EntityValue: "0"},
+				{EntityType: "PCI", EntityValue: "0000:18:00.0"},
+				{EntityType: "GPU_UUID", EntityValue: "GPU-new"},
+			},
+		},
+	}
+
+	assert.Empty(t, k8sConnector.aggregateEventMessages(messages, events))
+}
+
+func TestLegacyGPURecovery(t *testing.T) {
+	gpu0 := []*protos.Entity{
+		{EntityType: "GPU", EntityValue: "0"},
+		{EntityType: "PCI", EntityValue: "0000:0f:00.0"},
+		{EntityType: "GPU_UUID", EntityValue: "GPU-abc"},
+	}
+
+	tests := []struct {
+		name       string
+		class      string
+		entities   []*protos.Entity
+		errorCodes []string
+		messages   []string
+		expected   []string
+	}{
+		{
+			name: "legacy GPU-only message clears, other GPU kept",
+			messages: []string{
+				"ErrorCode:48 GPU:0 fault Recommended Action=RESTART_VM;",
+				"ErrorCode:48 GPU:1 fault Recommended Action=RESTART_VM;",
+			},
+			expected: []string{"ErrorCode:48 GPU:1 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "conflicting PCI kept",
+			messages: []string{"ErrorCode:48 GPU:0 PCI:0000:1a:00.0 fault Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 GPU:0 PCI:0000:1a:00.0 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name: "legacy entry clears, conflicting modern entry kept",
+			messages: []string{
+				"ErrorCode:48 GPU:0 fault Recommended Action=RESTART_VM;",
+				"ErrorCode:49 GPU:0 PCI:0000:1a:00.0 fault Recommended Action=RESTART_VM;",
+			},
+			expected: []string{"ErrorCode:49 GPU:0 PCI:0000:1a:00.0 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "PCI in diagnostic text does not block recovery",
+			messages: []string{"ErrorCode:48 GPU:0 cannot read PCI: configuration Recommended Action=RESTART_VM;"},
+			expected: nil,
+		},
+		{
+			name:     "cut PCI token kept",
+			messages: []string{"ErrorCode:48 GPU:0 PCI:"},
+			expected: []string{"ErrorCode:48 GPU:0 PCI:"},
+		},
+		{
+			name:     "GPU token inside another type kept",
+			messages: []string{"ErrorCode:48 OTHERGPU:0 fault Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 OTHERGPU:0 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "GPU only in diagnostic text kept",
+			messages: []string{"ErrorCode:48 GPU:1 comparison with GPU:0 failed Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 GPU:1 comparison with GPU:0 failed Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "GPU index prefix kept",
+			messages: []string{"ErrorCode:48 GPU:01 fault Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 GPU:01 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:       "error code scoping kept",
+			errorCodes: []string{"48"},
+			messages: []string{
+				"ErrorCode:48 GPU:0 fault Recommended Action=RESTART_VM;",
+				"ErrorCode:98 GPU:0 other Recommended Action=RESTART_VM;",
+			},
+			expected: []string{"ErrorCode:98 GPU:0 other Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "legacy entry without diagnostic text clears",
+			messages: []string{"ErrorCode:48 GPU:0 Recommended Action=RESTART_VM;"},
+			expected: nil,
+		},
+		{
+			name:     "later GPU mention does not override leading GPU",
+			messages: []string{"ErrorCode:48 GPU:1 details:comparison GPU:0 failed Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 GPU:1 details:comparison GPU:0 failed Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:     "entry cut before the PCI colon kept",
+			messages: []string{"ErrorCode:48 GPU:0 PC"},
+			expected: []string{"ErrorCode:48 GPU:0 PC"},
+		},
+		{
+			name: "entry cut inside the GPU index kept",
+			entities: []*protos.Entity{
+				{EntityType: "GPU", EntityValue: "1"},
+				{EntityType: "PCI", EntityValue: "0000:01:00.0"},
+			},
+			messages: []string{"ErrorCode:48 GPU:1"},
+			expected: []string{"ErrorCode:48 GPU:1"},
+		},
+		{
+			name:     "PCI-only recovery kept",
+			entities: []*protos.Entity{{EntityType: "PCI", EntityValue: "0000:0f:00.0"}},
+			messages: []string{"ErrorCode:48 GPU:0 fault Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 GPU:0 fault Recommended Action=RESTART_VM;"},
+		},
+		{
+			name:  "non-GPU recovery missing PCI kept",
+			class: "NIC",
+			entities: []*protos.Entity{
+				{EntityType: "NIC", EntityValue: "mlx5_0"},
+				{EntityType: "PCI", EntityValue: "0000:0f:00.0"},
+			},
+			messages: []string{"ErrorCode:48 NIC:mlx5_0 fault Recommended Action=RESTART_VM;"},
+			expected: []string{"ErrorCode:48 NIC:mlx5_0 fault Recommended Action=RESTART_VM;"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			event := &protos.HealthEvent{
+				ComponentClass:   "GPU",
+				IsHealthy:        true,
+				EntitiesImpacted: gpu0,
+				ErrorCode:        tc.errorCodes,
+			}
+			if tc.class != "" {
+				event.ComponentClass = tc.class
+			}
+
+			if tc.entities != nil {
+				event.EntitiesImpacted = tc.entities
+			}
+
+			actual := k8sConnector.aggregateEventMessages(tc.messages, []*protos.HealthEvent{event})
+			assert.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+// Entries cut inside their identity were written by earlier versions of the
+// connector (the writer no longer stores them), so the matcher must still
+// refuse to clear them on a recovery for another GPU.
+func TestLegacyGPURecoveryKeepsTruncatedModernEntries(t *testing.T) {
+	tests := []struct {
+		name     string
+		fragment string
+		gpu      string
+	}{
+		{name: "cut inside the GPU index", fragment: "ErrorCode:48 GPU:1", gpu: "1"},
+		{name: "cut before the PCI colon", fragment: "ErrorCode:48 GPU:0 PCI", gpu: "0"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var stored []string
+
+			for i := range 17 {
+				stored = append(stored,
+					fmt.Sprintf("ErrorCode:%d GPU:7 fault Recommended Action=RESTART_VM", 100+i))
+			}
+
+			stored = append(stored, tc.fragment)
+			require.Len(t, stored, 18)
+
+			event := &protos.HealthEvent{
+				ComponentClass: "GPU",
+				IsHealthy:      true,
+				EntitiesImpacted: []*protos.Entity{
+					{EntityType: "GPU", EntityValue: tc.gpu},
+					{EntityType: "PCI", EntityValue: "0000:01:00.0"},
+				},
+			}
+
+			assert.Equal(t, stored, k8sConnector.aggregateEventMessages(slices.Clone(stored), []*protos.HealthEvent{event}))
+		})
+	}
+}
+
+func TestUpdateHealthEventReason(t *testing.T) {
+	tests := []struct {
+		checkName string
+		isHealthy bool
+		expected  string
+	}{
+		{"GpuXidError", true, "GpuXidErrorIsHealthy"},
+		{"GpuXidError", false, "GpuXidErrorIsNotHealthy"},
+		{"XidBatchError", true, "XidBatchErrorIsHealthy"},
+		{"XidBatchError", false, "XidBatchErrorIsNotHealthy"},
+		{"GpuPcieWatch", true, "GpuPcieWatchIsHealthy"},
+		{"GpuPcieWatch", false, "GpuPcieWatchIsNotHealthy"},
+	}
+
+	for i, test := range tests {
+		result := k8sConnector.updateHealthEventReason(test.checkName, test.isHealthy)
+		if result != test.expected {
+			t.Errorf("Test %d failed: expected %s, got %s", i, test.expected, result)
+		}
+	}
+}
+
+func TestUpdateNodeCondition_StatusChange(t *testing.T) {
+	fixedTime := time.Date(2025, 1, 16, 5, 13, 23, 0, time.UTC)
+
+	healthEventsList := []protos.HealthEvent{
+		{
+			CheckName:          "GpuXidError",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			ErrorCode:          []string{"44"},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(fixedTime),
+			ComponentClass:     "gpu",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "XID44 error on GPU 0",
+			NodeName:           "testnode",
+		},
+		{
+			CheckName:          "InfiniBandErrorCheck",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "NIC", EntityValue: "mlx5_0"}},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(fixedTime),
+			ComponentClass:     "network",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "InfiniBand error on mlx5_0",
+			NodeName:           "testnode",
+		},
+		{
+			CheckName:          "NvswitchErrorFromKmsgWatch",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "NVSWITCH", EntityValue: "0"}},
+			ErrorCode:          []string{"SWITCH_ERROR"},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(fixedTime),
+			ComponentClass:     "nvswitch",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "Nvswitch error on nvswitch0",
+			NodeName:           "testnode",
+		},
+	}
+
+	for i := range healthEventsList {
+		healthEvent := &(healthEventsList)[i]
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+
+		conditionType := corev1.NodeConditionType(healthEvent.CheckName)
+		fakeNode := &corev1.Node{
+			Name: "testnode",
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{
+						Type:               conditionType,
+						Status:             corev1.ConditionFalse,
+						LastHeartbeatTime:  metav1.Time{Time: fixedTime.Add(-10 * time.Minute)},
+						LastTransitionTime: metav1.Time{Time: fixedTime.Add(-10 * time.Minute)},
+						Message:            NoHealthFailureMsg,
+					},
+				},
+			},
+		}
+		_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+		healthEvents.Events = append(healthEvents.Events, healthEvent)
+		_, err = k8sConnector.updateNodeConditions(ctx, healthEvents.Events)
+		if err != nil {
+			t.Errorf("updateNodeCondition failed: %v", err)
+		}
+
+		node, err := clientSet.CoreV1().Nodes().Get(ctx, "testnode", metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Failed to get node: %v", err)
+		}
+
+		conditionFound := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == conditionType {
+				conditionFound = true
+				if condition.Status != corev1.ConditionTrue {
+					t.Errorf("Expected condition status to be True for %s, got %v", conditionType, condition.Status)
+				}
+				expectedTime := fixedTime
+				actualTime := condition.LastTransitionTime.Time.UTC()
+				if !actualTime.Equal(expectedTime) {
+					t.Errorf("Expected LastTransitionTime to be updated to %v, got %v", expectedTime, actualTime)
+				}
+				break
+			}
+		}
+		if !conditionFound {
+			t.Errorf("Condition %s not found in node status", conditionType)
+		}
+
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+	}
+}
+
+func TestUpdateNodeCondition_NewCondition(t *testing.T) {
+	healthEventsList := []*protos.HealthEvent{
+		{
+			CheckName:          "GpuXidError",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			ErrorCode:          []string{"44"},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(time.Now()),
+			ComponentClass:     "gpu",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "XID44 error on GPU 0",
+			NodeName:           "testnode",
+		},
+		{
+			CheckName:          "InfiniBandErrorCheck",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "NIC", EntityValue: "mlx5_0"}},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(time.Now()),
+			ComponentClass:     "network",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "InfiniBand error on mlx5_0",
+			NodeName:           "testnode",
+		},
+		{
+			CheckName:          "NvswitchErrorFromKmsgWatch",
+			IsHealthy:          false,
+			EntitiesImpacted:   []*protos.Entity{{EntityType: "NVSWITCH", EntityValue: "0"}},
+			ErrorCode:          []string{"SWITCH_ERROR"},
+			IsFatal:            true,
+			GeneratedTimestamp: timestamppb.New(time.Now()),
+			ComponentClass:     "nvswitch",
+			RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+			Message:            "Nvswitch error on nvswitch0",
+			NodeName:           "testnode",
+		},
+	}
+
+	for _, healthEvent := range healthEventsList {
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+
+		fakeNode := &corev1.Node{
+			Name: "testnode",
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{},
+			},
+		}
+		_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		conditionType := corev1.NodeConditionType(healthEvent.CheckName)
+		healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+		healthEvents.Events = append(healthEvents.Events, healthEvent)
+		_, err = k8sConnector.updateNodeConditions(ctx, healthEvents.Events)
+		if err != nil {
+			t.Errorf("updateNodeCondition failed: %v", err)
+		}
+
+		node, err := clientSet.CoreV1().Nodes().Get(ctx, "testnode", metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Failed to get node: %v", err)
+		}
+
+		conditionFound := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == conditionType {
+				conditionFound = true
+				if condition.Status != corev1.ConditionTrue {
+					t.Errorf("Expected condition status to be True for %s, got %v", conditionType, condition.Status)
+				}
+				expectedMessage := k8sConnector.fetchHealthEventMessage(healthEvent)
+				if condition.Message != expectedMessage {
+					t.Errorf("Expected condition message to be %s, got %s", expectedMessage, condition.Message)
+				}
+				expectedReason := k8sConnector.updateHealthEventReason(healthEvent.CheckName, healthEvent.IsHealthy)
+				if condition.Reason != expectedReason {
+					t.Errorf("Expected condition reason to be %s, got %s", expectedReason, condition.Reason)
+				}
+				break
+			}
+		}
+		if !conditionFound {
+			t.Errorf("Condition %s not found in node status", conditionType)
+		}
+
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+	}
+}
+
+func TestUpdateNodeCondition_AddMessage(t *testing.T) {
+	healthEventsList := []struct {
+		conditionType   corev1.NodeConditionType
+		existingMsg     string
+		healthEvent     *protos.HealthEvent
+		expectedMessage string
+	}{
+		{
+			conditionType: "GpuXidError",
+			existingMsg:   "GPU:0 error",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "1"}},
+				ErrorCode:          []string{"45"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "gpu",
+				RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+				Message:            "XID45 error on GPU 1",
+				NodeName:           "testnode",
+			},
+			expectedMessage: "GPU:0 error;ErrorCode:45 GPU:1 XID45 error on GPU 1 Recommended Action=CONTACT_SUPPORT;",
+		},
+		{
+			conditionType: "EthernetErrorCheck",
+			existingMsg:   "NIC:eth0 error",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "EthernetErrorCheck",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "NIC", EntityValue: "eth1"}},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "network",
+				RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+				Message:            "error on eth1",
+				NodeName:           "testnode",
+			},
+			expectedMessage: "NIC:eth0 error;NIC:eth1 error on eth1 Recommended Action=CONTACT_SUPPORT;",
+		},
+		{
+			conditionType: "NvswitchErrorFromKmsgWatch",
+			existingMsg:   " nvswitch0 error",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "NvswitchErrorFromKmsgWatch",
+				IsHealthy:          false,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "NVSWITCH", EntityValue: "1"}},
+				ErrorCode:          []string{"SWITCH_ERROR"},
+				IsFatal:            true,
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				ComponentClass:     "nvswitch",
+				RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+				Message:            "Nvswitch error on nvswitch1",
+				NodeName:           "testnode",
+			},
+			expectedMessage: " nvswitch0 error;ErrorCode:SWITCH_ERROR NVSWITCH:1 Nvswitch error on nvswitch1 Recommended Action=CONTACT_SUPPORT;",
+		},
+	}
+
+	for _, testCase := range healthEventsList {
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+
+		fakeNode := &corev1.Node{
+			Name: "testnode",
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{
+						Type:               testCase.conditionType,
+						Status:             corev1.ConditionTrue,
+						LastHeartbeatTime:  metav1.Now(),
+						LastTransitionTime: metav1.Now(),
+						Message:            testCase.existingMsg,
+					},
+				},
+			},
+		}
+		_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+		healthEvents.Events = append(healthEvents.Events, testCase.healthEvent)
+		_, err = k8sConnector.updateNodeConditions(ctx, healthEvents.Events)
+		if err != nil {
+			t.Errorf("updateNodeCondition failed: %v", err)
+		}
+
+		node, err := clientSet.CoreV1().Nodes().Get(ctx, "testnode", metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Failed to get node: %v", err)
+		}
+
+		conditionFound := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == testCase.conditionType {
+				conditionFound = true
+				if condition.Message != testCase.expectedMessage {
+					t.Errorf("Expected condition message to be '%s', got '%s'", testCase.expectedMessage, condition.Message)
+				}
+				if condition.Status != corev1.ConditionTrue {
+					t.Errorf("Expected condition status to be True, got %v", condition.Status)
+				}
+				break
+			}
+		}
+		if !conditionFound {
+			t.Errorf("Condition %s not found in node status", testCase.conditionType)
+		}
+
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+	}
+}
+
+func TestUpdateNodeCondition_RemoveMessages(t *testing.T) {
+	testCases := []struct {
+		conditionType    corev1.NodeConditionType
+		existingMsg      string
+		entitiesImpacted []*protos.Entity
+		expectedMessage  string
+	}{
+		{
+			conditionType:    "GpuXidError",
+			existingMsg:      "GPU:0 error;GPU:1 error;",
+			entitiesImpacted: []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+			expectedMessage:  "GPU:1 error;",
+		},
+		{
+			conditionType:    "InfiniBandErrorCheck",
+			existingMsg:      "NIC:eth0 error;NIC:eth1 error;",
+			entitiesImpacted: []*protos.Entity{{EntityType: "NIC", EntityValue: "eth0"}},
+			expectedMessage:  "NIC:eth1 error;",
+		},
+		{
+			conditionType:    "NvswitchErrorFromKmsgWatch",
+			existingMsg:      "NVSWITCH:0 error;NVSWITCH:1 error;",
+			entitiesImpacted: []*protos.Entity{{EntityType: "NVSWITCH", EntityValue: "0"}},
+			expectedMessage:  "NVSWITCH:1 error;",
+		},
+	}
+
+	for index, testCase := range testCases {
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+
+		fakeNode := &corev1.Node{
+			Name: "testnode",
+			Status: corev1.NodeStatus{
+				Conditions: []corev1.NodeCondition{
+					{
+						Type:               testCase.conditionType,
+						Status:             corev1.ConditionTrue,
+						LastHeartbeatTime:  metav1.Now(),
+						LastTransitionTime: metav1.Now(),
+						Message:            testCase.existingMsg,
+					},
+				},
+			},
+		}
+		_, err := clientSet.CoreV1().Nodes().Create(ctx, fakeNode, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatalf("Failed to create node: %v", err)
+		}
+
+		healthEvent := &protos.HealthEvent{
+			CheckName:          string(testCase.conditionType),
+			IsHealthy:          true,
+			EntitiesImpacted:   testCase.entitiesImpacted,
+			GeneratedTimestamp: timestamppb.New(time.Now()),
+			NodeName:           "testnode",
+		}
+
+		healthEvents := protos.HealthEvents{Version: 1, Events: make([]*protos.HealthEvent, 0)}
+		healthEvents.Events = append(healthEvents.Events, healthEvent)
+
+		_, err = k8sConnector.updateNodeConditions(ctx, healthEvents.Events)
+		if err != nil {
+			t.Errorf("testcase %d updateNodeCondition failed: %v", index+1, err)
+		}
+
+		node, err := clientSet.CoreV1().Nodes().Get(ctx, "testnode", metav1.GetOptions{})
+		if err != nil {
+			t.Errorf("Failed to get node: %v", err)
+		}
+
+		conditionFound := false
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == testCase.conditionType {
+				conditionFound = true
+				if condition.Message != testCase.expectedMessage {
+					t.Errorf("testcase %d Expected condition message to be '%s', got '%s'", index+1, testCase.expectedMessage, condition.Message)
+				}
+
+				if condition.Status != corev1.ConditionTrue {
+					t.Errorf("testcase %d Expected condition status to be True, got %v", index+1, condition.Status)
+				}
+				break
+			}
+		}
+		if !conditionFound {
+			t.Errorf("testcase %d Condition %s not found in node status", index+1, testCase.conditionType)
+		}
+
+		_ = clientSet.CoreV1().Nodes().Delete(ctx, "testnode", metav1.DeleteOptions{})
+	}
+}
+
+func TestIsTemporaryError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		// Nil error
+		{
+			name:     "nil error should return false",
+			err:      nil,
+			expected: false,
+		},
+
+		// Context errors
+		{
+			name:     "context.DeadlineExceeded should be retryable",
+			err:      context.DeadlineExceeded,
+			expected: true,
+		},
+		{
+			name:     "context.Canceled should be retryable",
+			err:      context.Canceled,
+			expected: true,
+		},
+		{
+			name:     "wrapped context.DeadlineExceeded should be retryable",
+			err:      fmt.Errorf("operation failed: %w", context.DeadlineExceeded),
+			expected: true,
+		},
+
+		// Kubernetes API errors
+		{
+			name:     "timeout error should be retryable",
+			err:      apierrors.NewTimeoutError("operation timed out", 30),
+			expected: true,
+		},
+		{
+			name:     "server timeout error should be retryable",
+			err:      apierrors.NewServerTimeout(schema.GroupResource{Group: "", Resource: "nodes"}, "update", 30),
+			expected: true,
+		},
+		{
+			name:     "service unavailable error should be retryable",
+			err:      apierrors.NewServiceUnavailable("service temporarily unavailable"),
+			expected: true,
+		},
+		{
+			name:     "too many requests error should be retryable",
+			err:      apierrors.NewTooManyRequests("rate limit exceeded", 60),
+			expected: true,
+		},
+		{
+			name:     "internal server error should be retryable",
+			err:      apierrors.NewInternalError(fmt.Errorf("internal error")),
+			expected: true,
+		},
+		{
+			name:     "not found error should not be retryable",
+			err:      apierrors.NewNotFound(schema.GroupResource{Group: "", Resource: "nodes"}, "test-node"),
+			expected: false,
+		},
+		{
+			name:     "bad request error should not be retryable",
+			err:      apierrors.NewBadRequest("invalid request"),
+			expected: false,
+		},
+
+		// Network errors
+		{
+			name:     "network timeout error should be retryable",
+			err:      &timeoutError{timeout: true},
+			expected: true,
+		},
+		{
+			name:     "non-timeout network error should not be retryable",
+			err:      &timeoutError{timeout: false},
+			expected: false,
+		},
+
+		// Syscall errors
+		{
+			name:     "ECONNREFUSED should be retryable",
+			err:      syscall.ECONNREFUSED,
+			expected: true,
+		},
+		{
+			name:     "ECONNRESET should be retryable",
+			err:      syscall.ECONNRESET,
+			expected: true,
+		},
+		{
+			name:     "ECONNABORTED should be retryable",
+			err:      syscall.ECONNABORTED,
+			expected: true,
+		},
+		{
+			name:     "ETIMEDOUT should be retryable",
+			err:      syscall.ETIMEDOUT,
+			expected: true,
+		},
+		{
+			name:     "EHOSTUNREACH should be retryable",
+			err:      syscall.EHOSTUNREACH,
+			expected: true,
+		},
+		{
+			name:     "ENETUNREACH should be retryable",
+			err:      syscall.ENETUNREACH,
+			expected: true,
+		},
+		{
+			name:     "EPIPE should be retryable",
+			err:      syscall.EPIPE,
+			expected: true,
+		},
+		{
+			name:     "wrapped ECONNRESET should be retryable",
+			err:      fmt.Errorf("connection failed: %w", syscall.ECONNRESET),
+			expected: true,
+		},
+		{
+			name:     "EACCES should not be retryable",
+			err:      syscall.EACCES,
+			expected: false,
+		},
+
+		// io.EOF errors
+		{
+			name:     "io.EOF should be retryable",
+			err:      io.EOF,
+			expected: true,
+		},
+		{
+			name:     "wrapped io.EOF should be retryable",
+			err:      fmt.Errorf("read failed: %w", io.EOF),
+			expected: true,
+		},
+
+		// String-based HTTP/2 and connection errors
+		{
+			name:     "http2: client connection lost should be retryable",
+			err:      fmt.Errorf("http2: client connection lost"),
+			expected: true,
+		},
+		{
+			name:     "http2: server connection lost should be retryable",
+			err:      fmt.Errorf("http2: server connection lost"),
+			expected: true,
+		},
+		{
+			name:     "http2: connection closed should be retryable",
+			err:      fmt.Errorf("http2: connection closed"),
+			expected: true,
+		},
+		{
+			name:     "connection reset by peer should be retryable",
+			err:      fmt.Errorf("read: connection reset by peer"),
+			expected: true,
+		},
+		{
+			name:     "broken pipe should be retryable",
+			err:      fmt.Errorf("write: broken pipe"),
+			expected: true,
+		},
+		{
+			name:     "connection refused should be retryable",
+			err:      fmt.Errorf("dial tcp: connection refused"),
+			expected: true,
+		},
+		{
+			name:     "connection timed out should be retryable",
+			err:      fmt.Errorf("dial tcp: connection timed out"),
+			expected: true,
+		},
+		{
+			name:     "i/o timeout should be retryable",
+			err:      fmt.Errorf("Post \"https://example.com\": i/o timeout"),
+			expected: true,
+		},
+		{
+			name:     "network is unreachable should be retryable",
+			err:      fmt.Errorf("dial tcp: network is unreachable"),
+			expected: true,
+		},
+		{
+			name:     "host is unreachable should be retryable",
+			err:      fmt.Errorf("dial tcp: no route to host: host is unreachable"),
+			expected: true,
+		},
+
+		// TLS/SSL errors
+		{
+			name:     "tls: handshake timeout should be retryable",
+			err:      fmt.Errorf("tls: handshake timeout"),
+			expected: true,
+		},
+		{
+			name:     "tls: oversized record received should be retryable",
+			err:      fmt.Errorf("tls: oversized record received with length 65536"),
+			expected: true,
+		},
+		{
+			name:     "remote error: tls: should be retryable",
+			err:      fmt.Errorf("remote error: tls: bad certificate"),
+			expected: true,
+		},
+
+		// DNS errors
+		{
+			name:     "no such host should be retryable",
+			err:      fmt.Errorf("dial tcp: lookup example.com: no such host"),
+			expected: true,
+		},
+		{
+			name:     "dns: no answer should be retryable",
+			err:      fmt.Errorf("dns: no answer from server"),
+			expected: true,
+		},
+		{
+			name:     "temporary failure in name resolution should be retryable",
+			err:      fmt.Errorf("dial tcp: lookup example.com on 127.0.0.1:53: temporary failure in name resolution"),
+			expected: true,
+		},
+
+		// Load balancer and proxy errors
+		{
+			name:     "502 Bad Gateway should be retryable",
+			err:      fmt.Errorf("502 Bad Gateway"),
+			expected: true,
+		},
+		{
+			name:     "503 Service Unavailable should be retryable",
+			err:      fmt.Errorf("503 Service Unavailable"),
+			expected: true,
+		},
+		{
+			name:     "504 Gateway Timeout should be retryable",
+			err:      fmt.Errorf("504 Gateway Timeout"),
+			expected: true,
+		},
+
+		// Kubernetes-specific error patterns
+		{
+			name:     "server unable to handle request should be retryable",
+			err:      fmt.Errorf("the server is currently unable to handle the request"),
+			expected: true,
+		},
+		{
+			name:     "etcd cluster unavailable should be retryable",
+			err:      fmt.Errorf("etcd cluster is unavailable or misconfigured"),
+			expected: true,
+		},
+		{
+			name:     "unable to connect to server should be retryable",
+			err:      fmt.Errorf("unable to connect to the server: dial tcp 10.0.0.1:6443: connect: connection refused"),
+			expected: true,
+		},
+		{
+			name:     "server not ready should be retryable",
+			err:      fmt.Errorf("server is not ready to handle requests"),
+			expected: true,
+		},
+
+		// String EOF errors
+		{
+			name:     "string EOF should be retryable",
+			err:      fmt.Errorf("unexpected EOF"),
+			expected: true,
+		},
+
+		// Non-retryable errors
+		{
+			name:     "generic error should not be retryable",
+			err:      fmt.Errorf("some random error"),
+			expected: false,
+		},
+		{
+			name:     "permission denied should not be retryable",
+			err:      fmt.Errorf("permission denied"),
+			expected: false,
+		},
+		{
+			name:     "invalid argument should not be retryable",
+			err:      fmt.Errorf("invalid argument"),
+			expected: false,
+		},
+
+		// Complex error scenarios
+		{
+			name:     "nested http2 error in url.Error should be retryable",
+			err:      &url.Error{Op: "Get", URL: "https://example.com", Err: fmt.Errorf("http2: client connection lost")},
+			expected: true,
+		},
+		{
+			name:     "deeply nested retryable error should be retryable",
+			err:      fmt.Errorf("operation failed: %w", fmt.Errorf("network error: %w", syscall.ECONNRESET)),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isTemporaryError(tt.err)
+			if result != tt.expected {
+				t.Errorf("isTemporaryError(%v) = %v, expected %v", tt.err, result, tt.expected)
+			}
+		})
+	}
+}
+
+// timeoutError is a mock implementation of net.Error for testing
+type timeoutError struct {
+	timeout bool
+}
+
+func (e *timeoutError) Error() string {
+	if e.timeout {
+		return "operation timed out"
+	}
+	return "network error"
+}
+
+func (e *timeoutError) Timeout() bool {
+	return e.timeout
+}
+
+func (e *timeoutError) Temporary() bool {
+	return false
+}
+
+func TestUpdateNodeConditions_ErrorHandling(t *testing.T) {
+	tests := []struct {
+		name        string
+		nodeName    string
+		healthEvent *protos.HealthEvent
+		expectError bool
+		setupNode   bool
+	}{
+		{
+			name:     "node not found",
+			nodeName: "nonexistent-node",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				IsFatal:            true,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"48"},
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				NodeName:           "nonexistent-node",
+			},
+			expectError: true,
+			setupNode:   false,
+		},
+		{
+			name:     "empty node name",
+			nodeName: "",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				IsFatal:            true,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"48"},
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				NodeName:           "",
+			},
+			expectError: true,
+			setupNode:   false,
+		},
+		{
+			name:     "successful update with no existing conditions",
+			nodeName: "test-node-success",
+			healthEvent: &protos.HealthEvent{
+				CheckName:          "GpuXidError",
+				IsHealthy:          false,
+				IsFatal:            true,
+				EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+				ErrorCode:          []string{"48"},
+				GeneratedTimestamp: timestamppb.New(time.Now()),
+				NodeName:           "test-node-success",
+			},
+			expectError: false,
+			setupNode:   true,
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localCtx := context.Background()
+			localClientSet := fake.NewSimpleClientset()
+			stopCh := make(chan struct{})
+			defer close(stopCh)
+
+			ringBuffer := ringbuffer.NewRingBuffer(fmt.Sprintf("testRingBuffer-%d", i), localCtx)
+			connector := NewK8sConnector(localClientSet, ringBuffer, stopCh, localCtx, K8sConnectorConfig{
+				MaxNodeConditionMessageLength: 1024,
+				CompactedHealthEventMsgLen:    72,
+			})
+
+			if tt.setupNode {
+				node := &corev1.Node{
+					Name: tt.nodeName,
+				}
+				_, err := localClientSet.CoreV1().Nodes().Create(localCtx, node, metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+
+			healthEvents := &protos.HealthEvents{
+				Events: []*protos.HealthEvent{tt.healthEvent},
+			}
+
+			_, err := connector.updateNodeConditions(localCtx, healthEvents.Events)
+
+			if tt.expectError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+func TestProcessHealthEvents_StoreOnlyStrategy(t *testing.T) {
+	testCases := []struct {
+		name                   string
+		healthEvents           []*protos.HealthEvent
+		expectNodeConditions   bool
+		expectKubernetesEvents bool
+		description            string
+		expectedConditionType  string
+		expectedEventType      string
+	}{
+		{
+			name: "STORE_ONLY event should not create node condition",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuXidError",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{"79"},
+					IsFatal:            true,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "XID 79: GPU has fallen off the bus",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_STORE_ONLY,
+				},
+			},
+			expectNodeConditions:   false,
+			expectKubernetesEvents: false,
+			description:            "STORE_ONLY fatal event should not create node condition",
+		},
+		{
+			name: "STORE_AND_ANALYSE event should not create node condition",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuXidError",
+					Agent:              "gpu-health-monitor",
+					ComponentClass:     "GPU",
+					ErrorCode:          []string{"79"},
+					IsFatal:            true,
+					IsHealthy:          false,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "XID 79: GPU has fallen off the bus",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_STORE_AND_ANALYSE,
+				},
+			},
+			expectNodeConditions:   false,
+			expectKubernetesEvents: false,
+			description:            "STORE_AND_ANALYSE fatal event should not create node condition",
+		},
+		{
+			name: "STORE_ONLY non-fatal event should not create Kubernetes event",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuPcieWatch",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{"DCGM_FR_PCI_REPLAY_RATE"},
+					IsFatal:            false, // Non-fatal creates K8s events, not conditions
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_NONE,
+					Message:            "PCI replay rate warning on GPU 0",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_STORE_ONLY,
+				},
+			},
+			expectNodeConditions:   false,
+			expectKubernetesEvents: false,
+			description:            "STORE_ONLY non-fatal event should not create Kubernetes event",
+		},
+		{
+			name: "EXECUTE_REMEDIATION event should create node condition",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuXidError",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{"79"},
+					IsFatal:            true,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "XID 79: GPU has fallen off the bus",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_EXECUTE_REMEDIATION,
+				},
+			},
+			expectNodeConditions:   true,
+			expectKubernetesEvents: false,
+			description:            "EXECUTE_REMEDIATION fatal event should create node condition",
+			expectedConditionType:  "GpuXidError",
+			expectedEventType:      "",
+		},
+		{
+			name: "Mixed strategies - only EXECUTE_REMEDIATION should be processed",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuXidError",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{"79"},
+					IsFatal:            true,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "XID 79 on GPU 0",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_STORE_ONLY,
+				},
+				{
+					CheckName:          "GpuThermalWatch",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "1"}},
+					ErrorCode:          []string{"DCGM_FR_CLOCK_THROTTLE_THERMAL"},
+					IsFatal:            true,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "Thermal throttle on GPU 1",
+					NodeName:           "store-only-test-node",
+					ProcessingStrategy: protos.ProcessingStrategy_EXECUTE_REMEDIATION,
+				},
+			},
+			expectNodeConditions:   true,
+			expectKubernetesEvents: false,
+			description:            "Only EXECUTE_REMEDIATION events should create conditions",
+			expectedConditionType:  "GpuThermalWatch",
+			expectedEventType:      "",
+		},
+		{
+			name: "STORE_ONLY non fatal event should not create Kubernetes event",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuPowerWatch",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{""},
+					IsFatal:            false,
+					ProcessingStrategy: protos.ProcessingStrategy_STORE_ONLY,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "Power warning on GPU 0",
+					NodeName:           "store-only-test-node",
+				},
+			},
+			expectNodeConditions:   false,
+			expectKubernetesEvents: false,
+			description:            "STORE_ONLY non fatal event should not create Kubernetes event",
+			expectedConditionType:  "",
+			expectedEventType:      "",
+		},
+		{
+			name: "EXECUTE_REMEDIATION non fatal event should create Kubernetes event",
+			healthEvents: []*protos.HealthEvent{
+				{
+					CheckName:          "GpuPowerWatch",
+					IsHealthy:          false,
+					EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+					ErrorCode:          []string{""},
+					IsFatal:            false,
+					ProcessingStrategy: protos.ProcessingStrategy_EXECUTE_REMEDIATION,
+					GeneratedTimestamp: timestamppb.New(time.Now()),
+					ComponentClass:     "GPU",
+					RecommendedAction:  protos.RecommendedAction_CONTACT_SUPPORT,
+					Message:            "Power warning on GPU 0",
+					NodeName:           "store-only-test-node",
+				},
+			},
+			expectNodeConditions:   false,
+			expectKubernetesEvents: true,
+			description:            "EXECUTE_REMEDIATION non fatal event should create Kubernetes event",
+			expectedConditionType:  "",
+			expectedEventType:      "GpuPowerWatch",
+		},
+	}
+
+	for i, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			localCtx := context.Background()
+			localClientSet := fake.NewSimpleClientset()
+			stopCh := make(chan struct{})
+			defer close(stopCh)
+
+			ringBuffer := ringbuffer.NewRingBuffer(fmt.Sprintf("storeOnlyTestBuffer-%d", i), localCtx)
+			connector := NewK8sConnector(localClientSet, ringBuffer, stopCh, localCtx, K8sConnectorConfig{
+				MaxNodeConditionMessageLength: 1024,
+				CompactedHealthEventMsgLen:    72,
+			})
+
+			nodeName := "store-only-test-node"
+			fakeNode := &corev1.Node{
+				Name: nodeName,
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:               corev1.NodeReady,
+							Status:             corev1.ConditionTrue,
+							LastHeartbeatTime:  metav1.Now(),
+							LastTransitionTime: metav1.Now(),
+							Reason:             "KubeletReady",
+							Message:            "kubelet is posting ready status",
+						},
+					},
+				},
+			}
+			_, err := localClientSet.CoreV1().Nodes().Create(localCtx, fakeNode, metav1.CreateOptions{})
+			require.NoError(t, err, "Failed to create test node")
+
+			healthEvents := &protos.HealthEvents{
+				Version: 1,
+				Events:  tc.healthEvents,
+			}
+			err = connector.ProcessBatch(localCtx, healthEvents)
+			require.NoError(t, err, "ProcessBatch should not return error")
+
+			node, err := localClientSet.CoreV1().Nodes().Get(localCtx, nodeName, metav1.GetOptions{})
+			require.NoError(t, err, "Failed to get test node")
+
+			// Count NVSentinel-related conditions (excluding standard K8s conditions like NodeReady)
+			var nvsentinelConditions []corev1.NodeCondition
+			for _, condition := range node.Status.Conditions {
+				condType := string(condition.Type)
+				if condType != string(corev1.NodeReady) &&
+					condType != string(corev1.NodeMemoryPressure) &&
+					condType != string(corev1.NodeDiskPressure) &&
+					condType != string(corev1.NodePIDPressure) &&
+					condType != string(corev1.NodeNetworkUnavailable) {
+					nvsentinelConditions = append(nvsentinelConditions, condition)
+					t.Logf("Found NVSentinel condition: %s", condType)
+				}
+			}
+
+			if tc.expectNodeConditions {
+				require.NotEmpty(t, nvsentinelConditions,
+					"Expected at least one NVSentinel node condition, but got none")
+				assert.Equal(t, tc.expectedConditionType, string(nvsentinelConditions[0].Type),
+					"Expected condition type %s, got %s", tc.expectedConditionType, nvsentinelConditions[0].Type)
+			} else {
+				assert.Empty(t, nvsentinelConditions,
+					"Expected no NVSentinel node conditions for non-remediation events, got %d", len(nvsentinelConditions))
+			}
+
+			// Verify Kubernetes events
+			events, err := localClientSet.CoreV1().Events("").List(localCtx, metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("involvedObject.kind=Node,involvedObject.name=%s", nodeName),
+			})
+			require.NoError(t, err, "Failed to list events")
+
+			if tc.expectKubernetesEvents {
+				require.NotEmpty(t, events.Items,
+					"Expected at least one Kubernetes event, but got none")
+				assert.Equal(t, tc.expectedEventType, events.Items[0].Type,
+					"Expected event type %s, got %s", tc.expectedEventType, events.Items[0].Type)
+			} else {
+				assert.Empty(t, events.Items,
+					"Expected no Kubernetes events for non-remediation events, got %d", len(events.Items))
+			}
+
+			t.Logf("Test passed: %s", tc.description)
+		})
+	}
+}
+
+func TestCompactMessageField(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      string
+		maxLen   int
+		expected string
+	}{
+		{
+			name:     "Short message - no compaction needed",
+			msg:      "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 Link down Recommended Action=RESTART_VM",
+			maxLen:   128,
+			expected: "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 Link down Recommended Action=RESTART_VM",
+		},
+		{
+			name:     "Long diagnostic - only diagnostic text truncated",
+			msg:      "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 GPU 3's NvLink link 0 is currently down Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun diagnostics. Recommended Action=RESTART_VM",
+			maxLen:   80,
+			expected: "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 GPU 3's NvLink link 0 is currently down C... Recommended Action=RESTART_VM",
+		},
+		{
+			name:     "No Recommended Action marker - returned as-is",
+			msg:      "some unstructured message without the marker",
+			maxLen:   10,
+			expected: "some unstructured message without the marker",
+		},
+		{
+			name:     "Multiple entities preserved - only diagnostic truncated",
+			msg:      "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec GPU 3's NvLink link 0 is currently down Check DCGM and system logs for errors. Recommended Action=RESTART_VM",
+			maxLen:   128,
+			expected: "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec GPU 3's NvLink link 0 ... Recommended Action=RESTART_VM",
+		},
+		{
+			name:     "Identity exceeds maxLen - full identity preserved with no diagnostic",
+			msg:      "ErrorCode:POD_STUCK_AFTER_DELETION v1/Pod:prod/61f345d08c9a432a-134a464884734f90 Pod is stuck after deletion timeout Recommended Action=RESTART_VM",
+			maxLen:   72,
+			expected: "ErrorCode:POD_STUCK_AFTER_DELETION v1/Pod:prod/61f345d08c9a432a-134a464884734f90 ... Recommended Action=RESTART_VM",
+		},
+		{
+			name:     "Short entity types - identity fits within maxLen",
+			msg:      "ErrorCode:48 GPU:0 Xid error 48 on GPU 0 with some extra diagnostic text that makes it long Recommended Action=DRAIN",
+			maxLen:   72,
+			expected: "ErrorCode:48 GPU:0 Xid error 48 on GPU 0 with some extra diagnostic t... Recommended Action=DRAIN",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := compactMessageField(tc.msg, tc.maxLen)
+			assert.Equal(t, tc.expected, result)
+
+			if strings.Contains(tc.msg, recommendedActionMarker) {
+				assert.Contains(t, result, recommendedActionMarker,
+					"Recommended Action must always be preserved")
+			}
+		})
+	}
+}
+
+func TestIsStructuredEntityToken(t *testing.T) {
+	tests := []struct {
+		token    string
+		expected bool
+	}{
+		{"GPU:0", true},
+		{"PCI:0000:c1:00.0", true},
+		{"v1/Pod:prod/my-pod-name", true},
+		{"NIC:mlx5_0", true},
+		{"NVSWITCH:0", true},
+		{"IB:mlx5_0", true},
+		{"GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec", true},
+		{"ErrorCode:48", false},
+		{"ErrorCode:DCGM_FR_NVLINK_DOWN", false},
+		{"novalue:", false},
+		{":nokey", false},
+		{"nocolon", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.token, func(t *testing.T) {
+			assert.Equal(t, tc.expected, isStructuredEntityToken(tc.token))
+		})
+	}
+}
+
+func TestEntityMatchesMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      string
+		entity   *protos.Entity
+		expected bool
+	}{
+		{
+			name:     "Exact match with trailing space",
+			msg:      "ErrorCode:48 GPU:0 Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "GPU", EntityValue: "0"},
+			expected: true,
+		},
+		{
+			name:     "Exact match - PCI address",
+			msg:      "ErrorCode:48 GPU:0 PCI:0000:c1:00.0 Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "PCI", EntityValue: "0000:c1:00.0"},
+			expected: true,
+		},
+		{
+			name:     "No match - different entity value",
+			msg:      "ErrorCode:48 GPU:0 Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "GPU", EntityValue: "1"},
+			expected: false,
+		},
+		{
+			name:     "No match - different entity type",
+			msg:      "ErrorCode:48 GPU:0 Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "NIC", EntityValue: "0"},
+			expected: false,
+		},
+		{
+			name:     "Tier 1 truncated match - entity ends with ...",
+			msg:      "ErrorCode:POD_STUCK v1/Pod:prod/61f345d08c9a432a-134... Recommended Action=RESTART_VM",
+			entity:   &protos.Entity{EntityType: "v1/Pod", EntityValue: "prod/61f345d08c9a432a-134a464884734f90"},
+			expected: true,
+		},
+		{
+			name:     "Tier 2 truncated match - entity is last token (byte-truncated)",
+			msg:      "ErrorCode:POD_STUCK v1/Pod:prod/61f345d08c9a432a-134",
+			entity:   &protos.Entity{EntityType: "v1/Pod", EntityValue: "prod/61f345d08c9a432a-134a464884734f90"},
+			expected: true,
+		},
+		{
+			name:     "False positive guard - complete shorter entity must NOT match longer",
+			msg:      "ErrorCode:48 v1/Pod:prod/app-a Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "v1/Pod", EntityValue: "prod/app-abcdef"},
+			expected: false,
+		},
+		{
+			name:     "False positive guard - complete shorter entity before Recommended Action must NOT match longer",
+			msg:      "ErrorCode:48 v1/Pod:prod/app-a Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "v1/Pod", EntityValue: "prod/app-abcdef"},
+			expected: false,
+		},
+		{
+			name:     "Entity type prefix only with no value - no match",
+			msg:      "ErrorCode:48 GPU: Xid error Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "GPU", EntityValue: "0"},
+			expected: false,
+		},
+		{
+			name:     "Truncated PCI address match",
+			msg:      "ErrorCode:48 GPU:3 PCI:0000:c4:00... Recommended Action=RESTART_VM",
+			entity:   &protos.Entity{EntityType: "PCI", EntityValue: "0000:c4:00.0"},
+			expected: true,
+		},
+		{
+			name:     "GPU type should not match GPU_UUID type",
+			msg:      "ErrorCode:48 GPU_UUID:GPU-8614c5d9-371d... Recommended Action=DRAIN",
+			entity:   &protos.Entity{EntityType: "GPU", EntityValue: "UUID:GPU-8614c5d9-371d"},
+			expected: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, entityMatchesMessage(tc.msg, tc.entity))
+		})
+	}
+}
+
+func TestTruncateConditionMessage(t *testing.T) {
+	generateLongMessages := func(count int) []string {
+		var msgs []string
+		for i := range count {
+			msgs = append(msgs, fmt.Sprintf(
+				"ErrorCode:DCGM_FR_NVLINK_DOWN GPU:%d PCI:0000:c%d:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d04344270%d "+
+					"GPU %d's NvLink link 0 is currently down Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun diagnostics. "+
+					"Recommended Action=RESTART_VM", i, i+1, i, i))
+		}
+		return msgs
+	}
+
+	tests := []struct {
+		name                          string
+		maxNodeConditionMessageLength int64
+		messages                      []string
+		shouldTruncate                bool
+		description                   string
+	}{
+		{
+			name:                          "Empty NodeConditionMessage with 1KB limit",
+			maxNodeConditionMessageLength: 1024,
+			messages:                      []string{},
+			shouldTruncate:                false,
+			description:                   "Empty NodeConditionMessage should return NoHealthFailureMsg",
+		},
+		{
+			name:                          "Single short NodeConditionMessage with 1KB limit",
+			maxNodeConditionMessageLength: 1024,
+			messages:                      []string{"ErrorCode:45 PCI:0000:29:00 GPU:GPU-xxx Recommended Action=CONTACT_SUPPORT"},
+			shouldTruncate:                false,
+			description:                   "Single short NodeConditionMessage should not be truncated",
+		},
+		{
+			name:                          "Multiple NodeConditionMessages exceeding 1KB limit - should truncate",
+			maxNodeConditionMessageLength: 1024,
+			messages:                      generateLongMessages(7), // ~1050 chars total
+			shouldTruncate:                true,
+			description:                   "NodeConditionMessages exceeding 1KB should be truncated",
+		},
+		{
+			name:                          "Many NodeConditionMessages with INFINITE limit - should NOT truncate",
+			maxNodeConditionMessageLength: math.MaxInt64,
+			messages:                      generateLongMessages(100), // ~15000 chars total
+			shouldTruncate:                false,
+			description:                   "Even 100 NodeConditionMessages should not be truncated with infinite limit",
+		},
+		{
+			name:                          "Multiple NodeConditionMessages with small limit (256 bytes) - should truncate",
+			maxNodeConditionMessageLength: 256,
+			messages:                      generateLongMessages(3),
+			shouldTruncate:                true,
+			description:                   "With 256 byte limit, even 3 NodeConditionMessages should be truncated",
+		},
+		{
+			name:                          "Single message exceeding limit - should truncate not produce ;...",
+			maxNodeConditionMessageLength: 1024,
+			messages:                      []string{strings.Repeat("ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 NvLink link down. ", 50)},
+			shouldTruncate:                true,
+			description:                   "Single message larger than max should be truncated, not skipped",
+		},
+		{
+			name:                          "Single message exactly at limit boundary",
+			maxNodeConditionMessageLength: 100,
+			messages:                      []string{"ErrorCode:DCGM_FR_TEMP_VIOLATION GPU:0 Thermal threshold exceeded. Recommended Action=RESTART_VM"},
+			shouldTruncate:                false,
+			description:                   "Message that exactly fits (msg + ';' = maxLen - suffixLen) should not be truncated",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			connector := &K8sConnector{
+				config: K8sConnectorConfig{
+					MaxNodeConditionMessageLength: tc.maxNodeConditionMessageLength,
+					CompactedHealthEventMsgLen:    72,
+				},
+			}
+
+			result := connector.truncateNodeConditionMessage(tc.messages)
+
+			t.Logf("Test: %s", tc.description)
+			t.Logf("Max limit: %d, Result length: %d", tc.maxNodeConditionMessageLength, len(result))
+
+			if tc.shouldTruncate {
+				// When truncation is expected
+				assert.LessOrEqual(t, len(result), int(tc.maxNodeConditionMessageLength),
+					"NodeConditionMessage length should not exceed configured max")
+				assert.Contains(t, result, truncationSuffix,
+					"truncated NodeConditionMessage should contain truncation suffix '...'")
+				assert.NotEqual(t, ";...", result,
+					"truncated message must contain partial content, not just ';...'")
+			} else {
+				// When no truncation is expected
+				assert.NotContains(t, result, truncationSuffix,
+					"non-truncated NodeConditionMessage should NOT contain truncation suffix '...'")
+
+				// For non-empty messages, verify all content is preserved
+				if len(tc.messages) > 0 {
+					for _, msg := range tc.messages {
+						assert.Contains(t, result, msg,
+							"all NodeConditionMessages should be preserved when not truncating")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestTruncateConditionMessage_EntityIdentifierPreservation(t *testing.T) {
+	connector := &K8sConnector{config: K8sConnectorConfig{MaxNodeConditionMessageLength: 1024, CompactedHealthEventMsgLen: 72}}
+
+	pciAddresses := []string{
+		"0000:c1:00.0", "0000:c2:00.0", "0000:c3:00.0", "0000:c4:00.0",
+		"0000:c5:00.0", "0000:c6:00.0", "0000:c7:00.0", "0000:c8:00.0",
+	}
+
+	var msgs []string
+	for i := range 8 {
+		msgs = append(msgs, fmt.Sprintf(
+			"ErrorCode:DCGM_FR_NVLINK_DOWN GPU:%d PCI:%s GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427e%d "+
+				"GPU %d's NvLink link 0 is currently down Check DCGM and system logs for errors. Reset GPU. Restart DCGM. Rerun diagnostics. "+
+				"Recommended Action=RESTART_VM", i, pciAddresses[i], i, i))
+	}
+
+	result := connector.truncateNodeConditionMessage(msgs)
+
+	t.Logf("Result length: %d / 1024", len(result))
+	assert.LessOrEqual(t, len(result), 1024)
+	for i := range 8 {
+		assert.Contains(t, result, fmt.Sprintf("GPU:%d ", i),
+			"GPU %d identifier must survive compaction for clearing", i)
+		assert.Contains(t, result, fmt.Sprintf("PCI:%s", pciAddresses[i]),
+			"PCI identifier for GPU %d must survive compaction for clearing", i)
+	}
+	assert.Contains(t, result, "ErrorCode:DCGM_FR_NVLINK_DOWN",
+		"Error code must be preserved")
+	assert.Contains(t, result, "Recommended Action=RESTART_VM",
+		"Recommended action must be preserved")
+}
+
+func TestMessagesMatchByIdentity(t *testing.T) {
+	tests := []struct {
+		name  string
+		a     string
+		b     string
+		match bool
+	}{
+		{
+			name:  "Full vs compacted - GPU and PCI match",
+			a:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec GPU 3's NvLink link 0 down Recommended Action=RESTART_VM",
+			b:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c... Recommended Action=RESTART_VM",
+			match: true,
+		},
+		{
+			name:  "Same GPU different NvLink - same fault identity",
+			a:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec GPU 3's NvLink link 0 down Recommended Action=RESTART_VM",
+			b:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9-371d-1d8a-9bab-78d0434427ec GPU 3's NvLink link 5 down Recommended Action=RESTART_VM",
+			match: true,
+		},
+		{
+			name:  "Different GPU - no match",
+			a:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 Recommended Action=RESTART_VM",
+			b:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:4 PCI:0000:c5:00.0 Recommended Action=RESTART_VM",
+			match: false,
+		},
+		{
+			name:  "Different ErrorCode - no match",
+			a:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 Recommended Action=RESTART_VM",
+			b:     "ErrorCode:DCGM_FR_CORRUPT_INFOROM GPU:3 PCI:0000:c4:00.0 Recommended Action=RESTART_VM",
+			match: false,
+		},
+		{
+			name:  "Different Recommended Action - no match",
+			a:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 Recommended Action=RESTART_VM",
+			b:     "ErrorCode:DCGM_FR_NVLINK_DOWN GPU:3 PCI:0000:c4:00.0 Recommended Action=CONTACT_SUPPORT",
+			match: false,
+		},
+		{
+			name:  "No Recommended Action in either - still matches on ErrorCode and entity",
+			a:     "ErrorCode:119 PCI:0002:00:00 GPU_UUID:GPU-22222222 kernel: some text",
+			b:     "ErrorCode:119 PCI:0002:00:00 GPU_UUID:GPU-22222... kernel: other text",
+			match: true,
+		},
+		{
+			name:  "No entities in common - no match",
+			a:     "ErrorCode:119 PCI:0002:00:00 Recommended Action=COMPONENT_RESET",
+			b:     "ErrorCode:119 PCI:0003:00:00 Recommended Action=COMPONENT_RESET",
+			match: false,
+		},
+		{
+			name:  "Same switch PCI, different GPU and link - different faults",
+			a:     "ErrorCode:12028 NVSWITCH:0 PCI:0000:c4:00.0 NVLINK:1 GPU:0 SXid link 1 Recommended Action=CONTACT_SUPPORT",
+			b:     "ErrorCode:12028 NVSWITCH:0 PCI:0000:c4:00.0 NVLINK:5 GPU:3 SXid link 5 Recommended Action=CONTACT_SUPPORT",
+			match: false,
+		},
+		{
+			name:  "One message names an extra entity - no match",
+			a:     "ErrorCode:119 GPU:3 PCI:0000:c4:00.0 Recommended Action=RESTART_VM",
+			b:     "ErrorCode:119 GPU:3 PCI:0000:c4:00.0 GPU_UUID:GPU-8614c5d9 Recommended Action=RESTART_VM",
+			match: false,
+		},
+		{
+			name:  "Same entities in another order - match",
+			a:     "ErrorCode:119 GPU:3 PCI:0000:c4:00.0 text Recommended Action=RESTART_VM",
+			b:     "ErrorCode:119 PCI:0000:c4:00.0 GPU:3 other text Recommended Action=RESTART_VM",
+			match: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := messagesMatchByIdentity(tc.a, tc.b)
+			assert.Equal(t, tc.match, result)
+		})
+	}
+}
+
+func TestDeduplicationBehavior(t *testing.T) {
+	msgOld := "ErrorCode:119 PCI:0002:00:00 GPU_UUID:GPU-22222222-2222-2222-2222-222222222222 " +
+		"kernel: [16450076.435595] NVRM: Xid (PCI:0002:00:00): 119, pid=1582259 Recommended Action=COMPONENT_RESET"
+	msgNew := "ErrorCode:119 PCI:0002:00:00 GPU_UUID:GPU-22222222-2222-2222-2222-222222222222 " +
+		"kernel: [16450077.123456] NVRM: Xid (PCI:0002:00:00): 119, pid=9999999 Recommended Action=COMPONENT_RESET"
+	msgUnrelated := "ErrorCode:79 PCI:0001:00:00 GPU_UUID:GPU-11111111-1111-1111-1111-111111111111 " +
+		"kernel: [16450078.000000] NVRM: Xid (PCI:0001:00:00): 79 Recommended Action=CONTACT_SUPPORT"
+
+	t.Run("Exact duplicate always blocked by addMessageIfNotExist", func(t *testing.T) {
+		connector := NewK8sConnector(nil, nil, nil, context.Background(), K8sConnectorConfig{
+			MaxNodeConditionMessageLength: 4096,
+			CompactedHealthEventMsgLen:    72,
+		})
+
+		event := &protos.HealthEvent{
+			ErrorCode:         []string{"119"},
+			EntitiesImpacted:  []*protos.Entity{{EntityType: "PCI", EntityValue: "0002:00:00"}},
+			Message:           "kernel: same message",
+			RecommendedAction: protos.RecommendedAction_COMPONENT_RESET,
+		}
+
+		msgs := connector.addMessageIfNotExist(nil, event)
+		require.Len(t, msgs, 1, "First add should create 1 entry")
+
+		msgs = connector.addMessageIfNotExist(msgs, event)
+		assert.Len(t, msgs, 1, "Exact same event should not create a second entry")
+	})
+
+	t.Run("Below limit - different timestamps preserved as separate entries", func(t *testing.T) {
+		connector := &K8sConnector{config: K8sConnectorConfig{
+			MaxNodeConditionMessageLength: 4096,
+			CompactedHealthEventMsgLen:    72,
+		}}
+
+		messages := []string{msgOld, msgUnrelated, msgNew}
+		result := connector.truncateNodeConditionMessage(messages)
+
+		assert.Contains(t, result, "pid=1582259", "Old message should be preserved below limit")
+		assert.Contains(t, result, "pid=9999999", "New message should be preserved below limit")
+		assert.Contains(t, result, "ErrorCode:79", "Unrelated message should be preserved")
+	})
+
+	t.Run("Above limit - identity duplicates consolidated keeping freshest", func(t *testing.T) {
+		connector := &K8sConnector{config: K8sConnectorConfig{
+			MaxNodeConditionMessageLength: 300,
+			CompactedHealthEventMsgLen:    72,
+		}}
+
+		messages := []string{msgOld, msgUnrelated, msgNew}
+		result := connector.truncateNodeConditionMessage(messages)
+		parts := strings.Split(result, ";")
+		count := 0
+
+		for _, part := range parts {
+			if strings.Contains(part, "ErrorCode:119") && strings.Contains(part, "PCI:0002:00:00") {
+				count++
+			}
+		}
+
+		assert.Equal(t, 1, count, "Should have exactly 1 entry for ErrorCode:119 PCI:0002:00:00 after dedup")
+		assert.Contains(t, result, "ErrorCode:79", "Unrelated message should survive dedup")
+		assert.NotContains(t, result, "pid=1582259", "Older duplicate should be dropped")
+	})
+
+	t.Run("Above limit - same-entity duplicate produces single compacted entry", func(t *testing.T) {
+		// Two messages with identical entity (PCI:0002:00:00) and Recommended Action
+		// but different diagnostic text. When above limit, dedup must consolidate them
+		// to exactly one entry in the compacted output — not two.
+		connector := &K8sConnector{config: K8sConnectorConfig{
+			MaxNodeConditionMessageLength: 300,
+			CompactedHealthEventMsgLen:    72,
+		}}
+
+		messages := []string{msgOld, msgNew}
+		result := connector.truncateNodeConditionMessage(messages)
+
+		var entries []string
+		for p := range strings.SplitSeq(result, ";") {
+			if p != "" && p != truncationSuffix {
+				entries = append(entries, p)
+			}
+		}
+
+		// Both messages share the same identity (PCI:0002:00:00 + COMPONENT_RESET),
+		// so exactly one compacted entry should remain after dedup.
+		require.Len(t, entries, 1, "Same-entity duplicates must produce exactly one entry after dedup+compaction")
+
+		// The surviving entry must be in compacted form (diagnostic text truncated).
+		assert.Contains(t, entries[0], truncationSuffix,
+			"Surviving entry must be in compacted form")
+		assert.Contains(t, entries[0], "PCI:0002:00:00",
+			"Entity identifier must be preserved in the compacted entry")
+		assert.Contains(t, entries[0], "Recommended Action=COMPONENT_RESET",
+			"Recommended Action must be preserved in the compacted entry")
+
+		// The freshest message (pid=9999999) must be the one kept.
+		assert.NotContains(t, result, "pid=1582259", "Older duplicate must be dropped")
+	})
+
+}
+
+// TestWriteNodeEvent_UpdateRacesDeletion verifies that when the remembered event is
+// deleted between the metadata.name lookup and the Update (the event TTL can expire in
+// that window) on a refresh past the refresh interval, the write is not lost: the stale
+// memory is dropped and a fresh event is created in the same attempt.
+func TestWriteNodeEvent_UpdateRacesDeletion(t *testing.T) {
+	localCtx := context.Background()
+	localClientSet := fake.NewSimpleClientset()
+	stopCh := make(chan struct{})
+
+	defer close(stopCh)
+
+	ringBuffer := ringbuffer.NewRingBuffer("updateRacesDeletionBuffer", localCtx)
+	connector := NewK8sConnector(localClientSet, ringBuffer, stopCh, localCtx, K8sConnectorConfig{
+		MaxNodeConditionMessageLength: 1024,
+		CompactedHealthEventMsgLen:    72,
+	})
+
+	nodeName := "update-race-test-node"
+	_, err := localClientSet.CoreV1().Nodes().Create(localCtx, &corev1.Node{
+		Name: nodeName,
+	}, metav1.CreateOptions{})
+	require.NoError(t, err, "Failed to create test node")
+
+	healthEvent := &protos.HealthEvent{
+		CheckName:          "GpuThermalWatch",
+		IsHealthy:          false,
+		EntitiesImpacted:   []*protos.Entity{{EntityType: "GPU", EntityValue: "0"}},
+		ErrorCode:          []string{"THERMAL_WARNING"},
+		IsFatal:            false,
+		GeneratedTimestamp: timestamppb.New(time.Now()),
+		NodeName:           nodeName,
+	}
+	healthEvents := &protos.HealthEvents{Version: 1, Events: []*protos.HealthEvent{healthEvent}}
+	k8sEvent := connector.createK8sEvent(localCtx, healthEvent)
+
+	// First write populates the Event memory.
+	require.NoError(t, connector.ProcessBatch(localCtx, healthEvents))
+
+	events, err := localClientSet.CoreV1().Events(DefaultNamespace).List(localCtx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1, "First health event should create exactly one Kubernetes event")
+
+	firstName := events.Items[0].Name
+	_, ok := connector.rememberedNodeEvent(nodeName, k8sEvent)
+	require.True(t, ok, "First write should remember the created event")
+
+	// The race needs a later report after the refresh interval, not a replay
+	// of the occurrence whose timestamp is already persisted.
+	ageRememberedEvent(t, connector, nodeName, k8sEvent)
+	healthEvent.GeneratedTimestamp = timestamppb.New(healthEvent.GeneratedTimestamp.AsTime().Add(time.Minute))
+
+	// Delete the raced event from the tracker so the NotFound reflects real state.
+	var (
+		updateCalled     bool
+		trackerDeleteErr error
+	)
+
+	localClientSet.PrependReactor("update", "events", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateCalled = true
+		trackerDeleteErr = localClientSet.Tracker().Delete(action.GetResource(), action.GetNamespace(), firstName)
+
+		return true, nil, apierrors.NewNotFound(corev1.Resource("events"), firstName)
+	})
+
+	require.NoError(t, connector.ProcessBatch(localCtx, healthEvents),
+		"A racing deletion should not surface as a write error")
+	require.NoError(t, trackerDeleteErr, "Failed to remove the raced event from the tracker")
+	require.True(t, updateCalled, "The cached event should have been updated in place before the race")
+
+	events, err = localClientSet.CoreV1().Events(DefaultNamespace).List(localCtx, metav1.ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, events.Items, 1, "A racing deletion should be recovered by creating one replacement event")
+	assert.Equal(t, firstName, events.Items[0].Name, "The fault keeps its name, derived from what it announces")
+	assert.Equal(t, int32(1), events.Items[0].Count, "The replacement is a fresh Event, not the deleted one bumped")
+
+	_, ok = connector.rememberedNodeEvent(nodeName, k8sEvent)
+	require.True(t, ok, "The recreated event should be remembered")
+}
+
+// TestK8sConnector_NodeEventMemory_HasNoSizeCap: the memory is bounded by
+// time, not by a count: every check written inside the refresh interval is
+// remembered, however many there are.
+func TestK8sConnector_NodeEventMemory_HasNoSizeCap(t *testing.T) {
+	connector := &K8sConnector{}
+
+	const checks = 5000
+
+	for i := range checks {
+		connector.rememberNodeEvent("node", &corev1.Event{Type: fmt.Sprintf("check-%d", i), Message: "message"}, nil)
+	}
+
+	for _, check := range []string{"check-0", fmt.Sprintf("check-%d", checks-1)} {
+		_, ok := connector.rememberedNodeEvent("node", &corev1.Event{Type: check, Message: "message"})
+		require.True(t, ok, "%s is remembered", check)
+	}
+
+	connector.nodeEventMu.Lock()
+	defer connector.nodeEventMu.Unlock()
+	assert.Equal(t, checks, connector.nodeEventMemory().Len(), "no entry was evicted for size")
+}

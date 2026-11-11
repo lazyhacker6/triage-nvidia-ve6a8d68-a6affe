@@ -1,0 +1,159 @@
+// Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package queue
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.opentelemetry.io/otel/trace"
+	"k8s.io/client-go/util/workqueue"
+
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/metrics"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+	"github.com/nvidia/nvsentinel/store-client/pkg/utils"
+)
+
+const (
+	// DefaultRequeueBackoffBase is the default base duration for exponential backoff on drain requeues.
+	DefaultRequeueBackoffBase = 10 * time.Second
+	// MaxRequeueBackoff is the maximum ceiling for exponential backoff on drain requeues.
+	MaxRequeueBackoff = 2 * time.Minute
+)
+
+func NewEventQueueManager(requeueBackoffBase time.Duration) EventQueueManager {
+	if requeueBackoffBase <= 0 {
+		requeueBackoffBase = DefaultRequeueBackoffBase
+	}
+
+	priorityState := newNodePriorityState()
+	baseQueue := workqueue.NewTypedWithConfig(workqueue.TypedQueueConfig[NodeEvent]{
+		Queue: newNodeEventPriorityQueue(priorityState),
+	})
+	delayingQueue := workqueue.NewTypedDelayingQueueWithConfig(workqueue.TypedDelayingQueueConfig[NodeEvent]{
+		Queue: baseQueue,
+	})
+
+	rateLimiter := workqueue.NewTypedItemExponentialFailureRateLimiter[NodeEvent](requeueBackoffBase, MaxRequeueBackoff)
+
+	mgr := &eventQueueManager{
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			rateLimiter,
+			workqueue.TypedRateLimitingQueueConfig[NodeEvent]{
+				DelayingQueue: delayingQueue,
+			},
+		),
+		rateLimiter:   rateLimiter,
+		shutdown:      make(chan struct{}),
+		priorityState: priorityState,
+	}
+
+	return mgr
+}
+
+// SetEventProcessor method has been removed - use SetDataStoreEventProcessor instead
+
+func (m *eventQueueManager) SetDataStoreEventProcessor(processor DataStoreEventProcessor) {
+	m.dataStoreEventProcessor = processor
+}
+
+func (m *eventQueueManager) MarkNodeDraining(nodeName string) {
+	m.priorityState.markNodeDraining(nodeName)
+}
+
+func (m *eventQueueManager) ClearNodeDraining(nodeName string) {
+	m.priorityState.clearNodeDraining(nodeName)
+
+	// Removed rather than zeroed: the gauge holds a Unix time, and time() minus zero reads as a
+	// wait of decades. Cleared by the node-level transition because the gauge is keyed by node --
+	// several events can be queued for one node (classifyForEnqueue puts the later ones in the low
+	// lane rather than dropping them), and every way a node stops draining reaches here. If a
+	// single-event cancellation removes it while another event for that node is still waiting,
+	// that event's next poll restores its own event's time, so the gap does not restart its clock.
+	metrics.NodeDrainAwaitingCompletionEventTimestamp.DeleteLabelValues(nodeName)
+}
+
+// EnqueueEventGeneric enqueues an event using the new database-agnostic interface.
+// Only the document ID is stored in the queue; the full event is fetched from the
+// database lazily when the worker processes the item, keeping queue memory minimal.
+func (m *eventQueueManager) EnqueueEventGeneric(ctx context.Context, nodeName string, event datastore.Event,
+	database DataStore, healthEventStore datastore.HealthEventStore, documentID any) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("context cancelled while enqueueing event for node %s: %w", nodeName, ctx.Err())
+	}
+
+	select {
+	case <-m.shutdown:
+		return fmt.Errorf("queue is shutting down")
+	default:
+	}
+
+	eventID := utils.ExtractEventID(event)
+
+	nodeEvent := NodeEvent{
+		NodeName:         nodeName,
+		EventID:          eventID,
+		DocumentID:       documentID,
+		Database:         database,
+		HealthEventStore: healthEventStore,
+	}
+
+	slog.DebugContext(ctx, "Enqueueing event", "nodeName", nodeName, "eventID", eventID)
+
+	m.queue.Add(nodeEvent)
+	metrics.QueueDepth.Set(float64(m.queue.Len()))
+
+	return nil
+}
+
+// EnqueueEvent method has been removed - use EnqueueEventGeneric instead
+
+func (m *eventQueueManager) Shutdown() {
+	slog.Info("Shutting down workqueue")
+	m.queue.ShutDown()
+	close(m.shutdown)
+	slog.Info("Workqueue shutdown complete")
+}
+
+// DrainSession holds per-event tracing state that persists across requeue
+// cycles via the eventQueueManager.sessions map. Phase transitions are marked
+// by short-lived ".start" and ".end" child spans of DrainSessionSpan;
+// drain scope is set directly on DrainSessionSpan via SetAttributes in the reconciler.
+type DrainSession struct {
+	DrainSessionSpan trace.Span
+
+	ScopeSet bool
+}
+
+type drainSessionContextKey struct{}
+
+var drainSessionKey = drainSessionContextKey{}
+
+// ContextWithDrainSession attaches the session to ctx so the reconciler can
+// start/end phase spans and set drain scope attributes without explicit plumbing.
+func ContextWithDrainSession(ctx context.Context, ds *DrainSession) context.Context {
+	return context.WithValue(ctx, drainSessionKey, ds)
+}
+
+// DrainSessionFromContext returns the DrainSession from ctx, or nil if not set.
+func DrainSessionFromContext(ctx context.Context) *DrainSession {
+	if ds, _ := ctx.Value(drainSessionKey).(*DrainSession); ds != nil {
+		return ds
+	}
+
+	return nil
+}
